@@ -1,0 +1,100 @@
+{
+  "general": {
+    "activeNetworks": ["robinhood", "mainnet"],
+    "currency": "ETH",
+    "minBalanceReserveEth": 0.0001,
+    "maxTotalActiveOfferVolumeEth": 0.004,
+    "loopIntervalMs": 15000,
+    "offerExpirationMinutes": 60,
+    "listingExpirationDays": 7
+  },
+  "capital": {
+    "totalTradingCapitalUsd": 10.0,
+    "maxActiveTrades": 1,
+    "minNetProfitUsd": 2.0
+  },
+  "liquidity": {
+    "minSales1Hour": 15,
+    "minUniqueWallets1Hour": 4
+  },
+  "networks": {
+    "robinhood": {
+      "name": "Robinhood Chain",
+      "rpcUrl": "https://robinhood-mainnet.g.alchemy.com/v2/REDACTED_KEY",
+      "chainId": 4663,
+      "currency": "ETH",
+      "blockExplorer": "https://explorer.robinhoodchain.com",
+      "estimatedGasCostUsd": 0.01,
+      "seaportAddress": "0x0000000000000068F116a894984e2DB1123eB395",
+      "conduitKey": "0x61159fefdfada89302ed55f8b9e89e2d67d8258712b3a3f89aa88525877f1d5e",
+      "wethAddress": "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+    },
+    "mainnet": {
+      "name": "Ethereum Mainnet",
+      "rpcUrl": "https://ethereum-rpc.publicnode.com",
+      "chainId": 1,
+      "currency": "ETH",
+      "blockExplorer": "https://etherscan.io",
+      "estimatedGasCostUsd": 3.50,
+      "seaportAddress": "0x0000000000000068F116a894984e2DB1123eB395",
+      "conduitKey": "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
+      "wethAddress": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+    }
+  },
+  "fees": {
+    "openseaFeeBps": 100,
+    "defaultRoyaltyBps": 50,
+    "maxAcceptableRoyaltyBps": 1000
+  },
+  "profitTargets": {
+    "defaultMinNetProfitUsd": 2.0,
+    "defaultMinMarginPercent": 13.0,
+    "undercutFloorByPercent": 1.0,
+    "bidUnderFloorPercent": 15.0
+  },
+  "riskManagement": {
+    "maxInventoryPerCollection": 1,
+    "maxTotalInventoryItems": 1,
+    "floorPriceDropThresholdPercent": 15.0,
+    "maxConsecutiveErrors": 5,
+    "emergencyStopOnLargeDrawdown": true
+  },
+  "targetCollections": [
+    {
+      "name": "Genesis Bugz",
+      "slug": "genesis-bugz00000",
+      "contractAddress": "0x78da3f78ba2665101bca8aca20553a72142fc193",
+      "network": "robinhood",
+      "enabled": true,
+      "maxBidEth": 0.0035,
+      "targetNetProfitUsd": 2.00,
+      "maxInventory": 1
+    },
+    {
+      "name": "Identity Units",
+      "slug": "identity-units-464613867",
+      "contractAddress": "0xb79696e5733a36fa5f1671c90340a8df715476f9",
+      "network": "robinhood",
+      "enabled": true,
+      "maxBidEth": 0.0035,
+      "targetNetProfitUsd": 2.00,
+      "maxInventory": 1
+    },
+    {
+      "name": "Credits",
+      "slug": "credits",
+      "contractAddress": "0x97630aa70ab14ed9883b41dafccbc11349723043",
+      "network": "mainnet",
+      "enabled": true,
+      "maxBidEth": 0.0035,
+      "targetNetProfitUsd": 2.00,
+      "maxInventory": 1
+    }
+  ],
+  "seaport": {
+    "version": "1.6",
+    "contractAddress": "0x0000000000000068F116a894984e2DB1123eB395",
+    "conduitKey": "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
+    "zoneAddress": "0x000056f7000000ece9003ca63978907a00ffd100"
+  }
+}
