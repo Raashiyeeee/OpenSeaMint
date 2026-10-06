@@ -11,11 +11,12 @@
   "capital": {
     "totalTradingCapitalUsd": 10.0,
     "maxActiveTrades": 1,
-    "minNetProfitUsd": 2.0
+    "maxBuyPriceUsd": 3.0,
+    "minNetProfitUsd": 0.20
   },
   "liquidity": {
-    "minSales1Hour": 1,
-    "minUniqueWallets1Hour": 1
+    "minSales1Hour": 15,
+    "minUniqueWallets1Hour": 4
   },
   "networks": {
     "robinhood": {
@@ -47,10 +48,11 @@
     "maxAcceptableRoyaltyBps": 1000
   },
   "profitTargets": {
-    "defaultMinNetProfitUsd": 2.0,
-    "defaultMinMarginPercent": 13.0,
+    "defaultMinNetProfitUsd": 0.20,
+    "defaultMinMarginPercent": 40.0,
     "undercutFloorByPercent": 1.0,
-    "bidUnderFloorPercent": 15.0
+    "bidUnderFloorPercent": 15.0,
+    "bidIncrementUsd": 0.05
   },
   "riskManagement": {
     "maxInventoryPerCollection": 1,

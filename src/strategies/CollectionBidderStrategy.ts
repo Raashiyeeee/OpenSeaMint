@@ -48,10 +48,10 @@ export class CollectionBidderStrategy {
       return;
     }
 
-    const minFloorUsd = 2.0; // Filter for NFTs $2 and above as requested
-    const maxFloorUsd = this.config.capital?.totalTradingCapitalUsd || 10.0;
+    const minFloorUsd = 0.50;
+    const maxFloorUsd = 3.50; // NFTs up to $3.50 floor for sub-$3 offers
 
-    // 1. Dynamic Market Discovery: Scan live marketplace for active collections ($2+) on active networks
+    // 1. Dynamic Market Discovery: Scan live marketplace for active collections ($0.50 - $3.50) on active networks
     for (const net of activeNetworks) {
       if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) break;
       try {
@@ -64,7 +64,7 @@ export class CollectionBidderStrategy {
               slug: disc.slug,
               contractAddress: disc.contractAddress,
               network: net,
-              targetNetProfitUsd: this.config.capital?.minNetProfitUsd ?? 2.0,
+              targetNetProfitUsd: this.config.capital?.minNetProfitUsd ?? 0.20,
               maxInventory: 1
             }, net);
           } catch (err: any) {
@@ -203,8 +203,8 @@ export class CollectionBidderStrategy {
         expectedNetProfitUsd: `$${calculation.netProfitUsd}`,
         marginPercent: `${calculation.marginPercent}%`,
         checkL_Liquidity: 'PASSED ✅ (>= 15 sales & >= 4 wallets in 1h)',
-        checkA_Capital: 'PASSED ✅ (Within $10.00)',
-        checkB_Profitability: 'PASSED ✅ (>= 13% margin & >= $2.00 profit)'
+        checkA_Capital: 'PASSED ✅ (Within $10.00 capital & <= $3.00 max buy)',
+        checkB_Profitability: 'PASSED ✅ (>= 40% margin & positive net profit)'
       },
       `ALL CHECKS PASSED ✅ Placing collection offer on ${targetNetwork.toUpperCase()}`
     );

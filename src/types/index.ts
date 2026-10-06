@@ -13,7 +13,8 @@ export interface NetworkInfo {
 export interface CapitalConfig {
   totalTradingCapitalUsd: number; // e.g. $10.0
   maxActiveTrades: number;        // e.g. 1 (One active trade at a time)
-  minNetProfitUsd: number;        // e.g. $2.0 (MIN_NET_PROFIT threshold)
+  minNetProfitUsd: number;        // e.g. $0.20
+  maxBuyPriceUsd?: number;        // Strict ceiling: maximum $3.00 buy price
 }
 
 export interface LiquidityConfig {
@@ -45,6 +46,7 @@ export interface BotConfig {
     defaultMinMarginPercent: number; // 13% default
     undercutFloorByPercent: number;
     bidUnderFloorPercent: number;
+    bidIncrementUsd?: number;
   };
   riskManagement: {
     maxInventoryPerCollection: number;
