@@ -62,8 +62,11 @@ async function runDryRun() {
   await bidderStrategy.evaluateAndPlaceBids();
   logger.info('Verified: Bot correctly held capital and prevented overlapping trades!');
 
-  logger.info('\n--- STAGE 3: SIMULATING OFFER ACCEPTANCE (NFT ACQUISITION) ---');
-  const sampleTarget = config.targetCollections[0];
+  const sampleTarget = config.targetCollections[0] || {
+    name: 'Sample Discovered NFT',
+    slug: 'sample-nft',
+    contractAddress: '0x811c82c1d2204d6a91da8941284c4b32ad18e00a'
+  };
   const simulatedAcquiredPriceEth = 0.0028; // ~$7.50 at $2700 ETH
   const simulatedTokenId = '42';
 
