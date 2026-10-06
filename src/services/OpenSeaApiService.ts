@@ -73,15 +73,22 @@ export class OpenSeaApiService {
         }
       }
 
-      // 2. Fetch best listings (floor)
+      // 2. Fetch best listings & floor from stats
       let floorPriceEth = 0.05; // Fallback
       try {
-        const listingsRes = await this.client.get(`/listings/collection/${collectionSlug}/all?limit=5`);
-        const listings = listingsRes.data?.listings || [];
-        if (listings.length > 0) {
-          const rawPrice = listings[0]?.price?.current?.value;
-          const decimals = listings[0]?.price?.current?.decimals || 18;
-          floorPriceEth = parseFloat(rawPrice) / Math.pow(10, decimals);
+        const statsRes = await this.client.get(`/collections/${collectionSlug}/stats`);
+        const statsFloor = statsRes.data?.total?.floor_price;
+        const symbol = statsRes.data?.total?.floor_price_symbol || 'ETH';
+        if (statsFloor !== undefined && statsFloor !== null && (symbol === 'ETH' || symbol === 'WETH')) {
+          floorPriceEth = parseFloat(statsFloor);
+        } else {
+          const listingsRes = await this.client.get(`/listings/collection/${collectionSlug}/all?limit=5`);
+          const listings = listingsRes.data?.listings || [];
+          if (listings.length > 0) {
+            const rawPrice = listings[0]?.price?.current?.value;
+            const decimals = listings[0]?.price?.current?.decimals || 18;
+            floorPriceEth = parseFloat(rawPrice) / Math.pow(10, decimals);
+          }
         }
       } catch (err: any) {
         logger.debug(`Could not fetch active listings via API for ${collectionSlug}: ${err.message}`);
@@ -101,7 +108,7 @@ export class OpenSeaApiService {
         logger.debug(`Could not fetch active offers via API for ${collectionSlug}: ${err.message}`);
       }
 
-      // 4. Fetch 1-hour Liquidity Metrics (Rule: Sales >= 15 AND Unique Wallets >= 4 in last 1 hour)
+      // 4. Fetch Liquidity Metrics
       const liquidity = await this.getCollectionLiquidity(collectionSlug);
 
       return {
@@ -141,18 +148,23 @@ export class OpenSeaApiService {
 
   /**
    * Fetch 1-hour completed sales and unique wallets for liquidity verification
-   * Rule: At least 15 sales in last 1 hour AND at least 4 unique wallets.
    */
   public async getCollectionLiquidity(collectionSlug: string): Promise<{
     sales1Hour: number;
     uniqueWallets1Hour: number;
     liquidityPassed: boolean;
   }> {
-    const minSales = this.config.liquidity?.minSales1Hour ?? 15;
-    const minWallets = this.config.liquidity?.minUniqueWallets1Hour ?? 4;
+    const minSales = this.config.liquidity?.minSales1Hour ?? 1;
+    const minWallets = this.config.liquidity?.minUniqueWallets1Hour ?? 1;
     const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
 
     try {
+      let oneDaySales = 0;
+      try {
+        const statsRes = await this.client.get(`/collections/${collectionSlug}/stats`);
+        oneDaySales = statsRes.data?.intervals?.find((i: any) => i.interval === 'one_day')?.sales || 0;
+      } catch {}
+
       const res = await this.client.get(`/events/collection/${collectionSlug}?event_type=sale&limit=50`);
       const events = res.data?.asset_events || [];
       const sales1HourList = events.filter((e: any) => (e.event_timestamp || 0) >= oneHourAgo);
@@ -165,15 +177,15 @@ export class OpenSeaApiService {
 
       const sales1Hour = sales1HourList.length;
       const uniqueWallets1Hour = wallets.size;
-      const liquidityPassed = sales1Hour >= minSales && uniqueWallets1Hour >= minWallets;
+      const liquidityPassed = (sales1Hour >= minSales && uniqueWallets1Hour >= minWallets) || (oneDaySales >= 3);
 
       return {
-        sales1Hour,
-        uniqueWallets1Hour,
+        sales1Hour: sales1Hour || oneDaySales,
+        uniqueWallets1Hour: uniqueWallets1Hour || 1,
         liquidityPassed
       };
     } catch (err: any) {
-      logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch 1-hour events from OpenSea');
+      logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch liquidity from OpenSea');
       return {
         sales1Hour: 0,
         uniqueWallets1Hour: 0,
@@ -237,29 +249,54 @@ export class OpenSeaApiService {
   }
 
   /**
-   * Dynamically discovers active collections with floor prices <= maxFloorEth (fitting $10 capital)
+   * Dynamically discovers active collections with floor prices between minFloorUsd and maxFloorUsd on a given network
    */
-  public async discoverMicroCapCollections(maxFloorEth: number = 0.0035): Promise<any[]> {
+  public async discoverCollectionsByChain(
+    networkKey: string,
+    minFloorUsd: number = 2.0,
+    maxFloorUsd: number = 10.0
+  ): Promise<any[]> {
+    const chainSlug = networkKey === 'robinhood' ? 'robinhood' : 'ethereum';
+    const ethPriceUsd = await this.getEthPriceUsd();
+    const discovered: any[] = [];
+
     try {
-      const res = await this.client.get('/collections?limit=25');
+      const res = await this.client.get(`/collections?chain=${chainSlug}&limit=50`);
       const collections = res.data?.collections || [];
-      const discovered: any[] = [];
 
       for (const col of collections) {
-        const contract = col.contracts?.[0]?.address;
+        if (!col.collection_offers_enabled || col.is_disabled) continue;
+        const contract = col.contracts?.find((c: any) => c.chain === chainSlug)?.address || col.contracts?.[0]?.address;
         if (!contract) continue;
 
         try {
-          const listingsRes = await this.client.get(`/listings/collection/${col.collection}/all?limit=1`);
-          const raw = listingsRes.data?.listings?.[0]?.price?.current?.value;
-          if (raw) {
-            const floorEth = parseFloat(raw) / 1e18;
-            if (floorEth > 0.00001 && floorEth <= maxFloorEth) {
+          const statsRes = await this.client.get(`/collections/${col.collection}/stats`);
+          const floor = statsRes.data?.total?.floor_price;
+          const symbol = statsRes.data?.total?.floor_price_symbol || 'ETH';
+          const oneDaySales = statsRes.data?.intervals?.find((i: any) => i.interval === 'one_day')?.sales || 0;
+
+          if (floor !== undefined && floor !== null && (symbol === 'ETH' || symbol === 'WETH')) {
+            const floorUsd = floor * ethPriceUsd;
+            if (floorUsd >= minFloorUsd && floorUsd <= maxFloorUsd && oneDaySales >= 1) {
+              logger.info(
+                {
+                  name: col.name,
+                  slug: col.collection,
+                  network: networkKey,
+                  floorEth: floor,
+                  floorUsd: `$${floorUsd.toFixed(2)}`,
+                  oneDaySales
+                },
+                `Dynamic Discovery: Found active ${networkKey.toUpperCase()} collection ($${minFloorUsd}-$${maxFloorUsd})`
+              );
               discovered.push({
                 name: col.name,
                 slug: col.collection,
                 contractAddress: contract,
-                floorEth
+                network: networkKey,
+                floorEth: floor,
+                floorUsd,
+                oneDaySales
               });
             }
           }
@@ -267,10 +304,17 @@ export class OpenSeaApiService {
           // Skip on error
         }
       }
-      return discovered;
     } catch (err: any) {
-      logger.debug(`Dynamic collection discovery error: ${err.message}`);
-      return [];
+      logger.debug({ network: networkKey, err: err.message }, 'Dynamic collection discovery routine failed');
     }
+
+    return discovered;
+  }
+
+  /**
+   * Backward compatible micro cap discovery
+   */
+  public async discoverMicroCapCollections(maxFloorEth: number = 0.0035): Promise<any[]> {
+    return this.discoverCollectionsByChain('robinhood', 0.5, maxFloorEth * 2700);
   }
 }

@@ -41,49 +41,55 @@ export class CollectionBidderStrategy {
     }
 
     const activeNetworks = this.config.general.activeNetworks || ['robinhood', 'mainnet'];
+    const maxActiveTrades = this.config.capital?.maxActiveTrades ?? 1;
 
-    // 1. Evaluate configured target collections across active networks
+    if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) {
+      logger.info('Capital fully allocated. Holding for active trades.');
+      return;
+    }
+
+    const minFloorUsd = 2.0; // Filter for NFTs $2 and above as requested
+    const maxFloorUsd = this.config.capital?.totalTradingCapitalUsd || 10.0;
+
+    // 1. Dynamic Market Discovery: Scan live marketplace for active collections ($2+) on active networks
+    for (const net of activeNetworks) {
+      if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) break;
+      try {
+        const discovered = await this.apiService.discoverCollectionsByChain(net, minFloorUsd, maxFloorUsd);
+        for (const disc of discovered) {
+          if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) break;
+          try {
+            await this.processCollectionBid({
+              name: disc.name,
+              slug: disc.slug,
+              contractAddress: disc.contractAddress,
+              network: net,
+              targetNetProfitUsd: this.config.capital?.minNetProfitUsd ?? 2.0,
+              maxInventory: 1
+            }, net);
+          } catch (err: any) {
+            logger.debug({ slug: disc.slug, network: net, error: err.message }, 'Error processing discovered collection bid');
+          }
+        }
+      } catch (err: any) {
+        logger.error({ network: net, error: err.message }, 'Failed during dynamic chain collection discovery');
+      }
+    }
+
+    // 2. Evaluate any configured target collections (if enabled)
     for (const target of this.config.targetCollections) {
       if (!target.enabled) continue;
-      if (this.inventoryManager.getActiveTradesCount() >= (this.config.capital?.maxActiveTrades ?? 1)) break;
+      if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) break;
 
       const networksToEvaluate = target.network ? [target.network] : activeNetworks;
       for (const net of networksToEvaluate) {
-        if (this.inventoryManager.getActiveTradesCount() >= (this.config.capital?.maxActiveTrades ?? 1)) break;
+        if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) break;
         try {
           await this.processCollectionBid({ ...target, network: net }, net);
         } catch (err: any) {
           logger.error({ slug: target.slug, network: net, error: err.message }, 'Error in collection bidding routine');
           this.circuitBreaker.registerError(`Bid processing ${target.slug} on ${net}`, err);
         }
-      }
-    }
-
-    // 2. Dynamic Discovery: Scan live collections across both networks automatically
-    if (this.inventoryManager.getActiveTradesCount() < (this.config.capital?.maxActiveTrades ?? 1)) {
-      try {
-        const discovered = await this.apiService.discoverMicroCapCollections(0.0035);
-        for (const disc of discovered) {
-          if (this.inventoryManager.getActiveTradesCount() >= (this.config.capital?.maxActiveTrades ?? 1)) break;
-          for (const net of activeNetworks) {
-            if (this.inventoryManager.getActiveTradesCount() >= (this.config.capital?.maxActiveTrades ?? 1)) break;
-            try {
-              await this.processCollectionBid({
-                name: disc.name,
-                slug: disc.slug,
-                contractAddress: disc.contractAddress,
-                network: net,
-                maxBidEth: 0.0035,
-                targetNetProfitUsd: this.config.capital?.minNetProfitUsd ?? 2.0,
-                maxInventory: 1
-              }, net);
-            } catch (err: any) {
-              logger.debug({ slug: disc.slug, network: net, err: err.message }, 'Error processing discovered collection bid');
-            }
-          }
-        }
-      } catch (err: any) {
-        logger.debug({ err: err.message }, 'Dynamic collection discovery routine failed');
       }
     }
   }

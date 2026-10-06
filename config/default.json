@@ -14,8 +14,8 @@
     "minNetProfitUsd": 2.0
   },
   "liquidity": {
-    "minSales1Hour": 15,
-    "minUniqueWallets1Hour": 4
+    "minSales1Hour": 1,
+    "minUniqueWallets1Hour": 1
   },
   "networks": {
     "robinhood": {
@@ -59,38 +59,7 @@
     "maxConsecutiveErrors": 5,
     "emergencyStopOnLargeDrawdown": true
   },
-  "targetCollections": [
-    {
-      "name": "Genesis Bugz",
-      "slug": "genesis-bugz00000",
-      "contractAddress": "0x78da3f78ba2665101bca8aca20553a72142fc193",
-      "network": "robinhood",
-      "enabled": true,
-      "maxBidEth": 0.0035,
-      "targetNetProfitUsd": 2.00,
-      "maxInventory": 1
-    },
-    {
-      "name": "Identity Units",
-      "slug": "identity-units-464613867",
-      "contractAddress": "0xb79696e5733a36fa5f1671c90340a8df715476f9",
-      "network": "robinhood",
-      "enabled": true,
-      "maxBidEth": 0.0035,
-      "targetNetProfitUsd": 2.00,
-      "maxInventory": 1
-    },
-    {
-      "name": "Credits",
-      "slug": "credits",
-      "contractAddress": "0x97630aa70ab14ed9883b41dafccbc11349723043",
-      "network": "mainnet",
-      "enabled": true,
-      "maxBidEth": 0.0035,
-      "targetNetProfitUsd": 2.00,
-      "maxInventory": 1
-    }
-  ],
+  "targetCollections": [],
   "seaport": {
     "version": "1.6",
     "contractAddress": "0x0000000000000068F116a894984e2DB1123eB395",
