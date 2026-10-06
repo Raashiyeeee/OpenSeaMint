@@ -148,23 +148,20 @@ export class OpenSeaApiService {
 
   /**
    * Fetch 1-hour completed sales and unique wallets for liquidity verification
+   * MANDATORY HARD FILTER:
+   * Last 1 Hour: Minimum completed sales: 15 AND Minimum unique wallets: 4.
+   * If either condition fails: DO NOT PLACE OFFER.
    */
   public async getCollectionLiquidity(collectionSlug: string): Promise<{
     sales1Hour: number;
     uniqueWallets1Hour: number;
     liquidityPassed: boolean;
   }> {
-    const minSales = this.config.liquidity?.minSales1Hour ?? 1;
-    const minWallets = this.config.liquidity?.minUniqueWallets1Hour ?? 1;
+    const minSales = this.config.liquidity?.minSales1Hour ?? 15;
+    const minWallets = this.config.liquidity?.minUniqueWallets1Hour ?? 4;
     const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
 
     try {
-      let oneDaySales = 0;
-      try {
-        const statsRes = await this.client.get(`/collections/${collectionSlug}/stats`);
-        oneDaySales = statsRes.data?.intervals?.find((i: any) => i.interval === 'one_day')?.sales || 0;
-      } catch {}
-
       const res = await this.client.get(`/events/collection/${collectionSlug}?event_type=sale&limit=50`);
       const events = res.data?.asset_events || [];
       const sales1HourList = events.filter((e: any) => (e.event_timestamp || 0) >= oneHourAgo);
@@ -177,15 +174,15 @@ export class OpenSeaApiService {
 
       const sales1Hour = sales1HourList.length;
       const uniqueWallets1Hour = wallets.size;
-      const liquidityPassed = (sales1Hour >= minSales && uniqueWallets1Hour >= minWallets) || (oneDaySales >= 3);
+      const liquidityPassed = sales1Hour >= minSales && uniqueWallets1Hour >= minWallets;
 
       return {
-        sales1Hour: sales1Hour || oneDaySales,
-        uniqueWallets1Hour: uniqueWallets1Hour || 1,
+        sales1Hour,
+        uniqueWallets1Hour,
         liquidityPassed
       };
     } catch (err: any) {
-      logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch liquidity from OpenSea');
+      logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch 1-hour events from OpenSea');
       return {
         sales1Hour: 0,
         uniqueWallets1Hour: 0,
@@ -253,8 +250,8 @@ export class OpenSeaApiService {
    */
   public async discoverCollectionsByChain(
     networkKey: string,
-    minFloorUsd: number = 2.0,
-    maxFloorUsd: number = 10.0
+    minFloorUsd: number = 0.50,
+    maxFloorUsd: number = 3.50
   ): Promise<any[]> {
     const chainSlug = networkKey === 'robinhood' ? 'robinhood' : 'ethereum';
     const ethPriceUsd = await this.getEthPriceUsd();

@@ -237,12 +237,12 @@ console.log('Case 7c PASSED: Genuine liquid collection passed Check L!\n');
 // TEST 8: Minimum 13% Price Advantage & Profit Percentage Rule
 // Expected resale must be >= 13% above offer price and yield >= $2 profit.
 // --------------------------------------------------------------------------
-console.log('--- Test 8: Minimum 13% Price Advantage & Profit Percentage Rule ---');
+console.log('--- Test 8: Minimum 40% Net Profit Margin Rule ($3 Max NFT Profile) ---');
 const highMarginData: CollectionMarketData = {
   slug: 'high-margin-nft',
   contractAddress: '0x4444444444444444444444444444444444444444',
-  floorPriceEth: 0.008, // ~$21.60
-  topOfferEth: 0.003,
+  floorPriceEth: 0.0008, // ~$2.16
+  topOfferEth: 0.0004,   // ~$1.08 (like Primal Apes)
   numListings: 10,
   openseaFeeBps: 100,
   royaltyFeeBps: 50,
@@ -252,12 +252,35 @@ const highMarginData: CollectionMarketData = {
   uniqueWallets1Hour: 6,
   liquidityPassed: true
 };
-const highMarginCalc = pricingEngine.calculateMaxBid(highMarginData, 2.0, 10.0, 'robinhood');
+const highMarginCalc = pricingEngine.calculateMaxBid(highMarginData, 0.20, 10.0, 'robinhood');
 assert.strictEqual(highMarginCalc.decision, 'ACCEPT', 'High margin liquid trade must be accepted');
-assert(highMarginCalc.marginPercent >= 13.0, 'Profit margin must be >= 13%');
-assert(highMarginCalc.netProfitUsd >= 2.0, 'Net profit must be >= $2.00');
-console.log('Test 8 PASSED: Margin is ' + highMarginCalc.marginPercent + '% (>= 13%) and net profit is $' + highMarginCalc.netProfitUsd, '\n');
+assert(highMarginCalc.marginPercent >= 40.0, 'Profit margin must be >= 40%');
+assert(highMarginCalc.netProfitUsd > 0, 'Net profit must be positive');
+assert(highMarginCalc.bidPriceUsd <= 3.0, 'Bid price must be <= $3.00');
+console.log('Test 8 PASSED: Margin is ' + highMarginCalc.marginPercent + '% (>= 40%) and net profit is $' + highMarginCalc.netProfitUsd, '\n');
+
+// --------------------------------------------------------------------------
+// TEST 9: Strict $3.00 Maximum Buy Price Ceiling
+// --------------------------------------------------------------------------
+console.log('--- Test 9: Strict $3.00 Maximum Buy Price Ceiling ---');
+const expensiveData: CollectionMarketData = {
+  slug: 'expensive-nft',
+  contractAddress: '0x5555555555555555555555555555555555555555',
+  floorPriceEth: 0.008, // ~$21.60
+  topOfferEth: 0.003,   // ~$8.10
+  numListings: 10,
+  openseaFeeBps: 100,
+  royaltyFeeBps: 50,
+  ethPriceUsd: 2700,
+  timestamp: Date.now(),
+  sales1Hour: 25,
+  uniqueWallets1Hour: 8,
+  liquidityPassed: true
+};
+const expensiveCalc = pricingEngine.calculateMaxBid(expensiveData, 0.20, 10.0, 'robinhood');
+assert.strictEqual(expensiveCalc.decision, 'REJECT', 'Expensive trade (> $3 buy price) must be rejected');
+console.log('Test 9 PASSED: Trade above $3 correctly rejected:', expensiveCalc.reason, '\n');
 
 console.log('================================================================');
-console.log('All 8 Capital Allocation, Liquidity & Profitability tests passed successfully!');
+console.log('All 9 Capital Allocation, Liquidity & Profitability tests passed successfully!');
 console.log('================================================================');

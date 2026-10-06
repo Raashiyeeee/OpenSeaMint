@@ -154,44 +154,67 @@ export class PricingEngine {
     // Net proceeds after all fees AND gas
     const netProceedsAfterGasEth = netProceedsEth - estimatedGasCostEth;
 
-    // Maximum bid we can place and still hit target profit
-    let calculatedMaxBidEth = netProceedsAfterGasEth - targetProfitEth;
-
-    // Safety margin: bid must also be at least bidUnderFloorPercent below floor
+    // 1. Calculate Maximum Profitable Bid Price (Must yield >= 40% net profit margin and net profit > 0)
+    const minMarginPercent = this.config.profitTargets.defaultMinMarginPercent ?? 40.0;
+    const maxMarginBidEth = netProceedsAfterGasEth / (1 + (minMarginPercent / 100));
     const floorDiscountLimit = floor * (1 - (this.config.profitTargets.bidUnderFloorPercent / 100));
-    if (calculatedMaxBidEth > floorDiscountLimit) {
-      calculatedMaxBidEth = floorDiscountLimit;
+    const maxBuyPriceUsd = this.config.capital?.maxBuyPriceUsd ?? 3.00;
+    const maxBuyPriceEth = maxBuyPriceUsd / ethPriceUsd;
+
+    let maxProfitableBidEth = Math.min(
+      maxMarginBidEth,
+      floorDiscountLimit,
+      maxCapitalEth,
+      maxBuyPriceEth
+    );
+    maxProfitableBidEth = Math.floor(Math.max(0, maxProfitableBidEth) * 10000) / 10000;
+
+    // 2. Offer Increment & Top Offer Competition Rule
+    // "Always bid just above the current highest valid offer using a small increment. Never jump directly to maximum."
+    const topOfferEth = marketData.topOfferEth || 0;
+    let finalBidEth = 0;
+    let competitivePassed = true;
+    let competitiveReason = '';
+
+    if (topOfferEth > 0) {
+      const bidIncrementUsd = this.config.profitTargets?.bidIncrementUsd ?? 0.05;
+      const bidIncrementEth = Math.max(0.0001, Math.round((bidIncrementUsd / ethPriceUsd) * 10000) / 10000);
+      const nextCompetitiveBidEth = Math.round((topOfferEth + bidIncrementEth) * 10000) / 10000;
+
+      if (nextCompetitiveBidEth > maxProfitableBidEth) {
+        competitivePassed = false;
+        competitiveReason = `Competition Check Failed: Next competitive offer ($${(nextCompetitiveBidEth * ethPriceUsd).toFixed(2)}) exceeds maximum 40% profitable price ($${(maxProfitableBidEth * ethPriceUsd).toFixed(2)}). Rule: Never sacrifice 40% profit target.`;
+        finalBidEth = nextCompetitiveBidEth;
+      } else {
+        finalBidEth = nextCompetitiveBidEth;
+      }
+    } else {
+      // No existing offer: Start conservative well under floor and within 40-50% profit ceiling
+      const conservativeBaseEth = Math.floor(Math.min(maxProfitableBidEth, floor * 0.65) * 10000) / 10000;
+      finalBidEth = conservativeBaseEth;
     }
 
-    // Capital preservation constraint: Cannot bid more than available capital ($10)
-    if (calculatedMaxBidEth > maxCapitalEth) {
-      calculatedMaxBidEth = maxCapitalEth;
-    }
-
-    // OpenSea requires bids in multiples of 0.0001 ETH (max 4 decimal places)
-    calculatedMaxBidEth = Math.floor(Math.max(0, calculatedMaxBidEth) * 10000) / 10000;
-    const bidPriceUsd = roundToPrecision(calculatedMaxBidEth * ethPriceUsd, 2);
+    const bidPriceUsd = roundToPrecision(finalBidEth * ethPriceUsd, 2);
 
     // Recompute exact margins based on this bid price
-    const grossProfitEth = targetListPriceEth - calculatedMaxBidEth;
+    const grossProfitEth = targetListPriceEth - finalBidEth;
     const grossProfitUsd = roundToPrecision(grossProfitEth * ethPriceUsd, 2);
-    const netProfitEth = targetListPriceEth - totalFeesEth - calculatedMaxBidEth - estimatedGasCostEth;
+    const netProfitEth = targetListPriceEth - totalFeesEth - finalBidEth - estimatedGasCostEth;
     const netProfitUsd = roundToPrecision(netProfitEth * ethPriceUsd, 2);
-    const minMarginPercent = this.config.profitTargets.defaultMinMarginPercent ?? 13.0;
-    const marginPercent = calculatedMaxBidEth > 0 ? (netProfitEth / calculatedMaxBidEth) * 100 : 0;
+    const marginPercent = finalBidEth > 0 ? (netProfitEth / finalBidEth) * 100 : 0;
 
     // Check L: Liquidity Requirement (Mandatory: >= 15 sales in 1h AND >= 4 unique wallets)
     const sales1Hour = marketData.sales1Hour ?? 0;
     const uniqueWallets1Hour = marketData.uniqueWallets1Hour ?? 0;
     const minSales = this.config.liquidity?.minSales1Hour ?? 15;
     const minWallets = this.config.liquidity?.minUniqueWallets1Hour ?? 4;
-    const checkLLiquidityPassed = marketData.liquidityPassed ?? (sales1Hour >= minSales && uniqueWallets1Hour >= minWallets);
+    const checkLLiquidityPassed = sales1Hour >= minSales && uniqueWallets1Hour >= minWallets;
 
-    // Check A: Capital check ($10 limit & positive bid)
-    const checkACapitalPassed = calculatedMaxBidEth <= maxCapitalEth && calculatedMaxBidEth > 0;
+    // Check A: Capital check ($10 total capital, $3.00 max buy price, and positive bid)
+    const checkACapitalPassed = finalBidEth <= maxCapitalEth && finalBidEth > 0 && bidPriceUsd <= maxBuyPriceUsd;
 
-    // Check B: Profitability & Price Advantage check (Net profit >= $2.00 AND margin >= 13%)
-    const checkBProfitPassed = netProfitUsd >= minNetProfit && marginPercent >= minMarginPercent && netProfitUsd > 0;
+    // Check B: Profitability check (Net profit > 0, margin >= 40%, and competitive threshold passed)
+    const checkBProfitPassed = netProfitUsd > 0 && marginPercent >= minMarginPercent && competitivePassed;
 
     const isProfitable = checkLLiquidityPassed && checkACapitalPassed && checkBProfitPassed;
     const decision: 'ACCEPT' | 'REJECT' = isProfitable ? 'ACCEPT' : 'REJECT';
@@ -199,19 +222,21 @@ export class PricingEngine {
     let reason = 'All criteria passed: Liquidity, Capital, and Profitability verified';
     if (!checkLLiquidityPassed) {
       reason = `Liquidity Check Failed: ${sales1Hour}/${minSales} sales in last 1 hour (${uniqueWallets1Hour}/${minWallets} unique wallets). Rule: Volume is mandatory (Zero/Low-volume rejected)`;
+    } else if (bidPriceUsd > maxBuyPriceUsd) {
+      reason = `Check A Failed: Required bid ($${bidPriceUsd.toFixed(2)}) exceeds maximum buy price limit ($${maxBuyPriceUsd.toFixed(2)})`;
     } else if (!checkACapitalPassed) {
-      reason = `Check A Failed: Required bid ($${bidPriceUsd}) exceeds available capital limit ($${capUsd})`;
+      reason = `Check A Failed: Required bid ($${bidPriceUsd.toFixed(2)}) exceeds available capital limit ($${capUsd.toFixed(2)})`;
+    } else if (!competitivePassed) {
+      reason = competitiveReason;
     } else if (netProfitUsd <= 0) {
-      reason = `Check B Failed: Net profit ($${netProfitUsd}) is negative or zero after royalties, fees, and gas`;
+      reason = `Check B Failed: Net profit ($${netProfitUsd.toFixed(2)}) is negative or zero after royalties, fees, and gas`;
     } else if (marginPercent < minMarginPercent) {
-      reason = `Check B Failed: Margin (${marginPercent.toFixed(1)}%) is below minimum price advantage threshold (${minMarginPercent}%)`;
-    } else if (!checkBProfitPassed) {
-      reason = `Check B Failed: Net profit ($${netProfitUsd}) is below minimum requirement ($${minNetProfit})`;
+      reason = `Check B Failed: Margin (${marginPercent.toFixed(1)}%) is below mandatory 40% minimum net profit threshold (Rule: Trade must provide >= 40% net profit).`;
     }
 
     return {
       network: activeNetworkKey,
-      bidPriceEth: calculatedMaxBidEth,
+      bidPriceEth: finalBidEth,
       bidPriceUsd,
       targetListPriceEth,
       targetListPriceUsd,

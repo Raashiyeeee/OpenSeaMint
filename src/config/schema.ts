@@ -21,7 +21,8 @@ const TargetCollectionSchema = z.object({
 const CapitalSchema = z.object({
   totalTradingCapitalUsd: z.number().positive().default(10.0),
   maxActiveTrades: z.number().int().positive().default(1),
-  minNetProfitUsd: z.number().nonnegative().default(2.0)
+  minNetProfitUsd: z.number().nonnegative().default(0.20),
+  maxBuyPriceUsd: z.number().positive().default(3.0)
 });
 
 const LiquiditySchema = z.object({
@@ -62,9 +63,10 @@ const BotConfigSchema = z.object({
   }),
   profitTargets: z.object({
     defaultMinNetProfitUsd: z.number().positive(),
-    defaultMinMarginPercent: z.number().positive().default(13.0),
+    defaultMinMarginPercent: z.number().positive().default(40.0),
     undercutFloorByPercent: z.number().nonnegative(),
-    bidUnderFloorPercent: z.number().positive()
+    bidUnderFloorPercent: z.number().positive(),
+    bidIncrementUsd: z.number().positive().default(0.05)
   }),
   riskManagement: z.object({
     maxInventoryPerCollection: z.number().int().positive(),
