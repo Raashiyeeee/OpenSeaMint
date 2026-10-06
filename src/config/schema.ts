@@ -1,0 +1,109 @@
+import fs from 'fs';
+import path from 'path';
+import dotenv from 'dotenv';
+import { z } from 'zod';
+import { BotConfig } from '../types';
+import { logger } from '../utils/logger';
+
+dotenv.config();
+
+const TargetCollectionSchema = z.object({
+  name: z.string(),
+  slug: z.string(),
+  contractAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+  network: z.string().optional(),
+  enabled: z.boolean(),
+  maxBidEth: z.number().positive(),
+  targetNetProfitUsd: z.number().positive(),
+  maxInventory: z.number().int().positive()
+});
+
+const CapitalSchema = z.object({
+  totalTradingCapitalUsd: z.number().positive().default(10.0),
+  maxActiveTrades: z.number().int().positive().default(1),
+  minNetProfitUsd: z.number().nonnegative().default(2.0)
+});
+
+const LiquiditySchema = z.object({
+  minSales1Hour: z.number().int().nonnegative().default(15),
+  minUniqueWallets1Hour: z.number().int().nonnegative().default(4)
+});
+
+const NetworkInfoSchema = z.object({
+  name: z.string(),
+  rpcUrl: z.string(),
+  chainId: z.number().int().positive(),
+  currency: z.string(),
+  blockExplorer: z.string(),
+  estimatedGasCostUsd: z.number().nonnegative().default(0.01),
+  seaportAddress: z.string().optional(),
+  conduitKey: z.string().optional(),
+  wethAddress: z.string().optional()
+});
+
+const BotConfigSchema = z.object({
+  general: z.object({
+    network: z.enum(['robinhood', 'mainnet', 'base', 'polygon', 'sepolia']).optional(),
+    activeNetworks: z.array(z.string()).default(['robinhood', 'mainnet']),
+    currency: z.string(),
+    minBalanceReserveEth: z.number().nonnegative(),
+    maxTotalActiveOfferVolumeEth: z.number().positive(),
+    loopIntervalMs: z.number().int().positive(),
+    offerExpirationMinutes: z.number().int().positive(),
+    listingExpirationDays: z.number().int().positive()
+  }),
+  capital: CapitalSchema,
+  liquidity: LiquiditySchema.default({ minSales1Hour: 15, minUniqueWallets1Hour: 4 }),
+  networks: z.record(NetworkInfoSchema),
+  fees: z.object({
+    openseaFeeBps: z.number().nonnegative(),
+    defaultRoyaltyBps: z.number().nonnegative(),
+    maxAcceptableRoyaltyBps: z.number().nonnegative()
+  }),
+  profitTargets: z.object({
+    defaultMinNetProfitUsd: z.number().positive(),
+    defaultMinMarginPercent: z.number().positive().default(13.0),
+    undercutFloorByPercent: z.number().nonnegative(),
+    bidUnderFloorPercent: z.number().positive()
+  }),
+  riskManagement: z.object({
+    maxInventoryPerCollection: z.number().int().positive(),
+    maxTotalInventoryItems: z.number().int().positive(),
+    floorPriceDropThresholdPercent: z.number().positive(),
+    maxConsecutiveErrors: z.number().int().positive(),
+    emergencyStopOnLargeDrawdown: z.boolean()
+  }),
+  targetCollections: z.array(TargetCollectionSchema),
+  seaport: z.object({
+    version: z.string(),
+    contractAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+    conduitKey: z.string(),
+    zoneAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/)
+  })
+});
+
+export function loadConfig(configPath?: string): BotConfig {
+  const resolvedPath = configPath || path.resolve(__dirname, '../../config/default.json');
+  try {
+    const rawData = fs.readFileSync(resolvedPath, 'utf8');
+    const parsed = JSON.parse(rawData);
+
+    // Environment overrides for RPCs
+    if (process.env.ROBINHOOD_RPC_URL && parsed.networks?.robinhood) {
+      parsed.networks.robinhood.rpcUrl = process.env.ROBINHOOD_RPC_URL;
+    }
+    if (process.env.ETHEREUM_RPC_URL && parsed.networks?.mainnet) {
+      parsed.networks.mainnet.rpcUrl = process.env.ETHEREUM_RPC_URL;
+    }
+
+    if (!parsed.general.activeNetworks) {
+      parsed.general.activeNetworks = ['robinhood', 'mainnet'];
+    }
+
+    const validated = BotConfigSchema.parse(parsed);
+    return validated as BotConfig;
+  } catch (err: any) {
+    logger.error({ err }, `Failed to load or validate configuration from ${resolvedPath}`);
+    throw new Error(`Configuration error: ${err.message}`);
+  }
+}
