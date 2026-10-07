@@ -45,7 +45,7 @@ const NetworkInfoSchema = z.object({
 const BotConfigSchema = z.object({
   general: z.object({
     network: z.enum(['robinhood', 'mainnet', 'base', 'polygon', 'sepolia']).optional(),
-    activeNetworks: z.array(z.string()).default(['robinhood', 'mainnet']),
+    activeNetworks: z.array(z.string()).default(['robinhood']),
     currency: z.string(),
     minBalanceReserveEth: z.number().nonnegative(),
     maxTotalActiveOfferVolumeEth: z.number().positive(),
@@ -98,8 +98,12 @@ export function loadConfig(configPath?: string): BotConfig {
       parsed.networks.mainnet.rpcUrl = process.env.ETHEREUM_RPC_URL;
     }
 
-    if (!parsed.general.activeNetworks) {
-      parsed.general.activeNetworks = ['robinhood', 'mainnet'];
+    if (process.env.ACTIVE_NETWORKS) {
+      parsed.general.activeNetworks = process.env.ACTIVE_NETWORKS.split(',').map((s: string) => s.trim()).filter(Boolean);
+    }
+
+    if (!parsed.general.activeNetworks || parsed.general.activeNetworks.length === 0) {
+      parsed.general.activeNetworks = ['robinhood'];
     }
 
     const validated = BotConfigSchema.parse(parsed);
