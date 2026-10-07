@@ -37,7 +37,7 @@ export class InventoryManager {
 
     // Capital locked in acquired inventory awaiting sale
     for (const item of this.inventory.values()) {
-      if (item.status === 'PENDING_LISTING' || item.status === 'LISTED') {
+      if (item.status === 'PENDING_LISTING' || item.status === 'LISTED' || item.status === 'HOLDING') {
         allocatedUsd += item.acquiredPriceUsd || (item.acquiredPriceEth * ethPriceUsd);
       }
     }
@@ -89,7 +89,7 @@ export class InventoryManager {
       }
     }
     for (const item of this.inventory.values()) {
-      if (item.status === 'PENDING_LISTING' || item.status === 'LISTED') {
+      if (item.status === 'PENDING_LISTING' || item.status === 'LISTED' || item.status === 'HOLDING') {
         count++;
       }
     }
@@ -122,6 +122,15 @@ export class InventoryManager {
       item.listingOrderId = orderId;
       item.status = 'LISTED';
       logger.info({ identifier, listPriceEth, listPriceUsd }, 'Item listed on OpenSea');
+    }
+  }
+
+  public updateHoldStatus(identifier: string, holdReason: string): void {
+    const item = this.inventory.get(identifier);
+    if (item) {
+      item.status = 'HOLDING';
+      item.holdReason = holdReason;
+      logger.info({ identifier, holdReason }, 'Item held in inventory due to Floor Dump Protection');
     }
   }
 

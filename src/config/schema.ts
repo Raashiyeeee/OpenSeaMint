@@ -26,8 +26,13 @@ const CapitalSchema = z.object({
 });
 
 const LiquiditySchema = z.object({
-  minSales1Hour: z.number().int().nonnegative().default(15),
-  minUniqueWallets1Hour: z.number().int().nonnegative().default(4)
+  minSales3Hours: z.number().int().nonnegative().default(20),
+  minUniqueWallets3Hours: z.number().int().nonnegative().default(5),
+  minFloorMultiplier: z.number().positive().default(1.40),
+  floorRangeMinPercent: z.number().nonnegative().default(80.0),
+  floorRangeMaxPercent: z.number().nonnegative().default(135.0),
+  minSales1Hour: z.number().int().nonnegative().optional(),
+  minUniqueWallets1Hour: z.number().int().nonnegative().optional()
 });
 
 const NetworkInfoSchema = z.object({
@@ -54,7 +59,7 @@ const BotConfigSchema = z.object({
     listingExpirationDays: z.number().int().positive()
   }),
   capital: CapitalSchema,
-  liquidity: LiquiditySchema.default({ minSales1Hour: 15, minUniqueWallets1Hour: 4 }),
+  liquidity: LiquiditySchema.default({ minSales3Hours: 20, minUniqueWallets3Hours: 5, minFloorMultiplier: 1.40 }),
   networks: z.record(NetworkInfoSchema),
   fees: z.object({
     openseaFeeBps: z.number().nonnegative(),

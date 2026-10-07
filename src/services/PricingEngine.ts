@@ -113,6 +113,7 @@ export class PricingEngine {
   ): ProfitCalculationResult {
     const floor = marketData.floorPriceEth;
     const ethPriceUsd = marketData.ethPriceUsd || 2700;
+    const floorUsd = roundToPrecision(floor * ethPriceUsd, 2);
 
     const minNetProfit = targetNetProfitUsd ?? this.config.capital?.minNetProfitUsd ?? this.config.profitTargets.defaultMinNetProfitUsd ?? 2.0;
     const targetProfitEth = minNetProfit / ethPriceUsd;
@@ -154,43 +155,49 @@ export class PricingEngine {
     // Net proceeds after all fees AND gas
     const netProceedsAfterGasEth = netProceedsEth - estimatedGasCostEth;
 
-    // 1. Calculate Maximum Profitable Bid Price (Must yield >= 40% net profit margin and net profit > 0)
+    // 1. Calculate Maximum Profitable Bid Price (Must satisfy Floor >= 1.40 * Offer, >= 40% margin, and net profit > 0)
     const minMarginPercent = this.config.profitTargets.defaultMinMarginPercent ?? 40.0;
     const maxMarginBidEth = netProceedsAfterGasEth / (1 + (minMarginPercent / 100));
+    
+    // Rule 2: Floor Must Be At Least 40% Above Offer Price (Floor >= Offer * 1.40 => Offer <= Floor / 1.40)
+    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40;
+    const maxOfferFloorRuleEth = floor / minFloorMultiplier;
+
     const floorDiscountLimit = floor * (1 - (this.config.profitTargets.bidUnderFloorPercent / 100));
     const maxBuyPriceUsd = this.config.capital?.maxBuyPriceUsd ?? 3.00;
     const maxBuyPriceEth = maxBuyPriceUsd / ethPriceUsd;
 
     let maxProfitableBidEth = Math.min(
       maxMarginBidEth,
+      maxOfferFloorRuleEth,
       floorDiscountLimit,
       maxCapitalEth,
       maxBuyPriceEth
     );
     maxProfitableBidEth = Math.floor(Math.max(0, maxProfitableBidEth) * 1000000) / 1000000;
 
-    // 2. Offer Increment & Top Offer Competition Rule
-    // "Always bid just above the current highest valid offer using a small increment. Never jump directly to maximum."
+    // 2. Rule 4: Buy Rule & Competition Handling
+    // "The bot should place the highest competitive offer that remains within the profitable acquisition limit.
+    // It must never increase the offer to an unprofitable level merely to become the highest bidder."
     const topOfferEth = marketData.topOfferEth || 0;
     let finalBidEth = 0;
     let competitivePassed = true;
     let competitiveReason = '';
 
     if (topOfferEth > 0) {
-      const bidIncrementUsd = this.config.profitTargets?.bidIncrementUsd ?? 0.01;
-      const bidIncrementEth = Math.max(0.000001, roundToPrecision(bidIncrementUsd / ethPriceUsd, 6));
-      const nextCompetitiveBidEth = roundToPrecision(topOfferEth + bidIncrementEth, 6);
-
-      if (nextCompetitiveBidEth > maxProfitableBidEth) {
+      if (topOfferEth >= maxProfitableBidEth) {
         competitivePassed = false;
-        competitiveReason = `Competition Check Failed: Next competitive offer ($${(nextCompetitiveBidEth * ethPriceUsd).toFixed(2)}) exceeds maximum 40% profitable price ($${(maxProfitableBidEth * ethPriceUsd).toFixed(2)}). Rule: Never sacrifice 40% profit target.`;
-        finalBidEth = maxProfitableBidEth;
+        competitiveReason = `Competition Check Failed: Top offer (${topOfferEth} ETH / $${(topOfferEth * ethPriceUsd).toFixed(2)}) is at or above maximum profitable price ($${(maxProfitableBidEth * ethPriceUsd).toFixed(2)}). Rule: Never increase offer to unprofitable level to become highest bidder.`;
+        finalBidEth = topOfferEth;
       } else {
-        finalBidEth = nextCompetitiveBidEth;
+        const bidIncrementUsd = this.config.profitTargets?.bidIncrementUsd ?? 0.01;
+        const bidIncrementEth = Math.max(0.000001, roundToPrecision(bidIncrementUsd / ethPriceUsd, 6));
+        const nextCompetitiveBidEth = roundToPrecision(topOfferEth + bidIncrementEth, 6);
+        finalBidEth = Math.min(nextCompetitiveBidEth, maxProfitableBidEth);
       }
     } else {
-      // No existing offer: Start conservative well under floor and within 40-50% profit ceiling
-      const conservativeBaseEth = roundToPrecision(Math.min(maxProfitableBidEth, floor * 0.65), 6);
+      // No existing offer: Bid within 40% floor rule ceiling
+      const conservativeBaseEth = roundToPrecision(Math.min(maxProfitableBidEth, floor / minFloorMultiplier), 6);
       finalBidEth = conservativeBaseEth;
     }
 
@@ -203,12 +210,16 @@ export class PricingEngine {
     const netProfitUsd = roundToPrecision(netProfitEth * ethPriceUsd, 2);
     const marginPercent = finalBidEth > 0 ? (netProfitEth / finalBidEth) * 100 : 0;
 
-    // Check L: Liquidity Requirement (Mandatory: >= 15 sales in 1h AND >= 4 unique wallets, or verified sustained volume)
-    const sales1Hour = marketData.sales1Hour ?? 0;
-    const uniqueWallets1Hour = marketData.uniqueWallets1Hour ?? 0;
-    const minSales = this.config.liquidity?.minSales1Hour ?? 15;
-    const minWallets = this.config.liquidity?.minUniqueWallets1Hour ?? 4;
-    const checkLLiquidityPassed = (sales1Hour >= minSales && uniqueWallets1Hour >= minWallets) || (marketData.liquidityPassed === true);
+    // Rule 1, 3, 10: ETH Floor-Sale Liquidity Requirement
+    // Within previous 3 hours: >= 20 sales, >= 5 unique wallets, native ETH, around floor range
+    const sales3Hours = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    const uniqueWallets3Hours = marketData.uniqueWallets3Hours ?? marketData.uniqueWallets1Hour ?? 0;
+    const minSales = this.config.liquidity?.minSales3Hours ?? 20;
+    const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 5;
+    const checkLLiquidityPassed = (sales3Hours >= minSales && uniqueWallets3Hours >= minWallets) || (marketData.liquidityPassed === true);
+
+    // Rule 2: Floor >= Offer * 1.40 check
+    const checkFFloorRatioPassed = finalBidEth > 0 && floor >= (finalBidEth * minFloorMultiplier - 0.000001);
 
     // Check A: Capital check ($10 total capital, $3.00 max buy price, and positive bid)
     const checkACapitalPassed = finalBidEth <= maxCapitalEth && finalBidEth > 0 && bidPriceUsd <= maxBuyPriceUsd;
@@ -216,12 +227,14 @@ export class PricingEngine {
     // Check B: Profitability check (Net profit > 0, margin >= 40%, and competitive threshold passed)
     const checkBProfitPassed = netProfitUsd > 0 && marginPercent >= minMarginPercent && competitivePassed;
 
-    const isProfitable = checkLLiquidityPassed && checkACapitalPassed && checkBProfitPassed;
+    const isProfitable = checkLLiquidityPassed && checkFFloorRatioPassed && checkACapitalPassed && checkBProfitPassed;
     const decision: 'ACCEPT' | 'REJECT' = isProfitable ? 'ACCEPT' : 'REJECT';
 
-    let reason = 'All criteria passed: Liquidity, Capital, and Profitability verified';
+    let reason = 'All criteria passed: Liquidity, Floor Ratio (>= 140%), Capital, and Profitability verified';
     if (!checkLLiquidityPassed) {
-      reason = `Liquidity Check Failed: ${sales1Hour}/${minSales} sales in last 1 hour (${uniqueWallets1Hour}/${minWallets} unique wallets). Rule: Volume is mandatory (Zero/Low-volume rejected)`;
+      reason = marketData.liquidityReason || `ETH Floor-Sale Liquidity Failed: ${sales3Hours}/${minSales} sales in last 3h (${uniqueWallets3Hours}/${minWallets} wallets). Rule: Real native-ETH sales must support floor.`;
+    } else if (!checkFFloorRatioPassed) {
+      reason = `Floor Ratio Check Failed: Current floor ($${floorUsd.toFixed(2)}) is not at least 40% above offer ($${bidPriceUsd.toFixed(2)}). Required floor: >= $${(bidPriceUsd * minFloorMultiplier).toFixed(2)}. Rule: Floor Price >= Offer Price * 1.40.`;
     } else if (bidPriceUsd > maxBuyPriceUsd) {
       reason = `Check A Failed: Required bid ($${bidPriceUsd.toFixed(2)}) exceeds maximum buy price limit ($${maxBuyPriceUsd.toFixed(2)})`;
     } else if (!checkACapitalPassed) {
@@ -253,9 +266,12 @@ export class PricingEngine {
       netProfitEth: roundToPrecision(netProfitEth, 6),
       netProfitUsd,
       marginPercent: roundToPrecision(marginPercent, 2),
-      sales1Hour,
-      uniqueWallets1Hour,
+      sales1Hour: marketData.sales1Hour,
+      uniqueWallets1Hour: marketData.uniqueWallets1Hour,
+      sales3Hours,
+      uniqueWallets3Hours,
       checkLLiquidityPassed,
+      checkFFloorRatioPassed,
       checkACapitalPassed,
       checkBProfitPassed,
       isProfitable,
@@ -265,8 +281,110 @@ export class PricingEngine {
   }
 
   /**
-   * Calculates the optimal listing price when an item is acquired.
-   * Ensures target profit is captured while remaining competitive at the floor.
+   * Calculates the minimum profitable listing price.
+   * Rule 6: Never sell below acquisition cost (listPrice >= acquiredPrice).
+   * Rule 7: No loss selling (proceeds after fees & gas must yield positive profit).
+   */
+  public getMinProfitableListPrice(
+    acquiredPriceEth: number,
+    marketData: { openseaFeeBps: number; royaltyFeeBps: number; ethPriceUsd: number },
+    targetProfitUsd?: number,
+    networkKey?: string
+  ): {
+    minProfitablePriceEth: number;
+    hardBreakevenPriceEth: number;
+    estimatedGasCostEth: number;
+    totalFeeRate: number;
+  } {
+    const ethPriceUsd = marketData.ethPriceUsd || 2700;
+    const profitGoalUsd = targetProfitUsd ?? this.config.capital?.minNetProfitUsd ?? this.config.profitTargets.defaultMinNetProfitUsd ?? 0.20;
+    const profitGoalEth = profitGoalUsd / ethPriceUsd;
+
+    const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
+    const networkInfo = this.config.networks?.[activeNetworkKey];
+    const estimatedGasCostUsd = networkInfo?.estimatedGasCostUsd ?? (activeNetworkKey === 'mainnet' ? 3.50 : 0.01);
+    const estimatedGasCostEth = estimatedGasCostUsd / ethPriceUsd;
+
+    const openseaFeeRate = (marketData.openseaFeeBps || 50) / 10000;
+    const royaltyFeeRate = (marketData.royaltyFeeBps || 50) / 10000;
+    const totalFeeRate = openseaFeeRate + royaltyFeeRate;
+
+    // Hard rule: List price must NEVER be below acquiredPriceEth (Rule 6)
+    // No-loss selling: proceeds after fees & gas must cover cost + profit (Rule 7)
+    const minProfitablePriceEth = Math.max(
+      acquiredPriceEth,
+      roundToPrecision((acquiredPriceEth + profitGoalEth + estimatedGasCostEth) / (1 - totalFeeRate), 6)
+    );
+
+    const hardBreakevenPriceEth = Math.max(
+      acquiredPriceEth,
+      roundToPrecision((acquiredPriceEth + estimatedGasCostEth) / (1 - totalFeeRate), 6)
+    );
+
+    return {
+      minProfitablePriceEth,
+      hardBreakevenPriceEth,
+      estimatedGasCostEth,
+      totalFeeRate
+    };
+  }
+
+  /**
+   * Evaluates whether an acquired NFT should be listed or held.
+   * Rules 5, 6, 7, 8, 9, 11:
+   * - If floor drops below minimum profitable price -> HOLD (Floor Dump Protection)
+   * - If market supports profitable sale -> LIST at lowest competitive floor price
+   */
+  public evaluateListingOrHold(
+    acquiredPriceEth: number,
+    currentFloorEth: number,
+    marketData: { openseaFeeBps: number; royaltyFeeBps: number; ethPriceUsd: number },
+    targetProfitUsd?: number,
+    networkKey?: string
+  ): {
+    action: 'LIST' | 'HOLD';
+    recommendedListPriceEth?: number;
+    expectedNetProfitUsd?: number;
+    minProfitablePriceEth: number;
+    reason: string;
+  } {
+    const { minProfitablePriceEth, totalFeeRate, estimatedGasCostEth } = this.getMinProfitableListPrice(
+      acquiredPriceEth,
+      marketData,
+      targetProfitUsd,
+      networkKey
+    );
+    const ethPriceUsd = marketData.ethPriceUsd || 2700;
+
+    // Rule 8: Floor Dump Protection
+    if (currentFloorEth < minProfitablePriceEth) {
+      return {
+        action: 'HOLD',
+        minProfitablePriceEth,
+        reason: `Floor Dump Protection: Market floor (${currentFloorEth} ETH / $${(currentFloorEth * ethPriceUsd).toFixed(2)}) fell below min profitable price (${minProfitablePriceEth} ETH / $${(minProfitablePriceEth * ethPriceUsd).toFixed(2)}). HOLDING NFT to prevent loss selling.`
+      };
+    }
+
+    // Rule 5: Lowest competitive floor listing (e.g. undercut by 1% while staying >= minProfitablePriceEth)
+    const undercutPercent = this.config.profitTargets.undercutFloorByPercent ?? 1.0;
+    const competitiveFloorPrice = currentFloorEth * (1 - undercutPercent / 100);
+    const finalListingPriceEth = roundToPrecision(Math.max(minProfitablePriceEth, competitiveFloorPrice), 6);
+
+    const netProceeds = finalListingPriceEth * (1 - totalFeeRate);
+    const netProfitEth = netProceeds - acquiredPriceEth - estimatedGasCostEth;
+    const expectedNetProfitUsd = roundToPrecision(netProfitEth * ethPriceUsd, 2);
+
+    return {
+      action: 'LIST',
+      recommendedListPriceEth: finalListingPriceEth,
+      expectedNetProfitUsd,
+      minProfitablePriceEth,
+      reason: `Market supports profitable sale: Listing at lowest competitive floor price (${finalListingPriceEth} ETH).`
+    };
+  }
+
+  /**
+   * Calculates the optimal listing price when an item is acquired (backward compatible wrapper).
    */
   public calculateRelistPrice(
     acquiredPriceEth: number,
@@ -275,48 +393,30 @@ export class PricingEngine {
     targetProfitUsd?: number,
     networkKey?: string
   ): { listPriceEth: number; expectedNetProfitUsd: number; strategy: string } {
-    const ethPriceUsd = marketData.ethPriceUsd || 2700;
-    const profitGoalUsd = targetProfitUsd ?? this.config.capital?.minNetProfitUsd ?? this.config.profitTargets.defaultMinNetProfitUsd ?? 2.0;
-    const profitGoalEth = profitGoalUsd / ethPriceUsd;
+    const evalResult = this.evaluateListingOrHold(
+      acquiredPriceEth,
+      currentFloorEth,
+      marketData,
+      targetProfitUsd,
+      networkKey
+    );
 
-    // Gas estimate
-    const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
-    const networkInfo = this.config.networks?.[activeNetworkKey];
-    const estimatedGasCostUsd = networkInfo?.estimatedGasCostUsd ?? (activeNetworkKey === 'mainnet' ? 3.50 : 0.01);
-    const estimatedGasCostEth = estimatedGasCostUsd / ethPriceUsd;
-
-    const openseaFeeRate = marketData.openseaFeeBps / 10000;
-    const royaltyFeeRate = marketData.royaltyFeeBps / 10000;
-    const totalFeeRate = openseaFeeRate + royaltyFeeRate;
-
-    // Break-even + target profit required list price including gas:
-    // RequiredListPrice = (acquiredPriceEth + profitGoalEth + estimatedGasCostEth) / (1 - totalFeeRate)
-    const minRequiredListPrice = (acquiredPriceEth + profitGoalEth + estimatedGasCostEth) / (1 - totalFeeRate);
-
-    // Competitive floor listing (e.g. at or 1% below floor)
-    const competitiveFloorPrice = currentFloorEth * (1 - (this.config.profitTargets.undercutFloorByPercent / 100));
-
-    let finalListingPriceEth = Math.max(minRequiredListPrice, competitiveFloorPrice);
-    finalListingPriceEth = roundToPrecision(finalListingPriceEth, 6);
-
-    // Calculate expected net profit
-    const netProceeds = finalListingPriceEth * (1 - totalFeeRate);
-    const netProfitEth = netProceeds - acquiredPriceEth - estimatedGasCostEth;
-    const expectedNetProfitUsd = roundToPrecision(netProfitEth * ethPriceUsd, 2);
-
-    let strategy = 'COMPETITIVE_FLOOR';
-    if (minRequiredListPrice > competitiveFloorPrice) {
-      strategy = 'PROFIT_PRESERVING_ABOVE_FLOOR';
+    if (evalResult.action === 'HOLD') {
       logger.warn(
-        { acquiredPriceEth, currentFloorEth, minRequiredListPrice, competitiveFloorPrice },
-        'Floor dropped below ideal spread: listing priced to preserve target profit above current floor'
+        { acquiredPriceEth, currentFloorEth, minProfitablePriceEth: evalResult.minProfitablePriceEth },
+        'Floor dropped below minimum profitable threshold: Listing priced at minimum profitable ceiling to hold/prevent loss sale'
       );
+      return {
+        listPriceEth: evalResult.minProfitablePriceEth,
+        expectedNetProfitUsd: 0.20,
+        strategy: 'HOLD_PROTECTION_ABOVE_FLOOR'
+      };
     }
 
     return {
-      listPriceEth: finalListingPriceEth,
-      expectedNetProfitUsd,
-      strategy
+      listPriceEth: evalResult.recommendedListPriceEth || evalResult.minProfitablePriceEth,
+      expectedNetProfitUsd: evalResult.expectedNetProfitUsd || 0.20,
+      strategy: 'COMPETITIVE_FLOOR'
     };
   }
 }

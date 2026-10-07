@@ -281,6 +281,48 @@ const expensiveCalc = pricingEngine.calculateMaxBid(expensiveData, 0.20, 10.0, '
 assert.strictEqual(expensiveCalc.decision, 'REJECT', 'Expensive trade (> $3 buy price) must be rejected');
 console.log('Test 9 PASSED: Trade above $3 correctly rejected:', expensiveCalc.reason, '\n');
 
+// --------------------------------------------------------------------------
+// TEST 10: Floor Dump Protection & Relist/Hold Evaluation (Rule 6, 7, 8)
+// Acquired at 0.001 ETH (~$2.70). Min profitable price is ~0.001185 ETH (~$3.20).
+// Case 10a: Floor dumps to 0.0009 ETH (< min profitable price) -> MUST HOLD!
+// Case 10b: Floor rises to 0.0020 ETH (> min profitable price) -> MUST LIST!
+// --------------------------------------------------------------------------
+console.log('--- Test 10: Floor Dump Protection & Listing Evaluation ---');
+const marketFees = { openseaFeeBps: 50, royaltyFeeBps: 50, ethPriceUsd: 2700 };
+const dumpEval = pricingEngine.evaluateListingOrHold(0.001, 0.0009, marketFees, 0.20, 'robinhood');
+assert.strictEqual(dumpEval.action, 'HOLD', 'Dumped floor must trigger HOLD action');
+assert(dumpEval.reason.includes('Floor Dump Protection'), 'Reason must cite Floor Dump Protection');
+console.log('Case 10a PASSED: Dumped floor correctly held:', dumpEval.reason);
+
+const normalEval = pricingEngine.evaluateListingOrHold(0.001, 0.0020, marketFees, 0.20, 'robinhood');
+assert.strictEqual(normalEval.action, 'LIST', 'Healthy floor must trigger LIST action');
+assert(normalEval.recommendedListPriceEth! >= dumpEval.minProfitablePriceEth, 'List price must be >= min profitable price');
+assert(normalEval.expectedNetProfitUsd! > 0, 'Expected net profit must be positive');
+console.log('Case 10b PASSED: Healthy floor correctly listed at ' + normalEval.recommendedListPriceEth + ' ETH, profit: $' + normalEval.expectedNetProfitUsd, '\n');
+
+// --------------------------------------------------------------------------
+// TEST 11: Inventory Manager HOLDING Status & Capital Locking
+// --------------------------------------------------------------------------
+console.log('--- Test 11: Inventory Manager HOLDING Status & Capital Locking ---');
+const holdInvManager = new InventoryManager(config);
+holdInvManager.addInventoryItem({
+  identifier: 'test-contract:42',
+  collectionSlug: 'test-collection',
+  contractAddress: '0x1234567890123456789012345678901234567890',
+  tokenId: '42',
+  acquiredPriceEth: 0.003,
+  acquiredPriceUsd: 8.10,
+  acquiredAtTimestamp: Date.now(),
+  status: 'PENDING_LISTING'
+});
+
+holdInvManager.updateHoldStatus('test-contract:42', 'Market floor dumped');
+assert.strictEqual(holdInvManager.getActiveTradesCount(), 1, 'Holding item must count as active trade');
+assert.strictEqual(holdInvManager.getAllocatedCapitalUsd(2700), 8.10, 'Holding item must lock capital');
+const blockedCheck = holdInvManager.canAllocateCapital(5.0);
+assert.strictEqual(blockedCheck.allowed, false, 'New trade must be blocked while item is being held');
+console.log('Test 11 PASSED: Held item correctly locks capital and prevents new trades: ' + blockedCheck.reason, '\n');
+
 console.log('================================================================');
-console.log('All 9 Capital Allocation, Liquidity & Profitability tests passed successfully!');
+console.log('All 11 Capital Allocation, Liquidity, Floor Protection & Profitability tests passed successfully!');
 console.log('================================================================');

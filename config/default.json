@@ -15,8 +15,11 @@
     "minNetProfitUsd": 0.20
   },
   "liquidity": {
-    "minSales1Hour": 15,
-    "minUniqueWallets1Hour": 4
+    "minSales3Hours": 20,
+    "minUniqueWallets3Hours": 5,
+    "minFloorMultiplier": 1.40,
+    "floorRangeMinPercent": 80.0,
+    "floorRangeMaxPercent": 135.0
   },
   "networks": {
     "robinhood": {
