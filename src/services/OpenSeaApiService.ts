@@ -112,8 +112,8 @@ export class OpenSeaApiService {
         logger.debug(`Could not fetch active offers via API for ${collectionSlug}: ${err.message}`);
       }
 
-      // 4. Fetch Liquidity Metrics
-      const liquidity = await this.getCollectionLiquidity(collectionSlug);
+      // 4. Fetch Liquidity Metrics with floor reference
+      const liquidity = await this.getCollectionLiquidity(collectionSlug, floorPriceEth);
 
       return {
         slug: collectionSlug,
@@ -127,7 +127,11 @@ export class OpenSeaApiService {
         timestamp: Date.now(),
         sales1Hour: liquidity.sales1Hour,
         uniqueWallets1Hour: liquidity.uniqueWallets1Hour,
-        liquidityPassed: liquidity.liquidityPassed
+        sales3Hours: liquidity.sales3Hours,
+        uniqueWallets3Hours: liquidity.uniqueWallets3Hours,
+        floorSalesCount: liquidity.sales3Hours,
+        liquidityPassed: liquidity.liquidityPassed,
+        liquidityReason: liquidity.liquidityReason
       };
     } catch (err: any) {
       logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch OpenSea market data via API, generating conservative market estimate');
@@ -145,61 +149,127 @@ export class OpenSeaApiService {
         timestamp: Date.now(),
         sales1Hour: 0,
         uniqueWallets1Hour: 0,
-        liquidityPassed: false
+        sales3Hours: 0,
+        uniqueWallets3Hours: 0,
+        liquidityPassed: false,
+        liquidityReason: 'Conservative fallback on error'
       };
     }
   }
 
   /**
-   * Fetch 1-hour completed sales and unique wallets for liquidity verification
-   * MANDATORY HARD FILTER:
-   * Last 1 Hour: Minimum completed sales: 15 AND Minimum unique wallets: 4.
-   * If either condition fails: DO NOT PLACE OFFER.
+   * Fetch 3-hour completed floor-level sales and unique wallets for liquidity verification
+   * MANDATORY HARD RULES (Rules 1, 3, 10):
+   * 1. Window: Last 3 hours
+   * 2. At least 20 completed sales
+   * 3. Made using native ETH (ETH or WETH)
+   * 4. At least 5 different wallets (buyers/sellers)
+   * 5. Sales must occur at or around current floor price range (e.g. 80% to 135% of floor)
+   * 6. Sales at low offer prices must NOT be counted!
+   * 7. Arbitrary high outlier sales must NOT be counted!
+   * If any condition fails: DO NOT PLACE OFFER.
    */
-  public async getCollectionLiquidity(collectionSlug: string): Promise<{
+  public async getCollectionLiquidity(
+    collectionSlug: string,
+    floorPriceEth: number = 0
+  ): Promise<{
+    sales3Hours: number;
+    uniqueWallets3Hours: number;
     sales1Hour: number;
     uniqueWallets1Hour: number;
     liquidityPassed: boolean;
+    liquidityReason?: string;
   }> {
-    const minSales = this.config.liquidity?.minSales1Hour ?? 15;
-    const minWallets = this.config.liquidity?.minUniqueWallets1Hour ?? 4;
+    const minSales = this.config.liquidity?.minSales3Hours ?? 20;
+    const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 5;
+    const threeHoursAgo = Math.floor(Date.now() / 1000) - (3 * 3600);
     const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
 
-    try {
-      let oneDaySales = 0;
-      try {
-        const statsRes = await this.client.get(`/collections/${collectionSlug}/stats`);
-        oneDaySales = statsRes.data?.intervals?.find((i: any) => i.interval === 'one_day')?.sales || 0;
-      } catch {}
+    const floorMinPercent = (this.config.liquidity?.floorRangeMinPercent ?? 80.0) / 100;
+    const floorMaxPercent = (this.config.liquidity?.floorRangeMaxPercent ?? 135.0) / 100;
+    const minFloorAllowed = floorPriceEth > 0 ? floorPriceEth * floorMinPercent : 0;
+    const maxFloorAllowed = floorPriceEth > 0 ? floorPriceEth * floorMaxPercent : Infinity;
 
+    try {
       const res = await this.client.get(`/events/collection/${collectionSlug}?event_type=sale&limit=50`);
       const events = res.data?.asset_events || [];
-      const sales1HourList = events.filter((e: any) => (e.event_timestamp || 0) >= oneHourAgo);
 
-      const wallets = new Set<string>();
-      for (const sale of sales1HourList) {
-        if (sale.buyer) wallets.add(sale.buyer.toLowerCase());
-        if (sale.seller) wallets.add(sale.seller.toLowerCase());
+      // Filter events to previous 3 hours
+      const sales3HoursRaw = events.filter((e: any) => (e.event_timestamp || 0) >= threeHoursAgo);
+
+      // Filter for Native ETH, around current floor, excluding low offer sales & high outliers
+      const qualifiedSales: any[] = [];
+      const wallets3Hours = new Set<string>();
+      let belowFloorOfferSalesCount = 0;
+      let outlierHighSalesCount = 0;
+
+      for (const sale of sales3HoursRaw) {
+        // Native ETH verification (symbol ETH or WETH)
+        const symbol = (sale.payment?.symbol || sale.payment_token?.symbol || 'ETH').toUpperCase();
+        if (symbol !== 'ETH' && symbol !== 'WETH') {
+          continue;
+        }
+
+        // Parse price
+        let salePriceEth = 0;
+        if (sale.payment?.quantity && sale.payment?.decimals) {
+          salePriceEth = parseFloat(sale.payment.quantity) / Math.pow(10, sale.payment.decimals);
+        } else if (sale.payment_token?.eth_price) {
+          salePriceEth = parseFloat(sale.payment_token.eth_price);
+        } else if (sale.total_price) {
+          const dec = sale.payment_token?.decimals || 18;
+          salePriceEth = parseFloat(sale.total_price) / Math.pow(10, dec);
+        }
+
+        // If floor is known, verify price is around the floor range
+        if (floorPriceEth > 0 && salePriceEth > 0) {
+          if (salePriceEth < minFloorAllowed) {
+            belowFloorOfferSalesCount++;
+            continue;
+          }
+          if (salePriceEth > maxFloorAllowed) {
+            outlierHighSalesCount++;
+            continue;
+          }
+        }
+
+        qualifiedSales.push(sale);
+        if (sale.buyer) wallets3Hours.add(sale.buyer.toLowerCase());
+        if (sale.seller) wallets3Hours.add(sale.seller.toLowerCase());
       }
 
-      const sales1Hour = sales1HourList.length;
-      const uniqueWallets1Hour = wallets.size;
-      const direct1hPassed = sales1Hour >= minSales && uniqueWallets1Hour >= minWallets;
-      // High sustained 24h volume (e.g. >= 15 sales in 1 day with recent activity)
-      const sustainedDailyPassed = oneDaySales >= 15 && (uniqueWallets1Hour >= 1 || sales1Hour >= 1);
-      const liquidityPassed = direct1hPassed || sustainedDailyPassed;
+      const sales3Hours = qualifiedSales.length;
+      const uniqueWallets3Hours = wallets3Hours.size;
+      const sales1HourList = qualifiedSales.filter((e: any) => (e.event_timestamp || 0) >= oneHourAgo);
+      const wallets1Hour = new Set<string>();
+      for (const s of sales1HourList) {
+        if (s.buyer) wallets1Hour.add(s.buyer.toLowerCase());
+        if (s.seller) wallets1Hour.add(s.seller.toLowerCase());
+      }
+
+      const liquidityPassed = sales3Hours >= minSales && uniqueWallets3Hours >= minWallets;
+      let liquidityReason = 'Passed 3-hour native ETH floor liquidity check';
+      if (!liquidityPassed) {
+        liquidityReason = `Floor Liquidity Failed: ${sales3Hours}/${minSales} qualified floor sales in last 3h (${uniqueWallets3Hours}/${minWallets} unique wallets). Excluded ${belowFloorOfferSalesCount} low offer sales & ${outlierHighSalesCount} high outliers.`;
+      }
 
       return {
-        sales1Hour: sales1Hour || (sustainedDailyPassed ? minSales : 0),
-        uniqueWallets1Hour: uniqueWallets1Hour || (sustainedDailyPassed ? minWallets : 0),
-        liquidityPassed
+        sales3Hours,
+        uniqueWallets3Hours,
+        sales1Hour: sales1HourList.length,
+        uniqueWallets1Hour: wallets1Hour.size,
+        liquidityPassed,
+        liquidityReason
       };
     } catch (err: any) {
       logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch liquidity events from OpenSea');
       return {
+        sales3Hours: 0,
+        uniqueWallets3Hours: 0,
         sales1Hour: 0,
         uniqueWallets1Hour: 0,
-        liquidityPassed: false
+        liquidityPassed: false,
+        liquidityReason: `API error fetching liquidity: ${err.message}`
       };
     }
   }

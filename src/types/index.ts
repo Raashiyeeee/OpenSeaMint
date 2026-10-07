@@ -18,8 +18,13 @@ export interface CapitalConfig {
 }
 
 export interface LiquidityConfig {
-  minSales1Hour: number;        // Minimum 15 sales in last 1 hour
-  minUniqueWallets1Hour: number; // Minimum 4 unique wallets in last 1 hour
+  minSales3Hours: number;           // Minimum 20 sales in last 3 hours
+  minUniqueWallets3Hours: number;    // Minimum 5 unique wallets in last 3 hours
+  minFloorMultiplier?: number;      // Floor must be >= 1.40 * Offer
+  floorRangeMinPercent?: number;    // Floor sales range min (e.g. 80%)
+  floorRangeMaxPercent?: number;    // Floor sales range max (e.g. 135%)
+  minSales1Hour?: number;           // Backward compatibility
+  minUniqueWallets1Hour?: number;   // Backward compatibility
 }
 
 export interface BotConfig {
@@ -85,9 +90,13 @@ export interface CollectionMarketData {
   royaltyFeeBps: number;
   ethPriceUsd: number;
   timestamp: number;
-  sales1Hour: number;
-  uniqueWallets1Hour: number;
+  sales1Hour?: number;
+  uniqueWallets1Hour?: number;
+  sales3Hours?: number;
+  uniqueWallets3Hours?: number;
+  floorSalesCount?: number;
   liquidityPassed: boolean;
+  liquidityReason?: string;
 }
 
 export interface ProfitCalculationResult {
@@ -111,7 +120,10 @@ export interface ProfitCalculationResult {
   marginPercent: number;
   sales1Hour?: number;
   uniqueWallets1Hour?: number;
+  sales3Hours?: number;
+  uniqueWallets3Hours?: number;
   checkLLiquidityPassed: boolean;
+  checkFFloorRatioPassed: boolean;
   checkACapitalPassed: boolean;
   checkBProfitPassed: boolean;
   isProfitable: boolean;
@@ -132,7 +144,8 @@ export interface InventoryItem {
   currentListingPriceEth?: number;
   currentListingPriceUsd?: number;
   listingOrderId?: string;
-  status: 'PENDING_LISTING' | 'LISTED' | 'SOLD' | 'ERROR';
+  status: 'PENDING_LISTING' | 'LISTED' | 'HOLDING' | 'SOLD' | 'ERROR';
+  holdReason?: string;
   salePriceEth?: number;
   salePriceUsd?: number;
   realizedProfitEth?: number;

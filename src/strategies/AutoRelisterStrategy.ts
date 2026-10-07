@@ -68,7 +68,7 @@ export class AutoRelisterStrategy {
   public async scanAndRelistUnlistedInventory(walletAddress: string): Promise<void> {
     const unlisted = this.inventoryManager
       .getAllInventory()
-      .filter((i) => i.status === 'PENDING_LISTING');
+      .filter((i) => i.status === 'PENDING_LISTING' || i.status === 'HOLDING');
 
     for (const item of unlisted) {
       try {
@@ -92,8 +92,8 @@ export class AutoRelisterStrategy {
     );
     const targetProfitUsd = targetConfig?.targetNetProfitUsd || this.config.profitTargets.defaultMinNetProfitUsd;
 
-    // 3. Compute optimal listing price via PricingEngine
-    const relistCalc = this.pricingEngine.calculateRelistPrice(
+    // 3. Evaluate listing vs holding (Rule 8: Floor Dump Protection & Rule 6: No Loss Selling)
+    const listingEval = this.pricingEngine.evaluateListingOrHold(
       item.acquiredPriceEth,
       marketData.floorPriceEth,
       {
@@ -104,22 +104,34 @@ export class AutoRelisterStrategy {
       targetProfitUsd
     );
 
+    if (listingEval.action === 'HOLD') {
+      logger.warn(
+        { identifier: item.identifier, reason: listingEval.reason },
+        'Floor Dump Protection active: Holding NFT to prevent loss sale'
+      );
+      this.inventoryManager.updateHoldStatus(item.identifier, listingEval.reason);
+      return;
+    }
+
+    const listPriceEth = listingEval.recommendedListPriceEth!;
+    const expectedNetProfitUsd = listingEval.expectedNetProfitUsd!;
+
     logger.info(
       {
         identifier: item.identifier,
         acquiredPriceEth: item.acquiredPriceEth,
-        listPriceEth: relistCalc.listPriceEth,
-        expectedNetProfitUsd: relistCalc.expectedNetProfitUsd,
-        strategy: relistCalc.strategy
+        listPriceEth,
+        expectedNetProfitUsd,
+        minProfitablePriceEth: listingEval.minProfitablePriceEth
       },
-      'Listing NFT on OpenSea'
+      'Market supports profitable sale: Listing NFT on OpenSea'
     );
 
     // 4. Create and sign Seaport listing (off-chain EIP-712, 0 gas!)
     const { orderComponents, signature } = await this.seaportService.createSignedListing(
       item.contractAddress,
       item.tokenId,
-      relistCalc.listPriceEth,
+      listPriceEth,
       marketData.openseaFeeBps,
       this.config.general.listingExpirationDays
     );
@@ -137,10 +149,10 @@ export class AutoRelisterStrategy {
     const res = await this.apiService.postListing(chainSlug, postPayload);
 
     // 6. Update inventory tracking
-    const listPriceUsd = relistCalc.listPriceEth * (marketData.ethPriceUsd || 2700);
+    const listPriceUsd = listPriceEth * (marketData.ethPriceUsd || 2700);
     this.inventoryManager.updateListingStatus(
       item.identifier,
-      relistCalc.listPriceEth,
+      listPriceEth,
       res?.order_hash || `sim_list_${Date.now()}`,
       listPriceUsd
     );
