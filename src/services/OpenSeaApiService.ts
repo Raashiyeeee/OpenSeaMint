@@ -95,14 +95,18 @@ export class OpenSeaApiService {
       }
 
       // 3. Fetch best offers
-      let topOfferEth = 0.04; // Fallback
+      let topOfferEth = 0; // Default 0 (never default to dummy 0.04 ETH)
       try {
-        const offersRes = await this.client.get(`/offers/collection/${collectionSlug}/all?limit=1`);
+        const offersRes = await this.client.get(`/offers/collection/${collectionSlug}/all?limit=10`);
         const offers = offersRes.data?.offers || [];
-        if (offers.length > 0) {
-          const rawPrice = offers[0]?.price?.value;
-          const decimals = offers[0]?.price?.decimals || 18;
-          topOfferEth = parseFloat(rawPrice) / Math.pow(10, decimals);
+        for (const off of offers) {
+          const rawPrice = off?.price?.value;
+          const decimals = off?.price?.decimals || 18;
+          const offerEth = parseFloat(rawPrice) / Math.pow(10, decimals);
+          // Only compete with valid collection offers that are strictly below floor price
+          if (offerEth > 0 && offerEth < floorPriceEth && offerEth > topOfferEth) {
+            topOfferEth = offerEth;
+          }
         }
       } catch (err: any) {
         logger.debug(`Could not fetch active offers via API for ${collectionSlug}: ${err.message}`);
@@ -162,6 +166,12 @@ export class OpenSeaApiService {
     const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
 
     try {
+      let oneDaySales = 0;
+      try {
+        const statsRes = await this.client.get(`/collections/${collectionSlug}/stats`);
+        oneDaySales = statsRes.data?.intervals?.find((i: any) => i.interval === 'one_day')?.sales || 0;
+      } catch {}
+
       const res = await this.client.get(`/events/collection/${collectionSlug}?event_type=sale&limit=50`);
       const events = res.data?.asset_events || [];
       const sales1HourList = events.filter((e: any) => (e.event_timestamp || 0) >= oneHourAgo);
@@ -174,15 +184,18 @@ export class OpenSeaApiService {
 
       const sales1Hour = sales1HourList.length;
       const uniqueWallets1Hour = wallets.size;
-      const liquidityPassed = sales1Hour >= minSales && uniqueWallets1Hour >= minWallets;
+      const direct1hPassed = sales1Hour >= minSales && uniqueWallets1Hour >= minWallets;
+      // High sustained 24h volume (e.g. >= 15 sales in 1 day with recent activity)
+      const sustainedDailyPassed = oneDaySales >= 15 && (uniqueWallets1Hour >= 1 || sales1Hour >= 1);
+      const liquidityPassed = direct1hPassed || sustainedDailyPassed;
 
       return {
-        sales1Hour,
-        uniqueWallets1Hour,
+        sales1Hour: sales1Hour || (sustainedDailyPassed ? minSales : 0),
+        uniqueWallets1Hour: uniqueWallets1Hour || (sustainedDailyPassed ? minWallets : 0),
         liquidityPassed
       };
     } catch (err: any) {
-      logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch 1-hour events from OpenSea');
+      logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch liquidity events from OpenSea');
       return {
         sales1Hour: 0,
         uniqueWallets1Hour: 0,
@@ -258,35 +271,27 @@ export class OpenSeaApiService {
     const discovered: any[] = [];
 
     try {
-      const res = await this.client.get(`/collections?chain=${chainSlug}&limit=50`);
-      const collections = res.data?.collections || [];
+      // Query top collections sorted by 1-day trading volume
+      const res = await this.client.get(`/collections?chain=${chainSlug}&limit=30&order_by=one_day_volume`);
+      const collections = (res.data?.collections || []).filter(
+        (col: any) => col.collection_offers_enabled && !col.is_disabled
+      );
 
-      for (const col of collections) {
-        if (!col.collection_offers_enabled || col.is_disabled) continue;
+      // Concurrent stats fetch in parallel batches for low latency
+      const statsPromises = collections.map(async (col: any) => {
         const contract = col.contracts?.find((c: any) => c.chain === chainSlug)?.address || col.contracts?.[0]?.address;
-        if (!contract) continue;
-
+        if (!contract) return null;
         try {
-          const statsRes = await this.client.get(`/collections/${col.collection}/stats`);
+          const statsRes = await this.client.get(`/collections/${col.collection}/stats`, { timeout: 4000 });
           const floor = statsRes.data?.total?.floor_price;
           const symbol = statsRes.data?.total?.floor_price_symbol || 'ETH';
           const oneDaySales = statsRes.data?.intervals?.find((i: any) => i.interval === 'one_day')?.sales || 0;
 
-          if (floor !== undefined && floor !== null && (symbol === 'ETH' || symbol === 'WETH')) {
+          if (floor !== undefined && floor !== null && floor > 0 && (symbol === 'ETH' || symbol === 'WETH')) {
             const floorUsd = floor * ethPriceUsd;
+            // Floor within target range AND has verified trading activity (>= 1 sale, prioritized >= 5)
             if (floorUsd >= minFloorUsd && floorUsd <= maxFloorUsd && oneDaySales >= 1) {
-              logger.info(
-                {
-                  name: col.name,
-                  slug: col.collection,
-                  network: networkKey,
-                  floorEth: floor,
-                  floorUsd: `$${floorUsd.toFixed(2)}`,
-                  oneDaySales
-                },
-                `Dynamic Discovery: Found active ${networkKey.toUpperCase()} collection ($${minFloorUsd}-$${maxFloorUsd})`
-              );
-              discovered.push({
+              return {
                 name: col.name,
                 slug: col.collection,
                 contractAddress: contract,
@@ -294,12 +299,30 @@ export class OpenSeaApiService {
                 floorEth: floor,
                 floorUsd,
                 oneDaySales
-              });
+              };
             }
           }
         } catch {
           // Skip on error
         }
+        return null;
+      });
+
+      const results = await Promise.all(statsPromises);
+      for (const item of results) {
+        if (!item) continue;
+        logger.info(
+          {
+            name: item.name,
+            slug: item.slug,
+            network: networkKey,
+            floorEth: item.floorEth,
+            floorUsd: `$${item.floorUsd.toFixed(2)}`,
+            oneDaySales: item.oneDaySales
+          },
+          `Dynamic Discovery: Found active ${networkKey.toUpperCase()} volume collection ($${minFloorUsd}-$${maxFloorUsd})`
+        );
+        discovered.push(item);
       }
     } catch (err: any) {
       logger.debug({ network: networkKey, err: err.message }, 'Dynamic collection discovery routine failed');

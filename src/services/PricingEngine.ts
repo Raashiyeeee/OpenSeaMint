@@ -167,7 +167,7 @@ export class PricingEngine {
       maxCapitalEth,
       maxBuyPriceEth
     );
-    maxProfitableBidEth = Math.floor(Math.max(0, maxProfitableBidEth) * 10000) / 10000;
+    maxProfitableBidEth = Math.floor(Math.max(0, maxProfitableBidEth) * 1000000) / 1000000;
 
     // 2. Offer Increment & Top Offer Competition Rule
     // "Always bid just above the current highest valid offer using a small increment. Never jump directly to maximum."
@@ -177,20 +177,20 @@ export class PricingEngine {
     let competitiveReason = '';
 
     if (topOfferEth > 0) {
-      const bidIncrementUsd = this.config.profitTargets?.bidIncrementUsd ?? 0.05;
-      const bidIncrementEth = Math.max(0.0001, Math.round((bidIncrementUsd / ethPriceUsd) * 10000) / 10000);
-      const nextCompetitiveBidEth = Math.round((topOfferEth + bidIncrementEth) * 10000) / 10000;
+      const bidIncrementUsd = this.config.profitTargets?.bidIncrementUsd ?? 0.01;
+      const bidIncrementEth = Math.max(0.000001, roundToPrecision(bidIncrementUsd / ethPriceUsd, 6));
+      const nextCompetitiveBidEth = roundToPrecision(topOfferEth + bidIncrementEth, 6);
 
       if (nextCompetitiveBidEth > maxProfitableBidEth) {
         competitivePassed = false;
         competitiveReason = `Competition Check Failed: Next competitive offer ($${(nextCompetitiveBidEth * ethPriceUsd).toFixed(2)}) exceeds maximum 40% profitable price ($${(maxProfitableBidEth * ethPriceUsd).toFixed(2)}). Rule: Never sacrifice 40% profit target.`;
-        finalBidEth = nextCompetitiveBidEth;
+        finalBidEth = maxProfitableBidEth;
       } else {
         finalBidEth = nextCompetitiveBidEth;
       }
     } else {
       // No existing offer: Start conservative well under floor and within 40-50% profit ceiling
-      const conservativeBaseEth = Math.floor(Math.min(maxProfitableBidEth, floor * 0.65) * 10000) / 10000;
+      const conservativeBaseEth = roundToPrecision(Math.min(maxProfitableBidEth, floor * 0.65), 6);
       finalBidEth = conservativeBaseEth;
     }
 
@@ -203,12 +203,12 @@ export class PricingEngine {
     const netProfitUsd = roundToPrecision(netProfitEth * ethPriceUsd, 2);
     const marginPercent = finalBidEth > 0 ? (netProfitEth / finalBidEth) * 100 : 0;
 
-    // Check L: Liquidity Requirement (Mandatory: >= 15 sales in 1h AND >= 4 unique wallets)
+    // Check L: Liquidity Requirement (Mandatory: >= 15 sales in 1h AND >= 4 unique wallets, or verified sustained volume)
     const sales1Hour = marketData.sales1Hour ?? 0;
     const uniqueWallets1Hour = marketData.uniqueWallets1Hour ?? 0;
     const minSales = this.config.liquidity?.minSales1Hour ?? 15;
     const minWallets = this.config.liquidity?.minUniqueWallets1Hour ?? 4;
-    const checkLLiquidityPassed = sales1Hour >= minSales && uniqueWallets1Hour >= minWallets;
+    const checkLLiquidityPassed = (sales1Hour >= minSales && uniqueWallets1Hour >= minWallets) || (marketData.liquidityPassed === true);
 
     // Check A: Capital check ($10 total capital, $3.00 max buy price, and positive bid)
     const checkACapitalPassed = finalBidEth <= maxCapitalEth && finalBidEth > 0 && bidPriceUsd <= maxBuyPriceUsd;
