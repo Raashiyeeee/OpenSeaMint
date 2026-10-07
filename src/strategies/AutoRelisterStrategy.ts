@@ -131,7 +131,9 @@ export class AutoRelisterStrategy {
       protocol_address: this.config.seaport.contractAddress
     };
 
-    const chainSlug = this.config.general.network === 'robinhood' ? 'robinhood' : 'ethereum';
+    const activeNets = this.config.general.activeNetworks || ['robinhood'];
+    const chainSlug = this.config.general.network 
+      || (activeNets.includes('robinhood') && !activeNets.includes('mainnet') ? 'robinhood' : 'ethereum');
     const res = await this.apiService.postListing(chainSlug, postPayload);
 
     // 6. Update inventory tracking

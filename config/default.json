@@ -1,6 +1,6 @@
 {
   "general": {
-    "activeNetworks": ["robinhood", "mainnet"],
+    "activeNetworks": ["robinhood"],
     "currency": "ETH",
     "minBalanceReserveEth": 0.0001,
     "maxTotalActiveOfferVolumeEth": 0.004,
