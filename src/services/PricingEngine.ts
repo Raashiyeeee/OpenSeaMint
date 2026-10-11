@@ -214,19 +214,19 @@ export class PricingEngine {
     const netProfitUsd = roundToPrecision(netProfitEth * ethPriceUsd, 2);
     const marginPercent = finalBidEth > 0 ? (netProfitEth / finalBidEth) * 100 : 0;
 
-    // Liquidity verification (3h or 24h supported)
+    // Final Buy Filter:
+    // ✓ 20+ completed sales within 3 hours
+    // ✓ 5+ different wallets
+    // ✓ Sales in native ETH
+    // ✓ Around floor-price range
+    // ✓ Offer-price sales NOT counted
     const sales3Hours = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
     const uniqueWallets3Hours = marketData.uniqueWallets3Hours ?? marketData.uniqueWallets1Hour ?? 0;
-    const sales24Hours = marketData.sales24Hours ?? 0;
-    const minSales = this.config.liquidity?.minSales3Hours ?? 15;
-    const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 4;
-    const minSales24h = targetConfig?.minSales24Hours ?? this.config.liquidity?.minSales24Hours ?? 10;
+    const minSales = this.config.liquidity?.minSales3Hours ?? 20;
+    const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 5;
 
-    const checkLLiquidityPassed = marketData.liquidityPassed === false
-      ? false
-      : (sales3Hours >= minSales && uniqueWallets3Hours >= minWallets) ||
-        (sales24Hours > 0 && sales24Hours >= minSales24h) ||
-        (marketData.liquidityPassed === true);
+    const checkLLiquidityPassed = marketData.liquidityPassed !== false &&
+      (sales3Hours >= minSales && uniqueWallets3Hours >= minWallets);
 
     const checkFFloorRatioPassed = finalBidEth > 0 && floor >= (finalBidEth * minFloorMultiplier - 0.000001);
     const checkACapitalPassed = finalBidEth <= maxCapitalEth && finalBidEth > 0 && bidPriceUsd <= maxBuyPriceUsd;
@@ -237,7 +237,7 @@ export class PricingEngine {
 
     let reason = 'All criteria passed: Liquidity, Floor Ratio, Capital, and Profitability verified';
     if (!checkLLiquidityPassed) {
-      reason = marketData.liquidityReason || `Liquidity Check Failed: ${sales3Hours}/${minSales} sales in last 3h, ${sales24Hours}/${minSales24h} in 24h.`;
+      reason = marketData.liquidityReason || `Liquidity Check Failed: ${sales3Hours}/${minSales} qualified floor sales in last 3h, ${uniqueWallets3Hours}/${minWallets} unique wallets (offer sales excluded).`;
     } else if (!checkFFloorRatioPassed) {
       reason = `Floor Ratio Check Failed: Current floor ($${floorUsd.toFixed(2)}) is not at least ${((minFloorMultiplier - 1) * 100).toFixed(0)}% above offer ($${bidPriceUsd.toFixed(2)}).`;
     } else if (bidPriceUsd > maxBuyPriceUsd) {
