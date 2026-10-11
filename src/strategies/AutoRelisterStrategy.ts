@@ -95,7 +95,8 @@ export class AutoRelisterStrategy {
               network: net,
               acquiredPriceEth,
               acquiredAtTimestamp: Date.now(),
-              status: 'PENDING_LISTING'
+              status: 'PENDING_LISTING',
+              isExternalWalletItem: true
             };
             this.inventoryManager.addInventoryItem(newItem);
           }
