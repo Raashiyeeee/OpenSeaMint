@@ -167,7 +167,7 @@ export class PricingEngine {
     // Larry's strategy: floor price multiple (e.g. 0.85 = 15% discount)
     const floorMultiple = targetConfig?.floorPriceMultiple ?? (1 - (this.config.profitTargets.bidUnderFloorPercent / 100));
     const floorDiscountLimit = floor * floorMultiple;
-    const maxBuyPriceUsd = this.config.capital?.maxBuyPriceUsd ?? 3.00;
+    const maxBuyPriceUsd = this.config.capital?.maxBuyPriceUsd ?? 5.00;
     const maxBuyPriceEth = maxBuyPriceUsd / ethPriceUsd;
 
     let maxProfitableBidEth = Math.min(

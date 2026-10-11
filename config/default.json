@@ -11,9 +11,10 @@
   },
   "capital": {
     "totalTradingCapitalUsd": 10.0,
-    "maxActiveTrades": 1,
-    "maxBuyPriceUsd": 3.0,
-    "minNetProfitUsd": 0.20
+    "maxActiveTrades": 999,
+    "maxBuyPriceUsd": 5.0,
+    "minNetProfitUsd": 0.20,
+    "maxOfferCapitalPercent": 60.0
   },
   "liquidity": {
     "minSales3Hours": 20,
@@ -59,8 +60,8 @@
     "bidIncrementUsd": 0.05
   },
   "riskManagement": {
-    "maxInventoryPerCollection": 1,
-    "maxTotalInventoryItems": 1,
+    "maxInventoryPerCollection": 5,
+    "maxTotalInventoryItems": 999,
     "floorPriceDropThresholdPercent": 15.0,
     "maxConsecutiveErrors": 5,
     "emergencyStopOnLargeDrawdown": true

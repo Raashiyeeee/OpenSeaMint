@@ -12,9 +12,10 @@ export interface NetworkInfo {
 
 export interface CapitalConfig {
   totalTradingCapitalUsd: number; // e.g. $10.0
-  maxActiveTrades: number;        // e.g. 1 (One active trade at a time)
+  maxActiveTrades?: number;       // e.g. 999 (Unlimited by count, constrained by capital)
   minNetProfitUsd: number;        // e.g. $0.20
-  maxBuyPriceUsd?: number;        // Strict ceiling: maximum $3.00 buy price
+  maxBuyPriceUsd?: number;        // Strict ceiling: maximum $5.00 buy price
+  maxOfferCapitalPercent?: number; // e.g. 60.0 (Use up to 60% of total capital for simultaneous active offers)
 }
 
 export interface LiquidityConfig {
@@ -75,6 +76,7 @@ export interface FeeRecipient {
   fee: number;
   recipient: string;
   required?: boolean;
+  disabled?: boolean;
 }
 
 export interface TargetCollectionConfig {
@@ -103,6 +105,9 @@ export interface CollectionMarketData {
   ethPriceUsd: number;
   timestamp: number;
   fees?: FeeRecipient[];
+  mandatoryRoyaltyFeeBps?: number;
+  optionalRoyaltyFeeBps?: number;
+  creatorFeeDisabled?: boolean;
   sales1Hour?: number;
   uniqueWallets1Hour?: number;
   sales3Hours?: number;

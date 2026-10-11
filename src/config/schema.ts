@@ -24,9 +24,10 @@ const TargetCollectionSchema = z.object({
 
 const CapitalSchema = z.object({
   totalTradingCapitalUsd: z.number().positive().default(10.0),
-  maxActiveTrades: z.number().int().positive().default(1),
+  maxActiveTrades: z.number().int().positive().default(999),
   minNetProfitUsd: z.number().nonnegative().default(0.20),
-  maxBuyPriceUsd: z.number().positive().default(3.0)
+  maxBuyPriceUsd: z.number().positive().default(5.0),
+  maxOfferCapitalPercent: z.number().positive().max(100).default(60.0)
 });
 
 const LiquiditySchema = z.object({

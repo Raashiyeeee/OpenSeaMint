@@ -97,45 +97,61 @@ assert.strictEqual(capitalExceededTrade.checkACapitalPassed, false, 'Check A mus
 console.log('Test 4 PASSED: Capital limit check correctly failed: ' + capitalExceededTrade.reason, '\n');
 
 // --------------------------------------------------------------------------
-// TEST 5: Single Active Trade Rule & Capital Locking / Release
-// Bot has $10 capital. Only 1 active trade at a time.
+// TEST 5: Simultaneous Offers Across Qualifying NFTs & 60% Capital Allocation Rule
+// Number of NFTs is unlimited by count; limited only by active-offer capital allocation (e.g. 60% of $10 = $6.00 max).
 // --------------------------------------------------------------------------
-console.log('--- Test 5: Single Active Trade & Capital Lifecycle in InventoryManager ---');
+console.log('--- Test 5: Simultaneous Offers & 60% Active-Offer Capital Allocation ---');
 const inventoryManager = new InventoryManager(config);
 
 assert.strictEqual(inventoryManager.getTotalCapitalUsd(), 10.0, 'Total capital must be $10');
 assert.strictEqual(inventoryManager.getAvailableCapitalUsd(), 10.0, 'Available capital must start at $10');
 
-// Place first offer (locks capital)
+// Place first simultaneous offer ($2.50)
+const offer1Check = inventoryManager.canAllocateCapitalForOffer(2.50);
+assert.strictEqual(offer1Check.allowed, true, 'First offer ($2.50 <= $6.00 limit) must be allowed');
 inventoryManager.registerActiveOffer({
   orderHash: 'offer_1',
-  collectionSlug: 'robinhood-early-pass',
+  collectionSlug: 'collection-a',
   contractAddress: '0xa5c0bd78d1667c13bfb403e2a3336871396713c5',
-  priceEth: 0.0035,
-  priceUsd: 9.45,
+  priceEth: 0.000925,
+  priceUsd: 2.50,
   createdTimestamp: Date.now(),
   expiresTimestamp: Date.now() + 3600000,
   status: 'ACTIVE'
 });
 
-// Attempting second trade must be blocked!
-const secondTradeCheck = inventoryManager.canAllocateCapital(9.45);
-assert.strictEqual(secondTradeCheck.allowed, false, 'Second trade must be blocked by single active trade constraint');
-console.log('Second trade blocked as expected:', secondTradeCheck.reason);
+// Place second simultaneous offer ($2.50) across another qualifying collection (count is unlimited!)
+const offer2Check = inventoryManager.canAllocateCapitalForOffer(2.50);
+assert.strictEqual(offer2Check.allowed, true, 'Second simultaneous offer ($2.50 + $2.50 = $5.00 <= $6.00) must be allowed');
+inventoryManager.registerActiveOffer({
+  orderHash: 'offer_2',
+  collectionSlug: 'collection-b',
+  contractAddress: '0xb5c0bd78d1667c13bfb403e2a3336871396713c5',
+  priceEth: 0.000925,
+  priceUsd: 2.50,
+  createdTimestamp: Date.now(),
+  expiresTimestamp: Date.now() + 3600000,
+  status: 'ACTIVE'
+});
+console.log('Simultaneous offers allowed across multiple collections: Total active offers = $' + inventoryManager.getActiveOffersCapitalUsd());
 
-// Now simulate NFT acquired & then sold for $14
+// Attempt third offer ($2.00) -> $5.00 + $2.00 = $7.00 > $6.00 (60% of $10) -> Must be blocked!
+const offer3Check = inventoryManager.canAllocateCapitalForOffer(2.00);
+assert.strictEqual(offer3Check.allowed, false, 'Third offer exceeding 60% active offer allocation ($7.00 > $6.00) must be blocked');
+console.log('Third offer blocked by capital allocation limit:', offer3Check.reason);
+
+// Now simulate NFT acquired & then sold for $4.00
 const saleResult = inventoryManager.markItemSold(
   '0xa5c0bd78d1667c13bfb403e2a3336871396713c5:1',
-  0.0052, // ~$14.04
+  0.0015,
   2700,
   100, // 1% fee
   0.01 // gas
 );
 
-// Release capital and verify ready for next trade
 assert(saleResult.newTotalCapitalUsd >= 10.0, 'Capital after sale must be updated with profit');
 console.log('Sale completed: Capital released, new balance: $' + saleResult.newTotalCapitalUsd);
-console.log('Test 5 PASSED: Capital lock and release lifecycle verified!\n');
+console.log('Test 5 PASSED: Simultaneous offers and 60% active-offer capital allocation verified!\n');
 
 // --------------------------------------------------------------------------
 // TEST 6: Network Gas Impact: Robinhood Chain vs Ethereum Mainnet
@@ -260,9 +276,9 @@ assert(highMarginCalc.bidPriceUsd <= 3.0, 'Bid price must be <= $3.00');
 console.log('Test 8 PASSED: Margin is ' + highMarginCalc.marginPercent + '% (>= 40%) and net profit is $' + highMarginCalc.netProfitUsd, '\n');
 
 // --------------------------------------------------------------------------
-// TEST 9: Strict $3.00 Maximum Buy Price Ceiling
+// TEST 9: Strict $5.00 Maximum Buy Price Ceiling
 // --------------------------------------------------------------------------
-console.log('--- Test 9: Strict $3.00 Maximum Buy Price Ceiling ---');
+console.log('--- Test 9: Strict $5.00 Maximum Buy Price Ceiling ---');
 const expensiveData: CollectionMarketData = {
   slug: 'expensive-nft',
   contractAddress: '0x5555555555555555555555555555555555555555',
@@ -278,8 +294,8 @@ const expensiveData: CollectionMarketData = {
   liquidityPassed: true
 };
 const expensiveCalc = pricingEngine.calculateMaxBid(expensiveData, 0.20, 10.0, 'robinhood');
-assert.strictEqual(expensiveCalc.decision, 'REJECT', 'Expensive trade (> $3 buy price) must be rejected');
-console.log('Test 9 PASSED: Trade above $3 correctly rejected:', expensiveCalc.reason, '\n');
+assert.strictEqual(expensiveCalc.decision, 'REJECT', 'Expensive trade (> $5 buy price) must be rejected');
+console.log('Test 9 PASSED: Trade above $5 correctly rejected:', expensiveCalc.reason, '\n');
 
 // --------------------------------------------------------------------------
 // TEST 10: Floor Dump Protection & Relist/Hold Evaluation (Rule 6, 7, 8)
@@ -319,10 +335,103 @@ holdInvManager.addInventoryItem({
 holdInvManager.updateHoldStatus('test-contract:42', 'Market floor dumped');
 assert.strictEqual(holdInvManager.getActiveTradesCount(), 1, 'Holding item must count as active trade');
 assert.strictEqual(holdInvManager.getAllocatedCapitalUsd(2700), 8.10, 'Holding item must lock capital');
+// In test 11, with 1 held item, attempting to allocate capital beyond available must be blocked
 const blockedCheck = holdInvManager.canAllocateCapital(5.0);
-assert.strictEqual(blockedCheck.allowed, false, 'New trade must be blocked while item is being held');
-console.log('Test 11 PASSED: Held item correctly locks capital and prevents new trades: ' + blockedCheck.reason, '\n');
+assert.strictEqual(blockedCheck.allowed, false, 'New trade must be blocked when capital exceeds available');
+console.log('Test 11 PASSED: Held item correctly locks capital: ' + blockedCheck.reason, '\n');
+
+// --------------------------------------------------------------------------
+// TEST 12: Mandatory vs Optional Creator Fee Rule
+// --------------------------------------------------------------------------
+console.log('--- Test 12: Mandatory vs Optional Creator Fee Rule ---');
+// Case 12a: Optional creator fee (required: false) -> Automatically DISABLED to 0%
+const optionalFeeData: CollectionMarketData = {
+  slug: 'optional-fee-nft',
+  contractAddress: '0x6666666666666666666666666666666666666666',
+  floorPriceEth: 0.0015, // ~$4.05
+  topOfferEth: 0.0008,   // ~$2.16
+  numListings: 10,
+  openseaFeeBps: 50,     // 0.5%
+  royaltyFeeBps: 0,      // Optional fee was verified & disabled to 0 bps!
+  mandatoryRoyaltyFeeBps: 0,
+  optionalRoyaltyFeeBps: 500, // 5% creator fee was optional
+  creatorFeeDisabled: true,
+  ethPriceUsd: 2700,
+  timestamp: Date.now(),
+  sales1Hour: 25,
+  uniqueWallets1Hour: 8,
+  liquidityPassed: true,
+  fees: [
+    { fee: 0.5, recipient: '0x0000a26b00c1f0df003000390027140000faa719', required: true }, // OpenSea
+    { fee: 5.0, recipient: '0xcreator1111111111111111111111111111111111', required: false, disabled: true } // Optional creator fee
+  ]
+};
+const optionalFeeCalc = pricingEngine.calculateMaxBid(optionalFeeData, 0.20, 10.0, 'robinhood');
+assert.strictEqual(optionalFeeCalc.royaltyFeeUsd, 0, 'Optional creator fee must be 0 in calculations when disabled');
+assert.strictEqual(optionalFeeCalc.decision, 'ACCEPT', 'Profitable trade with optional fee disabled must be accepted');
+console.log('Case 12a PASSED: Optional creator fee successfully disabled to $0.00 royalty, net profit: $' + optionalFeeCalc.netProfitUsd);
+
+// Case 12b: Mandatory creator fee (required: true) -> Must be included in profitability calculations
+const mandatoryFeeData: CollectionMarketData = {
+  ...optionalFeeData,
+  slug: 'mandatory-fee-nft',
+  royaltyFeeBps: 500, // 5% mandatory fee included
+  mandatoryRoyaltyFeeBps: 500,
+  optionalRoyaltyFeeBps: 0,
+  creatorFeeDisabled: false,
+  fees: [
+    { fee: 0.5, recipient: '0x0000a26b00c1f0df003000390027140000faa719', required: true },
+    { fee: 5.0, recipient: '0xcreator1111111111111111111111111111111111', required: true, disabled: false }
+  ]
+};
+const mandatoryFeeCalc = pricingEngine.calculateMaxBid(mandatoryFeeData, 0.20, 10.0, 'robinhood');
+assert(mandatoryFeeCalc.royaltyFeeUsd > 0, 'Mandatory creator fee must be included in calculation');
+console.log('Case 12b PASSED: Mandatory creator fee included in calculation: $' + mandatoryFeeCalc.royaltyFeeUsd);
+
+// Case 12c: Seaport order fee verification rejects inclusion of optional creator fee
+let feeVerificationThrew = false;
+try {
+  const dummyConsideration = [
+    { recipient: '0xcreator1111111111111111111111111111111111' } // Errantly includes optional fee
+  ];
+  const dummyRawFees = [
+    { fee: 5.0, recipient: '0xcreator1111111111111111111111111111111111', required: false, disabled: true }
+  ];
+  // Verify using verifyOrderFees
+  const seaportService = new (require('../src/services/SeaportService').SeaportService)(config, require('ethers').Wallet.createRandom());
+  seaportService.verifyOrderFees(dummyConsideration, dummyRawFees);
+} catch (e: any) {
+  feeVerificationThrew = true;
+  assert(e.message.includes('Creator fee violation'), 'Error must identify creator fee violation');
+}
+assert.strictEqual(feeVerificationThrew, true, 'verifyOrderFees must reject order containing optional creator fee');
+console.log('Case 12c PASSED: Seaport verification strictly guarantees optional creator fee is disabled in order!\n');
+
+// --------------------------------------------------------------------------
+// TEST 13: Wallet Reconciliation & Total Bot Inventory Cap Resolution
+// --------------------------------------------------------------------------
+console.log('--- Test 13: Wallet Reconciliation & Inventory Cap Resolution ---');
+const reconcileInvManager = new InventoryManager(config);
+// Simulate bot previously had 1 NFT in inventory
+reconcileInvManager.addInventoryItem({
+  identifier: '0xcontract1:100',
+  collectionSlug: 'slug-a',
+  contractAddress: '0xcontract1',
+  tokenId: '100',
+  acquiredPriceEth: 0.001,
+  acquiredPriceUsd: 2.70,
+  acquiredAtTimestamp: Date.now(),
+  status: 'LISTED'
+});
+assert.strictEqual(reconcileInvManager.getInventoryCount(), 1, 'Inventory count should be 1');
+
+// Now simulate user sold the NFT on OpenSea/wallet: Wallet now has 0 NFTs
+const removed = reconcileInvManager.reconcileWalletInventory([]);
+assert.strictEqual(removed.length, 1, 'Should reconcile and remove sold NFT');
+assert.strictEqual(reconcileInvManager.getInventoryCount(), 0, 'Inventory count must reset to 0');
+assert.strictEqual(reconcileInvManager.canBidOnCollection('slug-a', 5), true, 'Bidding must be allowed once inventory is cleared');
+console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT, frees capital, and clears inventory cap!\n');
 
 console.log('================================================================');
-console.log('All 11 Capital Allocation, Liquidity, Floor Protection & Profitability tests passed successfully!');
+console.log('All 13 Capital Allocation, Liquidity, Floor Protection, Creator Fee & Inventory tests passed successfully!');
 console.log('================================================================');
