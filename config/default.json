@@ -6,7 +6,8 @@
     "maxTotalActiveOfferVolumeEth": 0.004,
     "loopIntervalMs": 15000,
     "offerExpirationMinutes": 60,
-    "listingExpirationDays": 7
+    "listingExpirationDays": 7,
+    "ignoredCollections": ["robin-owls-269031093", "robin-owls"]
   },
   "capital": {
     "totalTradingCapitalUsd": 10.0,

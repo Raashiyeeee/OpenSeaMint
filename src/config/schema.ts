@@ -61,7 +61,8 @@ const BotConfigSchema = z.object({
     maxTotalActiveOfferVolumeEth: z.number().positive(),
     loopIntervalMs: z.number().int().positive(),
     offerExpirationMinutes: z.number().int().positive(),
-    listingExpirationDays: z.number().int().positive()
+    listingExpirationDays: z.number().int().positive(),
+    ignoredCollections: z.array(z.string()).optional()
   }),
   capital: CapitalSchema,
   liquidity: LiquiditySchema.default({ minSales3Hours: 20, minUniqueWallets3Hours: 5, minFloorMultiplier: 1.40 }),
