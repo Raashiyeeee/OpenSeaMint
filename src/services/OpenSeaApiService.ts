@@ -194,14 +194,13 @@ export class OpenSeaApiService {
     liquidityPassed: boolean;
     liquidityReason?: string;
   }> {
-    const minSales = this.config.liquidity?.minSales3Hours ?? 5;
-    const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 2;
-    const minSales24h = this.config.liquidity?.minSales24Hours ?? 10;
+    const minSales = this.config.liquidity?.minSales3Hours ?? 20;
+    const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 5;
     const threeHoursAgo = Math.floor(Date.now() / 1000) - (3 * 3600);
     const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
 
-    const floorMinPercent = (this.config.liquidity?.floorRangeMinPercent ?? 60.0) / 100;
-    const floorMaxPercent = (this.config.liquidity?.floorRangeMaxPercent ?? 150.0) / 100;
+    const floorMinPercent = (this.config.liquidity?.floorRangeMinPercent ?? 80.0) / 100;
+    const floorMaxPercent = (this.config.liquidity?.floorRangeMaxPercent ?? 135.0) / 100;
     const minFloorAllowed = floorPriceEth > 0 ? floorPriceEth * floorMinPercent : 0;
     const maxFloorAllowed = floorPriceEth > 0 ? floorPriceEth * floorMaxPercent : Infinity;
 
@@ -209,18 +208,20 @@ export class OpenSeaApiService {
       const res = await this.client.get(`/events/collection/${collectionSlug}?event_type=sale&limit=50`);
       const events = res.data?.asset_events || [];
 
-      // Filter events to previous 3 hours
+      // Filter events to strictly last 3 hours
       const sales3HoursRaw = events.filter((e: any) => (e.event_timestamp || 0) >= threeHoursAgo);
 
       const qualifiedSales: any[] = [];
       const wallets3Hours = new Set<string>();
 
       for (const sale of sales3HoursRaw) {
+        // Condition: Sales must be in native ETH (ETH or WETH)
         const symbol = (sale.payment?.symbol || sale.payment_token?.symbol || 'ETH').toUpperCase();
         if (symbol !== 'ETH' && symbol !== 'WETH') {
           continue;
         }
 
+        // Parse price
         let salePriceEth = 0;
         if (sale.payment?.quantity && sale.payment?.decimals) {
           salePriceEth = parseFloat(sale.payment.quantity) / Math.pow(10, sale.payment.decimals);
@@ -231,10 +232,14 @@ export class OpenSeaApiService {
           salePriceEth = parseFloat(sale.total_price) / Math.pow(10, dec);
         }
 
-        // Keep sales within realistic boundaries (avoid massive wash outliers)
+        // Condition: Sales are around the actual floor-price range (80% - 135%)
+        // Condition: Offer-price sales (< minFloorAllowed) and high outliers (> maxFloorAllowed) are NOT counted
         if (floorPriceEth > 0 && salePriceEth > 0) {
-          if (salePriceEth > maxFloorAllowed * 3) {
-            continue;
+          if (salePriceEth < minFloorAllowed) {
+            continue; // Exclude below-floor offer sales
+          }
+          if (salePriceEth > maxFloorAllowed) {
+            continue; // Exclude high outlier sales
           }
         }
 
@@ -252,18 +257,12 @@ export class OpenSeaApiService {
         if (s.seller) wallets1Hour.add(s.seller.toLowerCase());
       }
 
-      // Liquidity passes if 3h requirement is met OR 24h volume verifies active market
-      const pass3h = sales3Hours >= minSales && uniqueWallets3Hours >= minWallets;
-      const pass24h = sales24Hours >= minSales24h;
-      const liquidityPassed = pass3h || pass24h;
+      // Final Buy Filter: Strictly requires 20+ sales within 3h AND 5+ unique wallets around floor
+      const liquidityPassed = sales3Hours >= minSales && uniqueWallets3Hours >= minWallets;
 
-      let liquidityReason = 'Passed liquidity checks';
+      let liquidityReason = `Passed 3-hour native ETH floor liquidity check (${sales3Hours}/${minSales} sales, ${uniqueWallets3Hours}/${minWallets} unique wallets)`;
       if (!liquidityPassed) {
-        liquidityReason = `Liquidity Failed: ${sales3Hours}/${minSales} sales in 3h, ${sales24Hours}/${minSales24h} in 24h.`;
-      } else if (pass24h && !pass3h) {
-        liquidityReason = `Passed 24-hour sustained trading liquidity (${sales24Hours} sales in 24h)`;
-      } else {
-        liquidityReason = `Passed 3-hour native ETH floor liquidity check (${sales3Hours} sales)`;
+        liquidityReason = `Liquidity Check Failed: ${sales3Hours}/${minSales} floor sales in last 3h, ${uniqueWallets3Hours}/${minWallets} unique wallets (offer sales excluded).`;
       }
 
       return {
@@ -276,14 +275,13 @@ export class OpenSeaApiService {
       };
     } catch (err: any) {
       logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch liquidity events from OpenSea');
-      const pass24h = sales24Hours >= minSales24h;
       return {
         sales3Hours: 0,
         uniqueWallets3Hours: 0,
         sales1Hour: 0,
         uniqueWallets1Hour: 0,
-        liquidityPassed: pass24h,
-        liquidityReason: pass24h ? `Verified by 24h stats (${sales24Hours} sales)` : `API error fetching liquidity: ${err.message}`
+        liquidityPassed: false,
+        liquidityReason: `API error fetching liquidity: ${err.message}`
       };
     }
   }

@@ -195,9 +195,8 @@ export class CollectionBidderStrategy {
       {
         collection: target.name,
         network: targetNetwork,
-        sales_1h: calculation.sales1Hour,
-        unique_wallets_1h: calculation.uniqueWallets1Hour,
-        sales_24h: marketData.sales24Hours,
+        sales_3h: calculation.sales3Hours,
+        unique_wallets_3h: calculation.uniqueWallets3Hours,
         bidPriceEth: calculation.bidPriceEth,
         bidPriceUsd: `$${calculation.bidPriceUsd}`,
         targetListPriceEth: calculation.targetListPriceEth,
@@ -207,7 +206,7 @@ export class CollectionBidderStrategy {
         estimatedGasCostUsd: `$${calculation.estimatedGasCostUsd}`,
         expectedNetProfitUsd: `$${calculation.netProfitUsd}`,
         marginPercent: `${calculation.marginPercent}%`,
-        checkL_Liquidity: 'PASSED ✅',
+        checkL_Liquidity: 'PASSED ✅ (>= 20 sales & >= 5 wallets in 3h around floor)',
         checkA_Capital: 'PASSED ✅',
         checkB_Profitability: 'PASSED ✅'
       },
