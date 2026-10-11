@@ -23,6 +23,7 @@ export interface LiquidityConfig {
   minFloorMultiplier?: number;      // Floor must be >= 1.40 * Offer
   floorRangeMinPercent?: number;    // Floor sales range min (e.g. 80%)
   floorRangeMaxPercent?: number;    // Floor sales range max (e.g. 135%)
+  minSales24Hours?: number;
   minSales1Hour?: number;           // Backward compatibility
   minUniqueWallets1Hour?: number;   // Backward compatibility
 }
@@ -69,6 +70,12 @@ export interface BotConfig {
   };
 }
 
+export interface FeeRecipient {
+  fee: number;
+  recipient: string;
+  required?: boolean;
+}
+
 export interface TargetCollectionConfig {
   name: string;
   slug: string;
@@ -78,6 +85,10 @@ export interface TargetCollectionConfig {
   maxBidEth: number;
   targetNetProfitUsd: number;
   maxInventory: number;
+  floorPriceMultiple?: number;
+  minMarginPercent?: number;
+  minSales24Hours?: number;
+  singleTokenBids?: boolean;
 }
 
 export interface CollectionMarketData {
@@ -90,10 +101,12 @@ export interface CollectionMarketData {
   royaltyFeeBps: number;
   ethPriceUsd: number;
   timestamp: number;
+  fees?: FeeRecipient[];
   sales1Hour?: number;
   uniqueWallets1Hour?: number;
   sales3Hours?: number;
   uniqueWallets3Hours?: number;
+  sales24Hours?: number;
   floorSalesCount?: number;
   liquidityPassed: boolean;
   liquidityReason?: string;

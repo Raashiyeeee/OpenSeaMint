@@ -66,6 +66,46 @@ export class AutoRelisterStrategy {
    * Scans unlisted inventory and creates competitive listing orders
    */
   public async scanAndRelistUnlistedInventory(walletAddress: string): Promise<void> {
+    // 1. Reconcile on-chain wallet inventory directly from OpenSea across all active networks
+    const activeNetworks = this.config.general.activeNetworks || ['robinhood'];
+    for (const net of activeNetworks) {
+      try {
+        const ownedNfts = await this.apiService.getAccountNfts(walletAddress, undefined, net);
+        for (const nft of ownedNfts) {
+          const contractAddress = nft.contract;
+          const tokenId = nft.identifier;
+          const slug = nft.collection || '';
+          if (!contractAddress || !tokenId) continue;
+
+          const identifier = `${contractAddress.toLowerCase()}:${tokenId}`;
+          const existing = this.inventoryManager.getInventoryItem(identifier);
+          if (!existing) {
+            logger.info({ identifier, slug, net }, 'Discovered unlisted NFT in wallet during scan. Adding to relist queue!');
+            let acquiredPriceEth = 0.0006; // Default to typical buy offer
+            try {
+              const marketData = await this.apiService.getCollectionMarketData(slug, contractAddress);
+              acquiredPriceEth = marketData.topOfferEth > 0 ? marketData.topOfferEth : (marketData.floorPriceEth * 0.85);
+            } catch {}
+
+            const newItem: InventoryItem = {
+              identifier,
+              collectionSlug: slug,
+              contractAddress,
+              tokenId,
+              network: net,
+              acquiredPriceEth,
+              acquiredAtTimestamp: Date.now(),
+              status: 'PENDING_LISTING'
+            };
+            this.inventoryManager.addInventoryItem(newItem);
+          }
+        }
+      } catch (err: any) {
+        logger.debug({ net, err: err.message }, 'Wallet NFT scan note');
+      }
+    }
+
+    // 2. Relist all unlisted or held items in inventory
     const unlisted = this.inventoryManager
       .getAllInventory()
       .filter((i) => i.status === 'PENDING_LISTING' || i.status === 'HOLDING');
@@ -127,13 +167,22 @@ export class AutoRelisterStrategy {
       'Market supports profitable sale: Listing NFT on OpenSea'
     );
 
-    // 4. Create and sign Seaport listing (off-chain EIP-712, 0 gas!)
+    const activeNets = this.config.general.activeNetworks || ['robinhood'];
+    const chainSlug = this.config.general.network 
+      || (activeNets.includes('robinhood') && !activeNets.includes('mainnet') ? 'robinhood' : 'ethereum');
+
+    // 3.5. Ensure on-chain ERC721 conduit approval is active
+    await this.seaportService.ensureNftConduitApproval(item.contractAddress, chainSlug);
+
+    // 4. Create and sign Seaport listing (off-chain EIP-712 with required fee recipients)
     const { orderComponents, signature } = await this.seaportService.createSignedListing(
       item.contractAddress,
       item.tokenId,
       listPriceEth,
       marketData.openseaFeeBps,
-      this.config.general.listingExpirationDays
+      this.config.general.listingExpirationDays,
+      chainSlug,
+      marketData.fees
     );
 
     // 5. Submit listing order to OpenSea
@@ -143,9 +192,6 @@ export class AutoRelisterStrategy {
       protocol_address: this.config.seaport.contractAddress
     };
 
-    const activeNets = this.config.general.activeNetworks || ['robinhood'];
-    const chainSlug = this.config.general.network 
-      || (activeNets.includes('robinhood') && !activeNets.includes('mainnet') ? 'robinhood' : 'ethereum');
     const res = await this.apiService.postListing(chainSlug, postPayload);
 
     // 6. Update inventory tracking
