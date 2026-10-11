@@ -68,10 +68,14 @@ export class AutoRelisterStrategy {
   public async scanAndRelistUnlistedInventory(walletAddress: string): Promise<void> {
     // 1. Reconcile on-chain wallet inventory directly from OpenSea across all active networks
     const activeNetworks = this.config.general.activeNetworks || ['robinhood'];
+    const allOwnedNfts: any[] = [];
+    const ethPriceUsd = await this.apiService.getEthPriceUsd();
+
     for (const net of activeNetworks) {
       try {
         const ownedNfts = await this.apiService.getAccountNfts(walletAddress, undefined, net);
         for (const nft of ownedNfts) {
+          allOwnedNfts.push(nft);
           const contractAddress = nft.contract;
           const tokenId = nft.identifier;
           const slug = nft.collection || '';
@@ -110,6 +114,10 @@ export class AutoRelisterStrategy {
         logger.debug({ net, err: err.message }, 'Wallet NFT scan note');
       }
     }
+
+    // Reconcile wallet holdings: If an NFT previously in inventory was sold or transferred,
+    // automatically clear it and release its locked capital and inventory slot.
+    this.inventoryManager.reconcileWalletInventory(allOwnedNfts, ethPriceUsd);
 
     // 2. Relist all unlisted or held items in inventory
     const unlisted = this.inventoryManager

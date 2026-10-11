@@ -158,8 +158,10 @@ async function main() {
 
   const runLoop = async () => {
     try {
-      await bidderStrategy.evaluateAndPlaceBids();
+      // 1. Reconcile on-chain wallet inventory (clear sold NFTs, list new ones)
       await relisterStrategy.scanAndRelistUnlistedInventory(tradingWallet.address);
+      // 2. Evaluate market and place simultaneous offers across qualifying NFTs
+      await bidderStrategy.evaluateAndPlaceBids();
     } catch (err: any) {
       logger.error({ err }, 'Unhandled error in strategy loop iteration');
     }

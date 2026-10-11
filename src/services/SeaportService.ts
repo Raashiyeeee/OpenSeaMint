@@ -1,5 +1,5 @@
 import { ethers, Wallet } from 'ethers';
-import { BotConfig } from '../types';
+import { BotConfig, FeeRecipient } from '../types';
 import { toWeiString } from '../utils/math';
 import { logger } from '../utils/logger';
 
@@ -96,7 +96,7 @@ export class SeaportService {
     bidPriceEth: number,
     durationMinutes: number = 60,
     networkKey?: string,
-    fees?: Array<{ fee: number; recipient: string }>
+    fees?: FeeRecipient[]
   ): Promise<{ orderComponents: any; signature: string }> {
     const offerer = this.signer.address;
     const startTime = Math.floor(Date.now() / 1000);
@@ -131,8 +131,12 @@ export class SeaportService {
       }
     ];
 
-    if (fees && fees.length > 0) {
-      for (const f of fees) {
+    // Mandatory vs Optional Creator Fee Rule:
+    // Filter out optional creator fees (required === false or disabled === true)
+    const effectiveFees = (fees || []).filter((f) => f.required !== false && f.disabled !== true);
+
+    if (effectiveFees.length > 0) {
+      for (const f of effectiveFees) {
         const feeWei = ((BigInt(bidWei) * BigInt(Math.round(f.fee * 100))) / 10000n).toString();
         consideration.push({
           itemType: 1, // ERC20 (WETH)
@@ -154,6 +158,9 @@ export class SeaportService {
         recipient: '0x0000a26b00c1f0df003000390027140000faa719'
       });
     }
+
+    // Verify optional creator fees are truly disabled
+    this.verifyOrderFees(consideration, fees);
 
     const domain = this.getEip712Domain(networkKey);
     let counter = '0';
@@ -204,7 +211,7 @@ export class SeaportService {
     bidPriceEth: number,
     durationMinutes: number = 60,
     networkKey?: string,
-    fees?: Array<{ fee: number; recipient: string }>
+    fees?: FeeRecipient[]
   ): Promise<{ orderComponents: any; signature: string }> {
     const offerer = this.signer.address;
     const startTime = Math.floor(Date.now() / 1000);
@@ -239,8 +246,11 @@ export class SeaportService {
       }
     ];
 
-    if (fees && fees.length > 0) {
-      for (const f of fees) {
+    // Mandatory vs Optional Creator Fee Rule:
+    const effectiveFees = (fees || []).filter((f) => f.required !== false && f.disabled !== true);
+
+    if (effectiveFees.length > 0) {
+      for (const f of effectiveFees) {
         const feeWei = ((BigInt(bidWei) * BigInt(Math.round(f.fee * 100))) / 10000n).toString();
         consideration.push({
           itemType: 1, // ERC20 (WETH)
@@ -262,6 +272,9 @@ export class SeaportService {
         recipient: '0x0000a26b00c1f0df003000390027140000faa719'
       });
     }
+
+    // Verify optional creator fees are truly disabled
+    this.verifyOrderFees(consideration, fees);
 
     const domain = this.getEip712Domain(networkKey);
     let counter = '0';
@@ -313,7 +326,7 @@ export class SeaportService {
     openseaFeeBps: number = 50,
     durationDays: number = 7,
     networkKey?: string,
-    fees?: Array<{ fee: number; recipient: string }>
+    fees?: FeeRecipient[]
   ): Promise<{ orderComponents: any; signature: string }> {
     const offerer = this.signer.address;
     const startTime = Math.floor(Date.now() / 1000);
@@ -335,8 +348,12 @@ export class SeaportService {
     let totalFeesWei = 0n;
     const feeConsiderations: any[] = [];
 
-    if (fees && fees.length > 0) {
-      for (const f of fees) {
+    // Mandatory vs Optional Creator Fee Rule:
+    // Filter out optional creator fees (required === false or disabled === true)
+    const effectiveFees = (fees || []).filter((f) => f.required !== false && f.disabled !== true);
+
+    if (effectiveFees.length > 0) {
+      for (const f of effectiveFees) {
         const feeWei = (totalWei * BigInt(Math.round(f.fee * 100))) / 10000n;
         totalFeesWei += feeWei;
         feeConsiderations.push({
@@ -360,6 +377,9 @@ export class SeaportService {
         recipient: ethers.getAddress('0x0000a26b00c1F0DF003000390027140000fAa719')
       });
     }
+
+    // Verify optional creator fees are truly disabled in listing order considerations
+    this.verifyOrderFees(feeConsiderations, fees);
 
     const sellerWei = totalWei - totalFeesWei;
 
@@ -455,5 +475,31 @@ export class SeaportService {
       logger.error({ contractAddress, err: err.message }, 'Failed to approve OpenSea conduit for NFT');
       return false;
     }
+  }
+
+  /**
+   * Mandatory Creator Fee Verification Rule:
+   * Verifies that optional creator fees are strictly disabled (excluded from order considerations),
+   * and that mandatory fees are preserved.
+   */
+  public verifyOrderFees(consideration: any[], rawFees?: FeeRecipient[]): void {
+    if (!rawFees || rawFees.length === 0) return;
+
+    for (const f of rawFees) {
+      const isOptional = f.required === false || f.disabled === true;
+      const recipient = f.recipient.toLowerCase();
+      const isPresent = consideration.some((c) => c.recipient?.toLowerCase() === recipient);
+
+      if (isOptional && isPresent) {
+        logger.error({ recipient, fee: f.fee }, 'Creator fee verification failed: Optional creator fee found in order considerations!');
+        throw new Error(`Creator fee violation: Optional creator fee for ${f.recipient} must be disabled but was found in considerations.`);
+      }
+
+      if (!isOptional && !isPresent && !recipient.includes('opensea')) {
+        logger.warn({ recipient, fee: f.fee }, 'Mandatory creator fee missing from order considerations.');
+      }
+    }
+
+    logger.debug('Creator fee check passed: Optional creator fees verified disabled, mandatory fees preserved.');
   }
 }

@@ -41,19 +41,25 @@ export class CollectionBidderStrategy {
     }
 
     const activeNetworks = this.config.general.activeNetworks || ['robinhood', 'mainnet'];
-    const maxActiveTrades = this.config.capital?.maxActiveTrades ?? 1;
+    const totalCapitalUsd = this.inventoryManager.getTotalCapitalUsd();
+    const activeOffersCapitalUsd = this.inventoryManager.getActiveOffersCapitalUsd();
+    const offerLimitPercent = this.config.capital?.maxOfferCapitalPercent ?? 60.0;
+    const maxOfferCapitalUsd = (totalCapitalUsd * offerLimitPercent) / 100;
 
-    if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) {
-      logger.info('Capital fully allocated. Holding for active trades.');
-      return;
-    }
+    logger.info(
+      {
+        totalCapitalUsd: `$${totalCapitalUsd.toFixed(2)}`,
+        activeOffersCapitalUsd: `$${activeOffersCapitalUsd.toFixed(2)}`,
+        maxOfferCapitalAllocation: `$${maxOfferCapitalUsd.toFixed(2)} (${offerLimitPercent}%)`
+      },
+      `Starting bidding cycle: Simultaneous offers enabled across all qualifying NFTs (up to ${offerLimitPercent}% capital allocation).`
+    );
 
     const minFloorUsd = 0.20;
     const maxFloorUsd = 8.00; // Expanded to include high-volume collections like Hex-lings ($4.57) and Project Shiesty ($5.12)
 
     // 1. Dynamic Market Discovery: Scan live marketplace for active collections on active networks
     for (const net of activeNetworks) {
-      if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) break;
       try {
         logger.info(`Scanning live marketplace on ${net.toUpperCase()} for active collections ($${minFloorUsd}-$${maxFloorUsd})...`);
         const discovered = await this.apiService.discoverCollectionsByChain(net, minFloorUsd, maxFloorUsd);
@@ -61,7 +67,6 @@ export class CollectionBidderStrategy {
           logger.info(`Dynamic scan: No active collections in $${minFloorUsd}-$${maxFloorUsd} range on ${net.toUpperCase()} this round.`);
         }
         for (const disc of discovered) {
-          if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) break;
           try {
             await this.processCollectionBid({
               name: disc.name,
@@ -69,7 +74,7 @@ export class CollectionBidderStrategy {
               contractAddress: disc.contractAddress,
               network: net,
               targetNetProfitUsd: this.config.capital?.minNetProfitUsd ?? 0.20,
-              maxInventory: 1
+              maxInventory: 5
             }, net);
           } catch (err: any) {
             logger.debug({ slug: disc.slug, network: net, error: err.message }, 'Error processing discovered collection bid');
@@ -83,11 +88,9 @@ export class CollectionBidderStrategy {
     // 2. Evaluate any configured target collections (if enabled)
     for (const target of this.config.targetCollections) {
       if (!target.enabled) continue;
-      if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) break;
 
       const networksToEvaluate = target.network ? [target.network] : activeNetworks;
       for (const net of networksToEvaluate) {
-        if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) break;
         try {
           await this.processCollectionBid({ ...target, network: net }, net);
         } catch (err: any) {
@@ -102,27 +105,15 @@ export class CollectionBidderStrategy {
     const targetNetwork = networkKey || target.network || 'robinhood';
 
     // 1. SCAN NFT & Check collection-level capacity
-    const canBid = this.inventoryManager.canBidOnCollection(target.slug, target.maxInventory);
+    const canBid = this.inventoryManager.canBidOnCollection(target.slug, target.maxInventory ?? 5);
     if (!canBid) return;
 
-    // 2. CHECK AVAILABLE CAPITAL (Check A)
-    // Rule: One active trade at a time when capital is fully allocated ($10 budget)
+    // 2. CHECK AVAILABLE CAPITAL
     const availableCapitalUsd = this.inventoryManager.getAvailableCapitalUsd();
-    const activeTrades = this.inventoryManager.getActiveTradesCount();
-    const maxTrades = this.config.capital?.maxActiveTrades ?? 1;
-
-    if (activeTrades >= maxTrades) {
+    if (availableCapitalUsd <= 0.20) {
       logger.info(
-        { activeTrades, maxTrades, totalCapitalUsd: this.inventoryManager.getTotalCapitalUsd() },
-        'Capital allocation check: Bot already has an active trade. Holding capital for current position.'
-      );
-      return;
-    }
-
-    if (availableCapitalUsd <= 0.50) {
-      logger.warn(
         { availableCapitalUsd, totalCapitalUsd: this.inventoryManager.getTotalCapitalUsd() },
-        'Capital allocation check: Insufficient available capital to place offer. Skipping scan.'
+        'Capital allocation check: Available capital exhausted. Skipping further offers.'
       );
       return;
     }
@@ -174,12 +165,12 @@ export class CollectionBidderStrategy {
       calculation.bidPriceUsd = roundToPrecision(calculation.bidPriceEth * (marketData.ethPriceUsd || 2700), 2);
     }
 
-    // Final capital lock re-validation
-    const capitalLockCheck = this.inventoryManager.canAllocateCapital(calculation.bidPriceUsd, marketData.ethPriceUsd);
+    // Final capital allocation check: Active offers allocation limit (e.g. 60% of total capital)
+    const capitalLockCheck = this.inventoryManager.canAllocateCapitalForOffer(calculation.bidPriceUsd, marketData.ethPriceUsd);
     if (!capitalLockCheck.allowed) {
-      logger.warn(
-        { reason: capitalLockCheck.reason, bidPriceUsd: calculation.bidPriceUsd, network: targetNetwork },
-        'TRADE REJECTED ❌: Cannot allocate capital for offer'
+      logger.info(
+        { reason: capitalLockCheck.reason, bidPriceUsd: calculation.bidPriceUsd, network: targetNetwork, slug: target.slug },
+        `OFFER SKIPPED [${targetNetwork.toUpperCase()}]: ${capitalLockCheck.reason}`
       );
       return;
     }
@@ -202,12 +193,16 @@ export class CollectionBidderStrategy {
         targetListPriceEth: calculation.targetListPriceEth,
         targetListPriceUsd: `$${calculation.targetListPriceUsd}`,
         creatorRoyaltyUsd: `$${calculation.royaltyFeeUsd}`,
+        creatorFeeRule: marketData.creatorFeeDisabled
+          ? 'OPTIONAL (DISABLED to 0 bps in Seaport & Calculations) ✅'
+          : `${marketData.royaltyFeeBps} bps (MANDATORY - factored into profit) 🛡️`,
         marketplaceFeeUsd: `$${calculation.openseaFeeUsd}`,
         estimatedGasCostUsd: `$${calculation.estimatedGasCostUsd}`,
         expectedNetProfitUsd: `$${calculation.netProfitUsd}`,
         marginPercent: `${calculation.marginPercent}%`,
+        activeOffersCapitalUsd: `$${this.inventoryManager.getActiveOffersCapitalUsd()}`,
         checkL_Liquidity: 'PASSED ✅ (>= 20 sales & >= 5 wallets in 3h around floor)',
-        checkA_Capital: 'PASSED ✅',
+        checkA_Capital: 'PASSED ✅ (within active-offer capital allocation)',
         checkB_Profitability: 'PASSED ✅'
       },
       `ALL CHECKS PASSED ✅ Placing collection offer on ${targetNetwork.toUpperCase()}`

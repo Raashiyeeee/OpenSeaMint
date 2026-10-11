@@ -1,5 +1,5 @@
 import axios, { AxiosInstance } from 'axios';
-import { BotConfig, CollectionMarketData } from '../types';
+import { BotConfig, CollectionMarketData, FeeRecipient } from '../types';
 import { logger } from '../utils/logger';
 
 export class OpenSeaApiService {
@@ -60,24 +60,71 @@ export class OpenSeaApiService {
 
       // Fees in basis points and full fee recipients array
       let openseaFeeBps = this.config.fees.openseaFeeBps;
-      let royaltyFeeBps = this.config.fees.defaultRoyaltyBps;
-      const rawFees: any[] = [];
+      let mandatoryRoyaltyFeeBps = 0;
+      let optionalRoyaltyFeeBps = 0;
+      let creatorFeeDisabled = false;
+      const rawFees: FeeRecipient[] = [];
 
-      if (collectionData?.fees && Array.isArray(collectionData.fees)) {
+      if (collectionData?.fees && Array.isArray(collectionData.fees) && collectionData.fees.length > 0) {
         for (const f of collectionData.fees) {
-          rawFees.push({
-            fee: f.fee,
-            recipient: f.recipient,
-            required: f.required
-          });
           const bps = Math.round((f.fee || 0) * 100);
-          if (f.recipient?.toLowerCase().includes('opensea')) {
+          const isOpensea = f.recipient?.toLowerCase().includes('opensea') ||
+            f.recipient?.toLowerCase() === '0x0000a26b00c1f0df003000390027140000faa719';
+
+          if (isOpensea) {
             openseaFeeBps = bps;
+            rawFees.push({
+              fee: f.fee,
+              recipient: f.recipient,
+              required: true,
+              disabled: false
+            });
           } else {
-            royaltyFeeBps += bps;
+            // Mandatory vs Optional Creator Fee Rule:
+            // - Optional: If creator fee can be disabled (f.required === false), disable it before proceeding.
+            // - Mandatory: If creator fee cannot be disabled (f.required === true), include in profitability calculations.
+            // - Unverified: If status cannot be verified (required === undefined), never assume zero!
+            if (f.required === false) {
+              optionalRoyaltyFeeBps += bps;
+              creatorFeeDisabled = true;
+              rawFees.push({
+                fee: f.fee,
+                recipient: f.recipient,
+                required: false,
+                disabled: true
+              });
+              logger.info(
+                { collectionSlug, recipient: f.recipient, feeBps: bps },
+                `[Creator Fee Rule] Optional creator fee detected (${bps} bps). Automatically DISABLED (set to 0% in Seaport consideration & profit calculations).`
+              );
+            } else {
+              mandatoryRoyaltyFeeBps += bps;
+              rawFees.push({
+                fee: f.fee,
+                recipient: f.recipient,
+                required: true,
+                disabled: false
+              });
+              logger.info(
+                { collectionSlug, recipient: f.recipient, feeBps: bps, required: f.required },
+                `[Creator Fee Rule] Mandatory creator fee detected (${bps} bps). Included in all profitability calculations and order considerations.`
+              );
+            }
           }
         }
+      } else {
+        // If fee metadata cannot be verified from marketplace API, DO NOT assume zero!
+        // Core rule: Never assume a fee is zero without verification.
+        mandatoryRoyaltyFeeBps = this.config.fees.defaultRoyaltyBps;
+        logger.warn(
+          { collectionSlug, defaultRoyaltyBps: this.config.fees.defaultRoyaltyBps },
+          `[Creator Fee Rule] Fee metadata could not be verified from marketplace API. Applying default creator fee (${this.config.fees.defaultRoyaltyBps} bps) in calculations.`
+        );
       }
+
+      // The applicable creator fee in all profitability calculations:
+      // Includes only mandatory royalties (optional fees were disabled to 0)
+      const royaltyFeeBps = mandatoryRoyaltyFeeBps;
 
       // 2. Fetch best listings & floor from stats
       let floorPriceEth = 0.05; // Fallback
@@ -134,6 +181,9 @@ export class OpenSeaApiService {
         numListings: 10,
         openseaFeeBps,
         royaltyFeeBps,
+        mandatoryRoyaltyFeeBps,
+        optionalRoyaltyFeeBps,
+        creatorFeeDisabled,
         ethPriceUsd,
         timestamp: Date.now(),
         fees: rawFees,
