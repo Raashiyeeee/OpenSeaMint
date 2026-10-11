@@ -72,7 +72,7 @@
       "slug": "hex-lings",
       "contractAddress": "0x3e19865ffbfe89085feee74245cce289c0b11566",
       "network": "robinhood",
-      "enabled": true,
+      "enabled": false,
       "maxBidEth": 0.0015,
       "targetNetProfitUsd": 0.20,
       "maxInventory": 1,

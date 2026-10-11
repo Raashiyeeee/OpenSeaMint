@@ -58,6 +58,8 @@ export class CollectionBidderStrategy {
     const minFloorUsd = 0.20;
     const maxFloorUsd = 8.00; // Expanded to include high-volume collections like Hex-lings ($4.57) and Project Shiesty ($5.12)
 
+    const processedThisCycle = new Set<string>();
+
     // 1. Dynamic Market Discovery: Scan live marketplace for active collections on active networks
     for (const net of activeNetworks) {
       try {
@@ -67,6 +69,8 @@ export class CollectionBidderStrategy {
           logger.info(`Dynamic scan: No active collections in $${minFloorUsd}-$${maxFloorUsd} range on ${net.toUpperCase()} this round.`);
         }
         for (const disc of discovered) {
+          const key = `${net}:${disc.slug}`;
+          processedThisCycle.add(key);
           try {
             await this.processCollectionBid({
               name: disc.name,
@@ -85,12 +89,16 @@ export class CollectionBidderStrategy {
       }
     }
 
-    // 2. Evaluate any configured target collections (if enabled)
+    // 2. Evaluate any configured target collections (if enabled and not already evaluated)
     for (const target of this.config.targetCollections) {
       if (!target.enabled) continue;
 
       const networksToEvaluate = target.network ? [target.network] : activeNetworks;
       for (const net of networksToEvaluate) {
+        const key = `${net}:${target.slug}`;
+        if (processedThisCycle.has(key)) {
+          continue;
+        }
         try {
           await this.processCollectionBid({ ...target, network: net }, net);
         } catch (err: any) {

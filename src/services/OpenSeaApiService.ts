@@ -441,7 +441,7 @@ export class OpenSeaApiService {
 
     try {
       // Query top collections sorted by 1-day trading volume
-      const res = await this.client.get(`/collections?chain=${chainSlug}&limit=30&order_by=one_day_volume`);
+      const res = await this.client.get(`/collections?chain=${chainSlug}&limit=100&order_by=one_day_volume`);
       const collections = (res.data?.collections || []).filter(
         (col: any) => col.collection_offers_enabled && !col.is_disabled
       );
