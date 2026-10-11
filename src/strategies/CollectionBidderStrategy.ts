@@ -48,14 +48,18 @@ export class CollectionBidderStrategy {
       return;
     }
 
-    const minFloorUsd = 0.50;
-    const maxFloorUsd = 3.50; // NFTs up to $3.50 floor for sub-$3 offers
+    const minFloorUsd = 0.20;
+    const maxFloorUsd = 8.00; // Expanded to include high-volume collections like Hex-lings ($4.57) and Project Shiesty ($5.12)
 
-    // 1. Dynamic Market Discovery: Scan live marketplace for active collections ($0.50 - $3.50) on active networks
+    // 1. Dynamic Market Discovery: Scan live marketplace for active collections on active networks
     for (const net of activeNetworks) {
       if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) break;
       try {
+        logger.info(`Scanning live marketplace on ${net.toUpperCase()} for active collections ($${minFloorUsd}-$${maxFloorUsd})...`);
         const discovered = await this.apiService.discoverCollectionsByChain(net, minFloorUsd, maxFloorUsd);
+        if (discovered.length === 0) {
+          logger.info(`Dynamic scan: No active collections in $${minFloorUsd}-$${maxFloorUsd} range on ${net.toUpperCase()} this round.`);
+        }
         for (const disc of discovered) {
           if (this.inventoryManager.getActiveTradesCount() >= maxActiveTrades) break;
           try {
