@@ -38,6 +38,7 @@ export interface BotConfig {
     loopIntervalMs: number;
     offerExpirationMinutes: number;
     listingExpirationDays: number;
+    ignoredCollections?: string[];
   };
   capital: CapitalConfig;
   liquidity: LiquidityConfig;

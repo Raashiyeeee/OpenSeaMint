@@ -78,6 +78,11 @@ export class AutoRelisterStrategy {
           if (!contractAddress || !tokenId) continue;
 
           const identifier = `${contractAddress.toLowerCase()}:${tokenId}`;
+          const ignored = this.config.general.ignoredCollections || ['robin-owls', 'robin-owls-269031093'];
+          if (ignored.some((i) => slug.toLowerCase().includes(i.toLowerCase()) || contractAddress.toLowerCase().includes(i.toLowerCase()))) {
+            continue;
+          }
+
           const existing = this.inventoryManager.getInventoryItem(identifier);
           if (!existing) {
             logger.info({ identifier, slug, net }, 'Discovered unlisted NFT in wallet during scan. Adding to relist queue!');
@@ -121,6 +126,14 @@ export class AutoRelisterStrategy {
   }
 
   private async relistItem(item: InventoryItem): Promise<void> {
+    const ignored = this.config.general.ignoredCollections || ['robin-owls', 'robin-owls-269031093'];
+    if (ignored.some((i) => item.collectionSlug.toLowerCase().includes(i.toLowerCase()) || item.contractAddress.toLowerCase().includes(i.toLowerCase()))) {
+      item.status = 'ERROR';
+      item.holdReason = 'Skipped: Collection configured in ignoredCollections';
+      logger.info({ identifier: item.identifier, slug: item.collectionSlug }, 'Skipping excluded collection from relisting');
+      return;
+    }
+
     // 1. Fetch current collection floor & fees
     const marketData = await this.apiService.getCollectionMarketData(
       item.collectionSlug,
