@@ -193,17 +193,30 @@ export class AutoRelisterStrategy {
       protocol_address: this.config.seaport.contractAddress
     };
 
-    const res = await this.apiService.postListing(chainSlug, postPayload);
+    try {
+      const res = await this.apiService.postListing(chainSlug, postPayload);
 
-    // 6. Update inventory tracking
-    const listPriceUsd = listPriceEth * (marketData.ethPriceUsd || 2700);
-    this.inventoryManager.updateListingStatus(
-      item.identifier,
-      listPriceEth,
-      res?.order_hash || `sim_list_${Date.now()}`,
-      listPriceUsd
-    );
+      // 6. Update inventory tracking
+      const listPriceUsd = listPriceEth * (marketData.ethPriceUsd || 2700);
+      this.inventoryManager.updateListingStatus(
+        item.identifier,
+        listPriceEth,
+        res?.order_hash || `sim_list_${Date.now()}`,
+        listPriceUsd
+      );
 
-    this.circuitBreaker.registerSuccess();
+      this.circuitBreaker.registerSuccess();
+    } catch (err: any) {
+      if (err.message?.includes('enforcement restrictions') || err.message?.includes('Validation error')) {
+        item.status = 'ERROR';
+        item.holdReason = 'Listing restricted by OpenSea (enforcement restrictions)';
+        logger.warn(
+          { identifier: item.identifier, slug: item.collectionSlug, error: err.message },
+          'OpenSea has active enforcement restrictions on this collection. Item marked as ERROR and excluded from relist queue.'
+        );
+        return;
+      }
+      throw err;
+    }
   }
 }
