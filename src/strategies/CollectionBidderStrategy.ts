@@ -131,12 +131,12 @@ export class CollectionBidderStrategy {
     if (!isStable) return;
 
     // 5. CALCULATE EXPECTED RESALE, ROYALTIES, MARKETPLACE FEES, GAS & NET PROFIT
-    // Core Rule: Must calculate realistic net resale value after all costs on specific network.
     const calculation = this.pricingEngine.calculateMaxBid(
       marketData,
       target.targetNetProfitUsd,
       availableCapitalUsd,
-      targetNetwork
+      targetNetwork,
+      target
     );
 
     // 6. PROFITABILITY CHECK (Check B) & CAPITAL CHECK (Check A)
@@ -193,6 +193,7 @@ export class CollectionBidderStrategy {
         network: targetNetwork,
         sales_1h: calculation.sales1Hour,
         unique_wallets_1h: calculation.uniqueWallets1Hour,
+        sales_24h: marketData.sales24Hours,
         bidPriceEth: calculation.bidPriceEth,
         bidPriceUsd: `$${calculation.bidPriceUsd}`,
         targetListPriceEth: calculation.targetListPriceEth,
@@ -202,9 +203,9 @@ export class CollectionBidderStrategy {
         estimatedGasCostUsd: `$${calculation.estimatedGasCostUsd}`,
         expectedNetProfitUsd: `$${calculation.netProfitUsd}`,
         marginPercent: `${calculation.marginPercent}%`,
-        checkL_Liquidity: 'PASSED ✅ (>= 15 sales & >= 4 wallets in 1h)',
-        checkA_Capital: 'PASSED ✅ (Within $10.00 capital & <= $3.00 max buy)',
-        checkB_Profitability: 'PASSED ✅ (>= 40% margin & positive net profit)'
+        checkL_Liquidity: 'PASSED ✅',
+        checkA_Capital: 'PASSED ✅',
+        checkB_Profitability: 'PASSED ✅'
       },
       `ALL CHECKS PASSED ✅ Placing collection offer on ${targetNetwork.toUpperCase()}`
     );
@@ -219,12 +220,13 @@ export class CollectionBidderStrategy {
       return;
     }
 
-    // 8. SIGN SEAPORT COLLECTION OFFER (Off-chain EIP-712, 0 gas!)
+    // 8. SIGN SEAPORT COLLECTION OFFER (Off-chain EIP-712 with required fee recipients)
     const { orderComponents, signature } = await this.seaportService.createSignedCollectionOffer(
       target.contractAddress,
       calculation.bidPriceEth,
       this.config.general.offerExpirationMinutes,
-      targetNetwork
+      targetNetwork,
+      marketData.fees
     );
 
     // 9. POST OFFER TO OPENSEA (OpenSea v2 /offers format)
@@ -242,6 +244,36 @@ export class CollectionBidderStrategy {
     };
 
     const res = await this.apiService.postCollectionOffer(postPayload);
+
+    // 9.5. Optional: Target recently minted tokens (Larry's offerSingle idea)
+    if (target.singleTokenBids) {
+      try {
+        const recentTokens = await this.apiService.getLatestMintedTokens(target.slug, 3);
+        for (const tok of recentTokens) {
+          try {
+            const { orderComponents: itemComponents, signature: itemSig } = await this.seaportService.createSignedItemOffer(
+              target.contractAddress,
+              tok.tokenId,
+              calculation.bidPriceEth,
+              this.config.general.offerExpirationMinutes,
+              targetNetwork,
+              marketData.fees
+            );
+            const singlePayload = {
+              parameters: itemComponents,
+              signature: itemSig,
+              protocol_address: this.config.seaport.contractAddress
+            };
+            const singleRes = await this.apiService.postSingleOffer(targetNetwork, singlePayload);
+            logger.info({ tokenId: tok.tokenId, orderHash: singleRes?.order_hash }, `Placed single token offer on recent mint #${tok.tokenId}`);
+          } catch (singleErr: any) {
+            logger.debug({ tokenId: tok.tokenId, err: singleErr.message }, 'Single offer info');
+          }
+        }
+      } catch (err: any) {
+        logger.debug({ err: err.message }, 'Recent mint single offer fetch skipped');
+      }
+    }
 
     // 10. TRACK OFFER & LOCK CAPITAL
     this.inventoryManager.registerActiveOffer({

@@ -15,7 +15,11 @@ const TargetCollectionSchema = z.object({
   enabled: z.boolean(),
   maxBidEth: z.number().positive(),
   targetNetProfitUsd: z.number().positive(),
-  maxInventory: z.number().int().positive()
+  maxInventory: z.number().int().positive(),
+  floorPriceMultiple: z.number().positive().optional(),
+  minMarginPercent: z.number().nonnegative().optional(),
+  minSales24Hours: z.number().nonnegative().optional(),
+  singleTokenBids: z.boolean().optional()
 });
 
 const CapitalSchema = z.object({
@@ -31,6 +35,7 @@ const LiquiditySchema = z.object({
   minFloorMultiplier: z.number().positive().default(1.40),
   floorRangeMinPercent: z.number().nonnegative().default(80.0),
   floorRangeMaxPercent: z.number().nonnegative().default(135.0),
+  minSales24Hours: z.number().int().nonnegative().optional(),
   minSales1Hour: z.number().int().nonnegative().optional(),
   minUniqueWallets1Hour: z.number().int().nonnegative().optional()
 });

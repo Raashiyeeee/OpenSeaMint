@@ -58,12 +58,18 @@ export class OpenSeaApiService {
       const collectionRes = await this.client.get(`/collections/${collectionSlug}`);
       const collectionData = collectionRes.data;
 
-      // Fees in basis points
+      // Fees in basis points and full fee recipients array
       let openseaFeeBps = this.config.fees.openseaFeeBps;
       let royaltyFeeBps = this.config.fees.defaultRoyaltyBps;
+      const rawFees: any[] = [];
 
       if (collectionData?.fees && Array.isArray(collectionData.fees)) {
         for (const f of collectionData.fees) {
+          rawFees.push({
+            fee: f.fee,
+            recipient: f.recipient,
+            required: f.required
+          });
           const bps = Math.round((f.fee || 0) * 100);
           if (f.recipient?.toLowerCase().includes('opensea')) {
             openseaFeeBps = bps;
@@ -75,10 +81,15 @@ export class OpenSeaApiService {
 
       // 2. Fetch best listings & floor from stats
       let floorPriceEth = 0.05; // Fallback
+      let sales24Hours = 0;
       try {
         const statsRes = await this.client.get(`/collections/${collectionSlug}/stats`);
         const statsFloor = statsRes.data?.total?.floor_price;
         const symbol = statsRes.data?.total?.floor_price_symbol || 'ETH';
+        const intervalSales = statsRes.data?.intervals?.find((i: any) => i.interval === 'one_day')?.sales;
+        if (intervalSales !== undefined) {
+          sales24Hours = intervalSales;
+        }
         if (statsFloor !== undefined && statsFloor !== null && (symbol === 'ETH' || symbol === 'WETH')) {
           floorPriceEth = parseFloat(statsFloor);
         } else {
@@ -113,7 +124,7 @@ export class OpenSeaApiService {
       }
 
       // 4. Fetch Liquidity Metrics with floor reference
-      const liquidity = await this.getCollectionLiquidity(collectionSlug, floorPriceEth);
+      const liquidity = await this.getCollectionLiquidity(collectionSlug, floorPriceEth, sales24Hours);
 
       return {
         slug: collectionSlug,
@@ -125,10 +136,12 @@ export class OpenSeaApiService {
         royaltyFeeBps,
         ethPriceUsd,
         timestamp: Date.now(),
+        fees: rawFees,
         sales1Hour: liquidity.sales1Hour,
         uniqueWallets1Hour: liquidity.uniqueWallets1Hour,
         sales3Hours: liquidity.sales3Hours,
         uniqueWallets3Hours: liquidity.uniqueWallets3Hours,
+        sales24Hours,
         floorSalesCount: liquidity.sales3Hours,
         liquidityPassed: liquidity.liquidityPassed,
         liquidityReason: liquidity.liquidityReason
@@ -171,7 +184,8 @@ export class OpenSeaApiService {
    */
   public async getCollectionLiquidity(
     collectionSlug: string,
-    floorPriceEth: number = 0
+    floorPriceEth: number = 0,
+    sales24Hours: number = 0
   ): Promise<{
     sales3Hours: number;
     uniqueWallets3Hours: number;
@@ -180,13 +194,14 @@ export class OpenSeaApiService {
     liquidityPassed: boolean;
     liquidityReason?: string;
   }> {
-    const minSales = this.config.liquidity?.minSales3Hours ?? 20;
-    const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 5;
+    const minSales = this.config.liquidity?.minSales3Hours ?? 5;
+    const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 2;
+    const minSales24h = this.config.liquidity?.minSales24Hours ?? 10;
     const threeHoursAgo = Math.floor(Date.now() / 1000) - (3 * 3600);
     const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
 
-    const floorMinPercent = (this.config.liquidity?.floorRangeMinPercent ?? 80.0) / 100;
-    const floorMaxPercent = (this.config.liquidity?.floorRangeMaxPercent ?? 135.0) / 100;
+    const floorMinPercent = (this.config.liquidity?.floorRangeMinPercent ?? 60.0) / 100;
+    const floorMaxPercent = (this.config.liquidity?.floorRangeMaxPercent ?? 150.0) / 100;
     const minFloorAllowed = floorPriceEth > 0 ? floorPriceEth * floorMinPercent : 0;
     const maxFloorAllowed = floorPriceEth > 0 ? floorPriceEth * floorMaxPercent : Infinity;
 
@@ -197,20 +212,15 @@ export class OpenSeaApiService {
       // Filter events to previous 3 hours
       const sales3HoursRaw = events.filter((e: any) => (e.event_timestamp || 0) >= threeHoursAgo);
 
-      // Filter for Native ETH, around current floor, excluding low offer sales & high outliers
       const qualifiedSales: any[] = [];
       const wallets3Hours = new Set<string>();
-      let belowFloorOfferSalesCount = 0;
-      let outlierHighSalesCount = 0;
 
       for (const sale of sales3HoursRaw) {
-        // Native ETH verification (symbol ETH or WETH)
         const symbol = (sale.payment?.symbol || sale.payment_token?.symbol || 'ETH').toUpperCase();
         if (symbol !== 'ETH' && symbol !== 'WETH') {
           continue;
         }
 
-        // Parse price
         let salePriceEth = 0;
         if (sale.payment?.quantity && sale.payment?.decimals) {
           salePriceEth = parseFloat(sale.payment.quantity) / Math.pow(10, sale.payment.decimals);
@@ -221,14 +231,9 @@ export class OpenSeaApiService {
           salePriceEth = parseFloat(sale.total_price) / Math.pow(10, dec);
         }
 
-        // If floor is known, verify price is around the floor range
+        // Keep sales within realistic boundaries (avoid massive wash outliers)
         if (floorPriceEth > 0 && salePriceEth > 0) {
-          if (salePriceEth < minFloorAllowed) {
-            belowFloorOfferSalesCount++;
-            continue;
-          }
-          if (salePriceEth > maxFloorAllowed) {
-            outlierHighSalesCount++;
+          if (salePriceEth > maxFloorAllowed * 3) {
             continue;
           }
         }
@@ -247,10 +252,18 @@ export class OpenSeaApiService {
         if (s.seller) wallets1Hour.add(s.seller.toLowerCase());
       }
 
-      const liquidityPassed = sales3Hours >= minSales && uniqueWallets3Hours >= minWallets;
-      let liquidityReason = 'Passed 3-hour native ETH floor liquidity check';
+      // Liquidity passes if 3h requirement is met OR 24h volume verifies active market
+      const pass3h = sales3Hours >= minSales && uniqueWallets3Hours >= minWallets;
+      const pass24h = sales24Hours >= minSales24h;
+      const liquidityPassed = pass3h || pass24h;
+
+      let liquidityReason = 'Passed liquidity checks';
       if (!liquidityPassed) {
-        liquidityReason = `Floor Liquidity Failed: ${sales3Hours}/${minSales} qualified floor sales in last 3h (${uniqueWallets3Hours}/${minWallets} unique wallets). Excluded ${belowFloorOfferSalesCount} low offer sales & ${outlierHighSalesCount} high outliers.`;
+        liquidityReason = `Liquidity Failed: ${sales3Hours}/${minSales} sales in 3h, ${sales24Hours}/${minSales24h} in 24h.`;
+      } else if (pass24h && !pass3h) {
+        liquidityReason = `Passed 24-hour sustained trading liquidity (${sales24Hours} sales in 24h)`;
+      } else {
+        liquidityReason = `Passed 3-hour native ETH floor liquidity check (${sales3Hours} sales)`;
       }
 
       return {
@@ -263,19 +276,20 @@ export class OpenSeaApiService {
       };
     } catch (err: any) {
       logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch liquidity events from OpenSea');
+      const pass24h = sales24Hours >= minSales24h;
       return {
         sales3Hours: 0,
         uniqueWallets3Hours: 0,
         sales1Hour: 0,
         uniqueWallets1Hour: 0,
-        liquidityPassed: false,
-        liquidityReason: `API error fetching liquidity: ${err.message}`
+        liquidityPassed: pass24h,
+        liquidityReason: pass24h ? `Verified by 24h stats (${sales24Hours} sales)` : `API error fetching liquidity: ${err.message}`
       };
     }
   }
 
   /**
-   * Post a signed collection offer order to OpenSea
+   * Post a signed collection offer order to OpenSea (/offers)
    */
   public async postCollectionOffer(signedOrderPayload: any): Promise<any> {
     if (process.env.BOT_MODE === 'SIMULATION') {
@@ -290,6 +304,42 @@ export class OpenSeaApiService {
       const errorDetail = err.response?.data?.errors || err.response?.data || err.message;
       logger.error({ status: err.response?.status, details: errorDetail }, 'OpenSea rejected offer');
       throw new Error(`OpenSea API Error: ${JSON.stringify(errorDetail)}`);
+    }
+  }
+
+  /**
+   * Post a single token buy order (Part Time Larry offerSingle style)
+   */
+  public async postSingleOffer(chain: string, signedOrderPayload: any): Promise<any> {
+    if (process.env.BOT_MODE === 'SIMULATION') {
+      logger.info({ chain, payload: signedOrderPayload }, '[SIMULATION] Pretending to submit single token offer to OpenSea');
+      return { order_hash: `sim_single_${Date.now()}`, status: 'success' };
+    }
+
+    try {
+      const response = await this.client.post(`/orders/${chain}/seaport/offers`, signedOrderPayload);
+      return response.data;
+    } catch (err: any) {
+      const errorDetail = err.response?.data?.errors || err.response?.data || err.message;
+      logger.error({ status: err.response?.status, details: errorDetail }, 'OpenSea rejected single token offer');
+      throw new Error(`OpenSea API Error: ${JSON.stringify(errorDetail)}`);
+    }
+  }
+
+  /**
+   * Fetches latest minted tokens in a collection (Larry's COLLECTION_ASSETS_URL idea)
+   */
+  public async getLatestMintedTokens(collectionSlug: string, limit: number = 10): Promise<Array<{ tokenId: string; name: string }>> {
+    try {
+      const res = await this.client.get(`/collection/${collectionSlug}/nfts?limit=${limit}`);
+      const nfts = res.data?.nfts || [];
+      return nfts.map((nft: any) => ({
+        tokenId: nft.identifier,
+        name: nft.name || `#${nft.identifier}`
+      }));
+    } catch (err: any) {
+      logger.debug(`Could not fetch minted tokens for ${collectionSlug}: ${err.message}`);
+      return [];
     }
   }
 
@@ -313,17 +363,18 @@ export class OpenSeaApiService {
   }
 
   /**
-   * Fetch NFTs currently owned by a wallet
+   * Fetch NFTs currently owned by a wallet on a specified chain
    */
-  public async getAccountNfts(walletAddress: string, collectionSlug?: string): Promise<any[]> {
+  public async getAccountNfts(walletAddress: string, collectionSlug?: string, chain: string = 'robinhood'): Promise<any[]> {
     try {
+      const chainSlug = chain === 'mainnet' ? 'ethereum' : chain;
       const url = collectionSlug 
-        ? `/chain/ethereum/account/${walletAddress}/nfts?collection=${collectionSlug}&limit=50`
-        : `/chain/ethereum/account/${walletAddress}/nfts?limit=50`;
+        ? `/chain/${chainSlug}/account/${walletAddress}/nfts?collection=${collectionSlug}&limit=50`
+        : `/chain/${chainSlug}/account/${walletAddress}/nfts?limit=50`;
       const res = await this.client.get(url);
       return res.data?.nfts || [];
     } catch (err: any) {
-      logger.debug(`Could not fetch NFTs for ${walletAddress}: ${err.message}`);
+      logger.debug(`Could not fetch NFTs for ${walletAddress} on ${chain}: ${err.message}`);
       return [];
     }
   }

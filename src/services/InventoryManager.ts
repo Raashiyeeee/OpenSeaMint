@@ -96,6 +96,10 @@ export class InventoryManager {
     return count;
   }
 
+  public getInventoryItem(identifier: string): InventoryItem | undefined {
+    return this.inventory.get(identifier);
+  }
+
   public addInventoryItem(item: InventoryItem): void {
     // When an item is acquired from an offer, mark matching offer as FULFILLED
     const offer = this.activeOffers.get(item.collectionSlug);
