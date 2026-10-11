@@ -163,6 +163,7 @@ export interface InventoryItem {
   salePriceUsd?: number;
   realizedProfitEth?: number;
   realizedProfitUsd?: number;
+  isExternalWalletItem?: boolean;
 }
 
 export interface ActiveOffer {

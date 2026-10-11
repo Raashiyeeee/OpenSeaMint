@@ -361,8 +361,8 @@ export class PricingEngine {
     );
     const ethPriceUsd = marketData.ethPriceUsd || 2700;
 
-    // Rule 8: Floor Dump Protection
-    if (currentFloorEth < minProfitablePriceEth) {
+    // Rule 8: Floor Dump Protection (only applies if an active market floor exists > 0)
+    if (currentFloorEth > 0 && currentFloorEth < minProfitablePriceEth) {
       return {
         action: 'HOLD',
         minProfitablePriceEth,
@@ -372,7 +372,7 @@ export class PricingEngine {
 
     // Rule 5: Lowest competitive floor listing (e.g. undercut by 1% while staying >= minProfitablePriceEth)
     const undercutPercent = this.config.profitTargets.undercutFloorByPercent ?? 1.0;
-    const competitiveFloorPrice = currentFloorEth * (1 - undercutPercent / 100);
+    const competitiveFloorPrice = currentFloorEth > 0 ? currentFloorEth * (1 - undercutPercent / 100) : minProfitablePriceEth;
     const finalListingPriceEth = roundToPrecision(Math.max(minProfitablePriceEth, competitiveFloorPrice), 6);
 
     const netProceeds = finalListingPriceEth * (1 - totalFeeRate);
