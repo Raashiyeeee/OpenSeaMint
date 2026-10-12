@@ -208,8 +208,8 @@ export class CollectionBidderStrategy {
         estimatedGasCostUsd: `$${calculation.estimatedGasCostUsd}`,
         expectedNetProfitUsd: `$${calculation.netProfitUsd}`,
         marginPercent: `${calculation.marginPercent}%`,
-        activeOffersCapitalUsd: `$${this.inventoryManager.getActiveOffersCapitalUsd()}`,
-        checkL_Liquidity: 'PASSED ✅ (>= 20 sales & >= 5 wallets in 3h around floor)',
+        checkL_Liquidity: 'PASSED ✅ (>= 10 genuine native ETH floor sales & >= 5 wallets in 3h, WETH & offers excluded)',
+        checkF_FloorRatio: 'PASSED ✅ (Floor >= Offer * 1.40, >= 40% floor difference excluding creator fees)',
         checkA_Capital: 'PASSED ✅ (within active-offer capital allocation)',
         checkB_Profitability: 'PASSED ✅'
       },
