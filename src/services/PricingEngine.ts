@@ -269,6 +269,14 @@ export class PricingEngine {
       finalBidEth = maxProfitableBidEth;
     }
 
+    // OpenSea Seaport Tick Size Rule:
+    // OpenSea enforces bid amounts to be in multiples of 0.0001 ETH with at most 4 decimal places.
+    let roundedBidEth = roundToPrecision(finalBidEth, 4);
+    if (roundedBidEth > maxProfitableBidEth) {
+      roundedBidEth = Math.floor(finalBidEth * 10000) / 10000;
+    }
+    finalBidEth = roundedBidEth;
+
     const bidPriceUsd = roundToPrecision(finalBidEth * ethPriceUsd, 2);
 
     // Recompute exact margins based on this bid price
