@@ -90,11 +90,16 @@ export class AutoRelisterStrategy {
           const existing = this.inventoryManager.getInventoryItem(identifier);
           if (!existing) {
             logger.info({ identifier, slug, net }, 'Discovered unlisted NFT in wallet during scan. Adding to relist queue!');
-            let acquiredPriceEth = 0.0006; // Default to typical buy offer
-            try {
-              const marketData = await this.apiService.getCollectionMarketData(slug, contractAddress);
-              acquiredPriceEth = marketData.topOfferEth > 0 ? marketData.topOfferEth : (marketData.floorPriceEth * 0.85);
-            } catch {}
+            let acquiredPriceEth = 0.0004;
+            const matchingOffer = this.inventoryManager.getActiveOffer(slug);
+            if (matchingOffer && matchingOffer.priceEth > 0) {
+              acquiredPriceEth = matchingOffer.priceEth;
+            } else {
+              try {
+                const marketData = await this.apiService.getCollectionMarketData(slug, contractAddress);
+                acquiredPriceEth = marketData.topOfferEth > 0 ? marketData.topOfferEth : (marketData.floorPriceEth * 0.85);
+              } catch {}
+            }
 
             const newItem: InventoryItem = {
               identifier,
@@ -108,6 +113,13 @@ export class AutoRelisterStrategy {
               isExternalWalletItem: true
             };
             this.inventoryManager.addInventoryItem(newItem);
+          } else if (existing.status === 'HOLDING' && existing.acquiredPriceEth >= 0.003 && net === 'robinhood') {
+            // Sanitize previously corrupted fallback prices
+            const matchingOffer = this.inventoryManager.getActiveOffer(slug);
+            if (matchingOffer && matchingOffer.priceEth > 0) {
+              existing.acquiredPriceEth = matchingOffer.priceEth;
+              existing.status = 'PENDING_LISTING';
+            }
           }
         }
       } catch (err: any) {
