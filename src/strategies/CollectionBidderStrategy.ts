@@ -339,10 +339,10 @@ export class CollectionBidderStrategy {
         estimatedGasCostUsd: `$${calculation.estimatedGasCostUsd}`,
         expectedNetProfitUsd: `$${calculation.netProfitUsd}`,
         marginPercent: `${calculation.marginPercent}%`,
-        checkMint_Completion: 'PASSED ✅ (Public mint completed and secondary demand verified)',
+        checkMint_Completion: 'PASSED ✅ (100% Mint-out verified and secondary demand confirmed)',
         checkDump_Protection: `PASSED ✅ (Floor decline ${calculation.floorDeclinePercent ?? 0}% < 40% threshold)`,
         checkL_Liquidity: 'PASSED ✅ (>= 10 genuine native ETH floor sales & >= 5 wallets in 3h, WETH & offers excluded)',
-        checkF_FloorRatio: 'PASSED ✅ (Floor >= Offer * 1.40, >= 40% floor difference excluding creator fees)',
+        checkF_FloorRatio: 'PASSED ✅ (Floor >= Offer * 1.30, >= 30% floor difference excluding creator fees)',
         checkA_Capital: 'PASSED ✅ (within active-offer capital allocation)',
         checkB_Profitability: 'PASSED ✅'
       },
@@ -355,6 +355,16 @@ export class CollectionBidderStrategy {
       logger.info(
         { targetNetwork, availableWeth, requiredWeth: calculation.bidPriceEth },
         `[${targetNetwork.toUpperCase()}] Insufficient WETH balance (${availableWeth} WETH available vs ${calculation.bidPriceEth} WETH required). Skipping offer on this chain until WETH is deposited.`
+      );
+      return;
+    }
+
+    // 7.8. FINAL OFFER-EXECUTION STAGE ENFORCEMENT (Rule 6: Core rule - If mint-out is not 100% complete, DO NOT OFFER)
+    const finalMintCheck = this.pricingEngine.verifyMintCompletion(marketData);
+    if (!finalMintCheck.passed) {
+      logger.error(
+        { slug: target.slug, network: targetNetwork, reason: finalMintCheck.reason },
+        `FINAL OFFER-EXECUTION BLOCKED 🛑: Collection has not fully minted out. ${finalMintCheck.reason}`
       );
       return;
     }
@@ -539,6 +549,16 @@ export class CollectionBidderStrategy {
     const availableWeth = await this.seaportService.getWethBalance(targetNetwork);
     if (availableWeth < calculation.bidPriceEth) {
       return { success: false, reason: `Insufficient WETH balance (${availableWeth} available vs ${calculation.bidPriceEth} required)` };
+    }
+
+    // 4.9. FINAL OFFER-EXECUTION STAGE ENFORCEMENT (Rule 6: Core rule - If mint-out is not 100% complete, DO NOT OFFER)
+    const finalItemMintCheck = this.pricingEngine.verifyMintCompletion(marketData);
+    if (!finalItemMintCheck.passed) {
+      logger.error(
+        { contractAddress: params.contractAddress, tokenId: params.tokenId, reason: finalItemMintCheck.reason },
+        `FINAL OFFER-EXECUTION BLOCKED 🛑: Collection has not fully minted out. ${finalItemMintCheck.reason}`
+      );
+      return { success: false, reason: finalItemMintCheck.reason };
     }
 
     // 5. Sign & Post Item Offer

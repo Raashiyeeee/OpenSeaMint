@@ -55,8 +55,13 @@ export class OpenSeaApiService {
     const ethPriceUsd = await this.getEthPriceUsd();
 
     try {
-      // 1. Fetch collection metadata & fees
-      const collectionRes = await this.client.get(`/collections/${collectionSlug}`);
+      // 1. Fetch collection metadata & fees with fresh, un-cached data
+      const collectionRes = await this.client.get(`/collections/${collectionSlug}`, {
+        headers: {
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache'
+        }
+      });
       const collectionData = collectionRes.data;
 
       // Fees in basis points and full fee recipients array
@@ -174,7 +179,7 @@ export class OpenSeaApiService {
       // 4. Fetch Liquidity Metrics with floor reference
       const liquidity = await this.getCollectionLiquidity(collectionSlug, floorPriceEth, sales24Hours);
 
-      // 5. Incomplete Public Mint & Mint Demand Metrics
+      // 5. Incomplete Public Mint & 100% Mint-Out Metrics
       const isMinting = collectionData?.is_minting === true;
       const totalSupply = typeof collectionData?.total_supply === 'number'
         ? collectionData.total_supply
@@ -182,15 +187,25 @@ export class OpenSeaApiService {
       const maxSupply = typeof collectionData?.max_supply === 'number' ? collectionData.max_supply : undefined;
 
       let mintCompleted = true;
+      let mintStatusVerified = true;
       let mintDemandPassed = true;
       let mintDemandReason: string | undefined;
 
-      if (isMinting) {
-        if (maxSupply && totalSupply !== undefined && totalSupply < maxSupply * 0.98) {
-          mintCompleted = false;
-          mintDemandPassed = false;
-          mintDemandReason = `Public mint is still active and supply remains incomplete (${totalSupply}/${maxSupply}). Collection struggling to sell out.`;
-        }
+      // 100% Mint-Out Rule:
+      // If collection has not reached 100% of total mint supply, REJECT.
+      if (maxSupply !== undefined && maxSupply > 0 && totalSupply !== undefined && totalSupply < maxSupply) {
+        mintCompleted = false;
+        mintDemandPassed = false;
+        mintDemandReason = `Incomplete Collection: Mint has not reached 100% of total mint supply (${totalSupply}/${maxSupply} minted, ${((totalSupply / maxSupply) * 100).toFixed(1)}%). Core rule: If mint-out is not 100% complete, DO NOT OFFER ❌`;
+      } else if (isMinting) {
+        mintCompleted = false;
+        mintDemandPassed = false;
+        mintDemandReason = `Public mint is currently active (is_minting: true). Collection is not 100% minted out. Core rule: If mint-out is not 100% complete, DO NOT OFFER ❌`;
+      } else if (totalSupply === undefined && maxSupply === undefined && collectionData === undefined) {
+        mintStatusVerified = false;
+        mintCompleted = false;
+        mintDemandPassed = false;
+        mintDemandReason = 'Mint-out status could not be verified from reliable marketplace data. Core rule: If status cannot be verified, DO NOT OFFER ❌';
       }
 
       if (!liquidity.liquidityPassed) {
@@ -224,6 +239,7 @@ export class OpenSeaApiService {
         liquidityReason: liquidity.liquidityReason,
         isMinting,
         mintCompleted,
+        mintStatusVerified,
         totalSupply,
         maxSupply,
         mintDemandPassed,
