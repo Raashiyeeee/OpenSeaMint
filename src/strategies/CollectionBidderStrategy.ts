@@ -257,6 +257,21 @@ export class CollectionBidderStrategy {
         const recentTokens = await this.apiService.getLatestMintedTokens(target.slug, 3);
         for (const tok of recentTokens) {
           try {
+            // Check Same NFT Re-Bidding Restriction & Capital Allocation
+            const nftBidCheck = this.inventoryManager.canPlaceOfferOnNft(
+              target.contractAddress,
+              tok.tokenId,
+              calculation.bidPriceUsd,
+              marketData.ethPriceUsd
+            );
+            if (!nftBidCheck.allowed) {
+              logger.info(
+                { tokenId: tok.tokenId, slug: target.slug, reason: nftBidCheck.reason },
+                `NFT OFFER SKIPPED: ${nftBidCheck.reason}`
+              );
+              continue;
+            }
+
             const { orderComponents: itemComponents, signature: itemSig } = await this.seaportService.createSignedItemOffer(
               target.contractAddress,
               tok.tokenId,
@@ -271,7 +286,21 @@ export class CollectionBidderStrategy {
               protocol_address: this.config.seaport.contractAddress
             };
             const singleRes = await this.apiService.postSingleOffer(targetNetwork, singlePayload);
-            logger.info({ tokenId: tok.tokenId, orderHash: singleRes?.order_hash }, `Placed single token offer on recent mint #${tok.tokenId}`);
+            logger.info({ tokenId: tok.tokenId, orderHash: singleRes?.order_hash }, `Placed single token offer on #${tok.tokenId}`);
+
+            // Track individual NFT offer and lock capital independently
+            this.inventoryManager.registerActiveOffer({
+              orderHash: singleRes?.order_hash || `sim_single_${tok.tokenId}_${Date.now()}`,
+              collectionSlug: target.slug,
+              contractAddress: target.contractAddress,
+              tokenId: tok.tokenId,
+              network: targetNetwork,
+              priceEth: calculation.bidPriceEth,
+              priceUsd: calculation.bidPriceUsd,
+              createdTimestamp: Date.now(),
+              expiresTimestamp: Date.now() + this.config.general.offerExpirationMinutes * 60 * 1000,
+              status: 'ACTIVE'
+            });
           } catch (singleErr: any) {
             logger.debug({ tokenId: tok.tokenId, err: singleErr.message }, 'Single offer info');
           }
@@ -296,4 +325,94 @@ export class CollectionBidderStrategy {
 
     this.circuitBreaker.registerSuccess();
   }
+
+  /**
+   * Places an offer on an individual NFT item while enforcing the Same NFT Re-Bidding Restriction,
+   * 60% capital allocation limit, and independent NFT tracking.
+   */
+  public async placeItemBid(params: {
+    contractAddress: string;
+    tokenId: string;
+    collectionSlug: string;
+    network?: string;
+    targetNetProfitUsd?: number;
+    maxBidEth?: number;
+  }): Promise<{ success: boolean; reason?: string }> {
+    const targetNetwork = params.network || 'robinhood';
+
+    // 1. Same NFT Re-Bidding Restriction & Capital Allocation Check
+    const availableCapitalUsd = this.inventoryManager.getAvailableCapitalUsd();
+    const nftCheck = this.inventoryManager.canPlaceOfferOnNft(params.contractAddress, params.tokenId);
+    if (!nftCheck.allowed) {
+      logger.info({ contractAddress: params.contractAddress, tokenId: params.tokenId, reason: nftCheck.reason }, 'Item bid rejected');
+      return { success: false, reason: nftCheck.reason };
+    }
+
+    // 2. Market Data & Pricing Calculation
+    const marketData = await this.apiService.getCollectionMarketData(params.collectionSlug, params.contractAddress);
+    const calculation = this.pricingEngine.calculateMaxBid(
+      marketData,
+      params.targetNetProfitUsd ?? this.config.capital?.minNetProfitUsd ?? 0.20,
+      availableCapitalUsd,
+      targetNetwork
+    );
+
+    if (!calculation.isProfitable) {
+      return { success: false, reason: `Profitability criteria failed: ${calculation.reason}` };
+    }
+
+    if (params.maxBidEth && calculation.bidPriceEth > params.maxBidEth) {
+      calculation.bidPriceEth = params.maxBidEth;
+      calculation.bidPriceUsd = roundToPrecision(calculation.bidPriceEth * (marketData.ethPriceUsd || 2700), 2);
+    }
+
+    // 3. Comply with configured 60% capital allocation limit
+    const capitalCheck = this.inventoryManager.canAllocateCapitalForOffer(calculation.bidPriceUsd, marketData.ethPriceUsd);
+    if (!capitalCheck.allowed) {
+      return { success: false, reason: capitalCheck.reason };
+    }
+
+    // 4. Pre-flight WETH check
+    const availableWeth = await this.seaportService.getWethBalance(targetNetwork);
+    if (availableWeth < calculation.bidPriceEth) {
+      return { success: false, reason: `Insufficient WETH balance (${availableWeth} available vs ${calculation.bidPriceEth} required)` };
+    }
+
+    // 5. Sign & Post Item Offer
+    const { orderComponents, signature } = await this.seaportService.createSignedItemOffer(
+      params.contractAddress,
+      params.tokenId,
+      calculation.bidPriceEth,
+      this.config.general.offerExpirationMinutes,
+      targetNetwork,
+      marketData.fees
+    );
+
+    const singlePayload = {
+      parameters: orderComponents,
+      signature,
+      protocol_address: this.config.seaport.contractAddress
+    };
+
+    const res = await this.apiService.postSingleOffer(targetNetwork, singlePayload);
+    const orderHash = res?.order_hash || `sim_single_${params.tokenId}_${Date.now()}`;
+
+    // 6. Register Active Offer & Independently Track NFT
+    this.inventoryManager.registerActiveOffer({
+      orderHash,
+      collectionSlug: params.collectionSlug,
+      contractAddress: params.contractAddress,
+      tokenId: params.tokenId,
+      network: targetNetwork,
+      priceEth: calculation.bidPriceEth,
+      priceUsd: calculation.bidPriceUsd,
+      createdTimestamp: Date.now(),
+      expiresTimestamp: Date.now() + this.config.general.offerExpirationMinutes * 60 * 1000,
+      status: 'ACTIVE'
+    });
+
+    logger.info({ contractAddress: params.contractAddress, tokenId: params.tokenId, orderHash }, 'Item offer placed successfully and tracked independently');
+    return { success: true };
+  }
 }
+
