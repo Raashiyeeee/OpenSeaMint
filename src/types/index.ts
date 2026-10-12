@@ -121,6 +121,7 @@ export interface CollectionMarketData {
   // Mint & Market Dump Protection
   isMinting?: boolean;
   mintCompleted?: boolean;
+  mintStatusVerified?: boolean;
   totalSupply?: number;
   maxSupply?: number;
   mintDemandPassed?: boolean;

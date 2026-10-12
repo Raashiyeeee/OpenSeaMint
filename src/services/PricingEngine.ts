@@ -399,8 +399,12 @@ export class PricingEngine {
   }
 
   /**
-   * Condition 1: Incomplete Public Mint — Strict Rejection
-   * Verifies that the public mint has ended or demonstrably completed its intended mint phase.
+   * Condition 1: Incomplete Public Mint — Strict Rejection (100% Mint-Out Rule)
+   * 1. Must verify collection's current mint status using reliable, up-to-date data.
+   * 2. If collection has not reached 100% of total mint supply, REJECT.
+   * 3. Recheck before every offer. If status cannot be verified, DO NOT OFFER.
+   * 4. No exceptions or overrides (volume, floor, profit cannot override).
+   * 5. Core rule: If mint-out is not 100% complete, DO NOT OFFER.
    */
   public verifyMintCompletion(marketData: CollectionMarketData): {
     passed: boolean;
@@ -409,19 +413,41 @@ export class PricingEngine {
     if (marketData.mintCompleted === false) {
       return {
         passed: false,
-        reason: marketData.mintDemandReason || 'Incomplete Public Mint: Public mint has not completed successfully. Strict Rejection ❌'
+        reason: marketData.mintDemandReason || 'Incomplete Collection: Mint has not reached 100% completion. Core rule: If mint-out is not 100% complete, DO NOT OFFER ❌'
       };
     }
 
+    const total = marketData.totalSupply;
+    const max = marketData.maxSupply;
+
+    // Reject if public mint is actively ongoing
     if (marketData.isMinting === true) {
-      const total = marketData.totalSupply || 0;
-      const max = marketData.maxSupply || total;
-      if (max > 0 && total < max * 0.98) {
+      if (max !== undefined && max > 0 && total !== undefined) {
         return {
           passed: false,
-          reason: `Incomplete Public Mint: Public mint is still active and supply remains incomplete (${total}/${max} minted). Collection is still struggling to sell out available supply. Strict Rejection ❌`
+          reason: `Incomplete Public Mint: Public mint is still active and supply has not reached 100% (${total}/${max} minted, ${((total / max) * 100).toFixed(1)}%). Core rule: If mint-out is not 100% complete, DO NOT OFFER ❌`
         };
       }
+      return {
+        passed: false,
+        reason: 'Incomplete Public Mint: Public mint is currently active (is_minting: true). Collection is not fully minted out. Core rule: If mint-out is not 100% complete, DO NOT OFFER ❌'
+      };
+    }
+
+    // Strict 100% supply check: If maxSupply is known, totalSupply MUST be >= maxSupply
+    if (max !== undefined && max > 0 && total !== undefined && total < max) {
+      return {
+        passed: false,
+        reason: `Incomplete Collection: Collection has not reached 100% of its total mint supply (${total}/${max} minted, ${((total / max) * 100).toFixed(1)}%). Core rule: If mint-out is not 100% complete, DO NOT OFFER ❌`
+      };
+    }
+
+    // Unverified mint status rejection (Rule 4: If status cannot be verified, do not place offer)
+    if (marketData.mintStatusVerified === false) {
+      return {
+        passed: false,
+        reason: 'Incomplete Public Mint: Mint-out status cannot be verified from reliable marketplace data. Core rule: If status cannot be verified, DO NOT OFFER ❌'
+      };
     }
 
     if (marketData.liquidityPassed === false) {
@@ -433,7 +459,7 @@ export class PricingEngine {
 
     return {
       passed: true,
-      reason: 'Mint completion and secondary-market demand verified ✅'
+      reason: '100% Mint-out verified and secondary-market demand confirmed ✅'
     };
   }
 

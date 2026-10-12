@@ -801,6 +801,49 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   assert.strictEqual(calcActiveUnsold.decision, 'REJECT', 'Must REJECT offer when mint supply remains incomplete');
   console.log('Case 16b PASSED: Active mint struggling to sell supply triggers strict rejection ✅');
 
+  // Case 16b2: 99% Minted Collection (4950/5000) -> Must REJECT under strict 100% Mint-Out Rule
+  const almostMintedData: CollectionMarketData = {
+    ...incompleteMintMarketData,
+    slug: 'almost-minted-nft',
+    mintCompleted: undefined,
+    isMinting: false,
+    totalSupply: 4950,
+    maxSupply: 5000
+  };
+  const verifyAlmostMinted = pricingEngine.verifyMintCompletion(almostMintedData);
+  assert.strictEqual(verifyAlmostMinted.passed, false, 'Must REJECT collection even at 99% supply (strict 100% rule)');
+  assert(verifyAlmostMinted.reason.includes('100%'), 'Reason must specify 100% mint supply requirement');
+  const calcAlmostMinted = pricingEngine.calculateMaxBid(almostMintedData, 0.20, 10.0, 'robinhood');
+  assert.strictEqual(calcAlmostMinted.decision, 'REJECT', 'Must REJECT 99% minted collection');
+  console.log('Case 16b2 PASSED: 99% minted collection strictly rejected (100% Mint-Out Rule) ✅');
+
+  // Case 16b3: Unverified Mint Status -> Must REJECT (Rule 4: If status cannot be verified, do not offer)
+  const unverifiedMintData: CollectionMarketData = {
+    ...incompleteMintMarketData,
+    slug: 'unverified-mint-nft',
+    mintCompleted: undefined,
+    mintStatusVerified: false,
+    totalSupply: undefined,
+    maxSupply: undefined
+  };
+  const verifyUnverified = pricingEngine.verifyMintCompletion(unverifiedMintData);
+  assert.strictEqual(verifyUnverified.passed, false, 'Must REJECT offer when mint status cannot be verified');
+  const calcUnverified = pricingEngine.calculateMaxBid(unverifiedMintData, 0.20, 10.0, 'robinhood');
+  assert.strictEqual(calcUnverified.decision, 'REJECT', 'Must REJECT offer when mint status cannot be verified');
+  console.log('Case 16b3 PASSED: Unverified mint status triggers strict rejection ✅');
+
+  // Case 16b4: No Exceptions or Overrides (Rule 5: Volume, floor price, or potential profit CANNOT override)
+  const highProfitIncompleteMint = pricingEngine.evaluateOfferScenario({
+    offerPriceUsd: 1.00,
+    floorPriceUsd: 10.00, // Massive 10x spread
+    mintCompleted: false, // Incomplete mint!
+    royaltyPercent: 0,
+    minNetProfitUsd: 0.20
+  });
+  assert.strictEqual(highProfitIncompleteMint.checkMintCompletedPassed, false, 'Mint check must fail despite massive potential profit');
+  assert.strictEqual(highProfitIncompleteMint.decision, 'REJECT', 'High profit cannot override incomplete mint rule');
+  console.log('Case 16b4 PASSED: No exceptions - potential profit cannot override 100% mint rule ✅');
+
   // Case 16c: Mint-demand failed / unreliable secondary market liquidity -> REJECT
   const poorLiquidityMintData: CollectionMarketData = {
     ...incompleteMintMarketData,
@@ -814,18 +857,22 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   assert.strictEqual(calcPoorLiquidity.decision, 'REJECT', 'Must REJECT offer when secondary market demand fails');
   console.log('Case 16c PASSED: Incomplete secondary-market demand triggers strict rejection ✅');
 
-  // Case 16d: Valid mint completion & healthy secondary demand -> Passed
+  // Case 16d: Valid 100% mint completion (5000/5000) & healthy secondary demand -> Passed
   const validMintData: CollectionMarketData = {
     ...incompleteMintMarketData,
     slug: 'completed-mint-nft',
     mintCompleted: true,
+    mintStatusVerified: true,
+    totalSupply: 5000,
+    maxSupply: 5000,
+    isMinting: false,
     liquidityPassed: true,
     sales3Hours: 12,
     uniqueWallets3Hours: 8
   };
   const mintVerification = pricingEngine.verifyMintCompletion(validMintData);
-  assert.strictEqual(mintVerification.passed, true, 'Mint completion check must pass when mint ended and liquidity is verified');
-  console.log('Case 16d PASSED: Verified mint completion and secondary-market demand passed ✅');
+  assert.strictEqual(mintVerification.passed, true, 'Mint completion check must pass when 100% minted and liquidity is verified');
+  console.log('Case 16d PASSED: Verified 100% mint completion and secondary-market demand passed ✅');
 
   // Case 16e: Market Dump Protection - 30% floor decline ($1.00 -> $0.70)
   // Reference Floor: $1.00, Current Floor: $0.70 -> 30% decline -> ELIGIBLE
