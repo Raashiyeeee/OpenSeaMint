@@ -610,11 +610,143 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   assert.strictEqual(rejectedScenario.checkFFloorRatioPassed, false, 'checkFFloorRatioPassed must be false');
   console.log('Case 14g PASSED: evaluateOfferScenario with enforceFloorRatio rejects sub-40% trades -> MANDATORY REJECTION ✅\n');
 
+  // --------------------------------------------------------------------------
+  // TEST 15: NFT Re-Bidding & Simultaneous Offers Rule Verification
+  // 1. Same NFT Re-Bidding Restriction & No Re-Bidding Before Sale
+  // 2. Simultaneous Offers on Different NFTs within 40% Capital Limit
+  // 3. Independent NFT Tracking (Token ID, Collection, Ownership, Listing, Sale Confirmation)
+  // 4. Re-bidding allowed on same NFT only after confirmed sale and criteria pass again
+  // --------------------------------------------------------------------------
+  console.log('--- Test 15: NFT Re-Bidding & Simultaneous Offers Rule ---');
+  const rebiddingManager = new InventoryManager(config);
+  const testContract = '0x1111222233334444555566667777888899990000';
+  const testTokenId = '101';
+  const testIdentifier = `${testContract.toLowerCase()}:${testTokenId}`;
+
+  // Step 1: Initial state - NFT is not owned and has no offers -> Bidding allowed
+  const initialCheck = rebiddingManager.canPlaceOfferOnNft(testContract, testTokenId, 1.50);
+  assert.strictEqual(initialCheck.allowed, true, 'Initial offer placement must be allowed on unowned NFT');
+  console.log('Case 15a PASSED: Fresh NFT can receive offer within capital limit ✅');
+
+  // Step 2: Bot acquires the NFT (simulated offer accepted)
+  rebiddingManager.addInventoryItem({
+    identifier: testIdentifier,
+    collectionSlug: 'alpha-collection',
+    contractAddress: testContract,
+    tokenId: testTokenId,
+    acquiredPriceEth: 0.0005,
+    acquiredPriceUsd: 1.35,
+    acquiredAtTimestamp: Date.now(),
+    status: 'PENDING_LISTING'
+  });
+
+  // Verify Independent NFT Tracking immediately after acquisition
+  const trackedAfterAcquisition = rebiddingManager.getTrackedNft(testContract, testTokenId);
+  assert(trackedAfterAcquisition !== undefined, 'Acquired NFT must be tracked independently');
+  assert.strictEqual(trackedAfterAcquisition.tokenId, testTokenId, 'Token ID must be tracked');
+  assert.strictEqual(trackedAfterAcquisition.ownershipStatus, 'OWNED', 'Ownership status must be OWNED');
+  assert.strictEqual(trackedAfterAcquisition.listingStatus, 'PENDING_LISTING', 'Listing status must be PENDING_LISTING');
+  assert.strictEqual(trackedAfterAcquisition.saleConfirmation, undefined, 'Sale confirmation must be undefined before sale');
+  console.log('Case 15b PASSED: Independent NFT Tracking initialized upon acquisition ✅');
+
+  // Step 3: Same NFT Re-Bidding Restriction - Bot MUST NOT place another offer on same NFT while owned
+  const rebiddingBlockedPending = rebiddingManager.canPlaceOfferOnNft(testContract, testTokenId, 1.50);
+  assert.strictEqual(rebiddingBlockedPending.allowed, false, 'Re-bidding must be strictly blocked while NFT is PENDING_LISTING');
+  assert(rebiddingBlockedPending.reason?.includes('Same NFT Re-Bidding Restriction'), 'Reason must specify Same NFT Re-Bidding Restriction');
+  console.log('Case 15c PASSED: Re-bidding on same NFT strictly blocked while PENDING_LISTING ✅');
+
+  // Step 4: NFT is listed on OpenSea - trade is still unresolved -> Re-bidding MUST STILL BE BLOCKED
+  rebiddingManager.updateListingStatus(testIdentifier, 0.001, 'order_123', 2.70);
+  const trackedAfterListing = rebiddingManager.getTrackedNft(testContract, testTokenId);
+  assert.strictEqual(trackedAfterListing?.listingStatus, 'LISTED', 'Listing status must update to LISTED');
+  assert.strictEqual(trackedAfterListing?.ownershipStatus, 'OWNED', 'Ownership status must remain OWNED');
+
+  const rebiddingBlockedListed = rebiddingManager.canPlaceOfferOnNft(testContract, testTokenId, 1.50);
+  assert.strictEqual(rebiddingBlockedListed.allowed, false, 'Re-bidding must be strictly blocked while NFT is LISTED');
+  console.log('Case 15d PASSED: Re-bidding on same NFT strictly blocked while LISTED ✅');
+
+  // Step 5: Floor dump occurs, NFT marked HOLDING - trade is still unresolved -> Re-bidding MUST STILL BE BLOCKED
+  rebiddingManager.updateHoldStatus(testIdentifier, 'Floor dump protection active');
+  const trackedAfterHold = rebiddingManager.getTrackedNft(testContract, testTokenId);
+  assert.strictEqual(trackedAfterHold?.listingStatus, 'HOLDING', 'Listing status must update to HOLDING');
+
+  const rebiddingBlockedHolding = rebiddingManager.canPlaceOfferOnNft(testContract, testTokenId, 1.50);
+  assert.strictEqual(rebiddingBlockedHolding.allowed, false, 'Re-bidding must be strictly blocked while NFT is HOLDING');
+  console.log('Case 15e PASSED: Re-bidding on same NFT strictly blocked while HOLDING ✅');
+
+  // Step 6: Simultaneous Offers on DIFFERENT NFTs while earlier NFT is awaiting resale
+  // Total capital: $10.00. 60% active offer allocation limit: $6.00.
+  // Place offer on different NFT #1 (testContract:102) for $2.50
+  const diffNft1Check = rebiddingManager.canPlaceOfferOnNft(testContract, '102', 2.50);
+  assert.strictEqual(diffNft1Check.allowed, true, 'Offer on different NFT #102 must be allowed while earlier NFT awaits resale');
+  rebiddingManager.registerActiveOffer({
+    orderHash: 'offer_diff_1',
+    collectionSlug: 'alpha-collection',
+    contractAddress: testContract,
+    tokenId: '102',
+    priceEth: 0.000925,
+    priceUsd: 2.50,
+    createdTimestamp: Date.now(),
+    expiresTimestamp: Date.now() + 3600000,
+    status: 'ACTIVE'
+  });
+
+  // Place offer on different NFT #2 (diffContract:200) for $2.50 (Total offers = $2.50 + $2.50 = $5.00 <= $6.00)
+  const diffContract = '0x9999888877776666555544443333222211110000';
+  const diffNft2Check = rebiddingManager.canPlaceOfferOnNft(diffContract, '200', 2.50);
+  assert.strictEqual(diffNft2Check.allowed, true, 'Simultaneous offer on NFT #200 across different collection must be allowed');
+  rebiddingManager.registerActiveOffer({
+    orderHash: 'offer_diff_2',
+    collectionSlug: 'beta-collection',
+    contractAddress: diffContract,
+    tokenId: '200',
+    priceEth: 0.000925,
+    priceUsd: 2.50,
+    createdTimestamp: Date.now(),
+    expiresTimestamp: Date.now() + 3600000,
+    status: 'ACTIVE'
+  });
+  console.log('Case 15f PASSED: Simultaneous offers on multiple different NFTs running concurrently while earlier NFT awaits resale ✅');
+
+  // Verify 60% capital allocation limit blocks third offer exceeding $6.00
+  // Current active offers: $5.00. New offer: $2.00 -> $7.00 > $6.00 limit -> Must be blocked!
+  const thirdOfferExceeded = rebiddingManager.canPlaceOfferOnNft(diffContract, '201', 2.00);
+  assert.strictEqual(thirdOfferExceeded.allowed, false, 'Third simultaneous offer exceeding 60% capital limit ($7.00 > $6.00) must be blocked');
+  console.log('Case 15g PASSED: 60% capital allocation limit enforced across simultaneous offers ✅');
+
+  // Verify independent tracking of multiple NFTs simultaneously
+  const tracked102 = rebiddingManager.getTrackedNft(testContract, '102');
+  const tracked200 = rebiddingManager.getTrackedNft(diffContract, '200');
+  assert(tracked102?.activeOffers.length === 1, 'NFT #102 must track its own active offer');
+  assert(tracked200?.activeOffers.length === 1, 'NFT #200 must track its own active offer');
+  console.log('Case 15h PASSED: Independent active offer tracking on distinct NFT tokens ✅');
+
+  // Step 7: Earlier NFT is SOLD and SALE IS CONFIRMED
+  const soldResult = rebiddingManager.markItemSold(testIdentifier, 0.0012, 2700, 100, 0.01, '0xtxhash123');
+  assert.strictEqual(soldResult.saleConfirmation.confirmed, true, 'Sale confirmation must be true');
+
+  const trackedAfterSale = rebiddingManager.getTrackedNft(testContract, testTokenId);
+  assert.strictEqual(trackedAfterSale?.ownershipStatus, 'SOLD', 'Ownership status must be SOLD');
+  assert.strictEqual(trackedAfterSale?.listingStatus, 'SOLD', 'Listing status must be SOLD');
+  assert.strictEqual(trackedAfterSale?.saleConfirmation?.confirmed, true, 'Sale confirmation must be recorded');
+  assert(rebiddingManager.isNftSaleConfirmed(testContract, testTokenId), 'isNftSaleConfirmed must return true');
+  console.log('Case 15i PASSED: Confirmed sale recorded with full audit details and trade resolved ✅');
+
+  // Step 8: After confirmed sale, re-bidding on same NFT is now ALLOWED (once all criteria pass again)
+  // Let active offers expire or cancel to free up capital
+  rebiddingManager.cancelActiveOffer('alpha-collection');
+  rebiddingManager.cancelActiveOffer('beta-collection');
+
+  const rebiddingAllowedPostSale = rebiddingManager.canPlaceOfferOnNft(testContract, testTokenId, 1.50);
+  assert.strictEqual(rebiddingAllowedPostSale.allowed, true, 'Re-bidding on same NFT must now be allowed after confirmed sale');
+  console.log('Case 15j PASSED: Re-bidding on same NFT allowed after confirmed sale ✅\n');
+
   console.log('================================================================');
-  console.log('All 14 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory & NFT Eligibility tests passed successfully!');
+  console.log('All 15 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory, NFT Eligibility & Re-Bidding tests passed successfully!');
   console.log('================================================================');
 })().catch((err) => {
-  console.error('Test 14 Failed:', err);
+  console.error('Test 14/15 Failed:', err);
   process.exit(1);
 });
+
 

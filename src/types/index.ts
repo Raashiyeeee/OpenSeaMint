@@ -150,8 +150,41 @@ export interface ProfitCalculationResult {
   reason?: string;
 }
 
+export type NftOwnershipStatus = 'OWNED' | 'UNRESOLVED' | 'SOLD' | 'NONE';
+export type NftListingStatus = 'UNLISTED' | 'PENDING_LISTING' | 'LISTED' | 'HOLDING' | 'SOLD';
+
+export interface NftSaleConfirmation {
+  confirmed: boolean;
+  soldAtTimestamp: number;
+  salePriceEth?: number;
+  salePriceUsd?: number;
+  realizedProfitUsd?: number;
+  transactionHash?: string;
+  orderId?: string;
+}
+
+export interface TrackedNft {
+  identifier: string; // contract:tokenId
+  tokenId: string;
+  collectionSlug: string;
+  contractAddress: string;
+  network?: string;
+  name?: string;
+  ownershipStatus: NftOwnershipStatus;
+  listingStatus: NftListingStatus;
+  activeOffers: ActiveOffer[];
+  saleConfirmation?: NftSaleConfirmation;
+  acquiredPriceEth?: number;
+  acquiredPriceUsd?: number;
+  acquiredAtTimestamp?: number;
+  currentListingPriceEth?: number;
+  currentListingPriceUsd?: number;
+  listingOrderId?: string;
+  holdReason?: string;
+}
+
 export interface InventoryItem {
-  identifier: string; // collection:tokenId
+  identifier: string; // contract:tokenId
   collectionSlug: string;
   contractAddress: string;
   network?: string;
@@ -164,6 +197,9 @@ export interface InventoryItem {
   currentListingPriceUsd?: number;
   listingOrderId?: string;
   status: 'PENDING_LISTING' | 'LISTED' | 'HOLDING' | 'SOLD' | 'ERROR';
+  ownershipStatus?: NftOwnershipStatus;
+  listingStatus?: NftListingStatus;
+  saleConfirmation?: NftSaleConfirmation;
   holdReason?: string;
   salePriceEth?: number;
   salePriceUsd?: number;
@@ -176,6 +212,7 @@ export interface ActiveOffer {
   orderHash: string;
   collectionSlug: string;
   contractAddress: string;
+  tokenId?: string;
   network?: string;
   priceEth: number;
   priceUsd: number;

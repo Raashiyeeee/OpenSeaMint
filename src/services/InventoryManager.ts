@@ -1,4 +1,4 @@
-import { BotConfig, InventoryItem, ActiveOffer } from '../types';
+import { BotConfig, InventoryItem, ActiveOffer, TrackedNft, NftSaleConfirmation } from '../types';
 import { roundToPrecision } from '../utils/math';
 import { logger } from '../utils/logger';
 
@@ -6,6 +6,7 @@ export class InventoryManager {
   private config: BotConfig;
   private inventory: Map<string, InventoryItem> = new Map();
   private activeOffers: Map<string, ActiveOffer> = new Map();
+  private trackedNfts: Map<string, TrackedNft> = new Map();
   private totalCapitalUsd: number;
   private cumulativeProfitUsd: number = 0;
 
@@ -18,9 +19,13 @@ export class InventoryManager {
     return roundToPrecision(this.totalCapitalUsd + this.cumulativeProfitUsd, 2);
   }
 
+  private getNftKey(contractAddress: string, tokenId: string): string {
+    return `${contractAddress.toLowerCase()}:${tokenId}`;
+  }
+
   /**
    * Returns capital currently allocated/locked in:
-   * 1. Active unexpired collection offers
+   * 1. Active unexpired collection or item offers
    * 2. Held NFT inventory (pending listing or currently listed)
    */
   public getAllocatedCapitalUsd(ethPriceUsd: number = 2700): number {
@@ -50,9 +55,6 @@ export class InventoryManager {
   /**
    * Returns unallocated capital available for new trades.
    */
-  /**
-   * Returns unallocated capital available for new trades.
-   */
   public getAvailableCapitalUsd(ethPriceUsd: number = 2700): number {
     const total = this.getTotalCapitalUsd();
     const allocated = this.getAllocatedCapitalUsd(ethPriceUsd);
@@ -75,8 +77,7 @@ export class InventoryManager {
 
   /**
    * Evaluates if capital can be allocated for an offer under the active-offer capital rule:
-   * Use up to 60% of total capital for simultaneous offers across every qualifying NFT.
-   * The number of NFTs is unlimited by count; it is limited only by the active-offer capital allocation.
+   * Comply with the configured 60% capital allocation limit for simultaneous active offers.
    */
   public canAllocateCapitalForOffer(
     requiredCapitalUsd: number,
@@ -183,17 +184,163 @@ export class InventoryManager {
     return this.inventory.get(identifier);
   }
 
-  public addInventoryItem(item: InventoryItem): void {
-    // When an item is acquired from an offer, mark matching offer as FULFILLED
-    const offer = this.activeOffers.get(item.collectionSlug);
-    if (offer && offer.status === 'ACTIVE') {
-      offer.status = 'FULFILLED';
+  /**
+   * Independent NFT Tracking: Get tracked NFT details
+   */
+  public getTrackedNft(contractAddress: string, tokenId: string): TrackedNft | undefined {
+    return this.trackedNfts.get(this.getNftKey(contractAddress, tokenId));
+  }
+
+  public getTrackedNftByIdentifier(identifier: string): TrackedNft | undefined {
+    return this.trackedNfts.get(identifier.toLowerCase());
+  }
+
+  public getAllTrackedNfts(): TrackedNft[] {
+    return Array.from(this.trackedNfts.values());
+  }
+
+  /**
+   * Checks whether the bot currently owns or holds an unresolved trade position on an NFT.
+   */
+  public isNftOwnedOrUnresolved(contractAddress: string, tokenId: string): boolean {
+    const key = this.getNftKey(contractAddress, tokenId);
+    const item = this.inventory.get(key);
+    if (item && item.status !== 'SOLD') {
+      return true;
+    }
+    const tracked = this.trackedNfts.get(key);
+    if (tracked) {
+      if (tracked.ownershipStatus === 'OWNED' || tracked.ownershipStatus === 'UNRESOLVED') {
+        return true;
+      }
+      if (tracked.listingStatus === 'PENDING_LISTING' || tracked.listingStatus === 'LISTED' || tracked.listingStatus === 'HOLDING') {
+        return true;
+      }
+      if (!tracked.saleConfirmation?.confirmed && tracked.ownershipStatus !== 'NONE' && tracked.ownershipStatus !== 'SOLD') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Checks whether a confirmed sale has been recorded for this NFT.
+   */
+  public isNftSaleConfirmed(contractAddress: string, tokenId: string): boolean {
+    const key = this.getNftKey(contractAddress, tokenId);
+    const tracked = this.trackedNfts.get(key);
+    return tracked?.saleConfirmation?.confirmed === true;
+  }
+
+  /**
+   * Core Rule 1 & 2: Same NFT Re-Bidding Restriction & No Re-Bidding Before Sale
+   * 1. Once an offer is accepted and the bot acquires an NFT, the bot must not place
+   *    another offer on that same NFT while it is owned or while the previous trade remains unresolved.
+   * 2. The bot must never place another offer on the same NFT before the previously acquired NFT
+   *    has been sold and the sale has been confirmed.
+   * 3. After that NFT is successfully sold and confirmed, re-bidding is allowed only if all
+   *    eligibility, native ETH floor-sale, pricing, and profitability criteria are satisfied again.
+   */
+  public canPlaceOfferOnNft(
+    contractAddress: string,
+    tokenId: string,
+    offerPriceUsd?: number,
+    ethPriceUsd: number = 2700
+  ): { allowed: boolean; reason?: string } {
+    const key = this.getNftKey(contractAddress, tokenId);
+
+    // 1. Same NFT Re-Bidding Restriction & No Re-Bidding Before Sale
+    if (this.isNftOwnedOrUnresolved(contractAddress, tokenId)) {
+      const tracked = this.trackedNfts.get(key);
+      const inv = this.inventory.get(key);
+      const ownership = tracked?.ownershipStatus || inv?.ownershipStatus || 'OWNED';
+      const listing = tracked?.listingStatus || inv?.listingStatus || inv?.status || 'PENDING_LISTING';
+      return {
+        allowed: false,
+        reason: `Same NFT Re-Bidding Restriction: NFT ${key} is currently owned / previous trade remains unresolved (ownership: ${ownership}, listing: ${listing}). Cannot place another offer before sale confirmation.`
+      };
     }
 
+    // 2. Active Offer Check on this exact NFT
+    if (this.hasActiveOfferOnNft(contractAddress, tokenId)) {
+      return {
+        allowed: false,
+        reason: `Active offer already in place for NFT ${key}. Cannot place duplicate offer before resolution.`
+      };
+    }
+
+    // 3. Comply with configured 60% capital allocation limit
+    if (offerPriceUsd !== undefined && offerPriceUsd > 0) {
+      const capitalCheck = this.canAllocateCapitalForOffer(offerPriceUsd, ethPriceUsd);
+      if (!capitalCheck.allowed) {
+        return capitalCheck;
+      }
+    }
+
+    return { allowed: true };
+  }
+
+  /**
+   * Adds newly acquired NFT to inventory and records independent NFT tracking.
+   */
+  public addInventoryItem(item: InventoryItem): void {
+    const key = item.identifier.toLowerCase();
+
+    // Mark matching active offer as FULFILLED
+    const offerBySlug = this.activeOffers.get(item.collectionSlug);
+    if (offerBySlug && offerBySlug.status === 'ACTIVE') {
+      offerBySlug.status = 'FULFILLED';
+    }
+
+    // Also fulfill active offer matching this token
+    for (const off of this.activeOffers.values()) {
+      if (
+        off.status === 'ACTIVE' &&
+        off.contractAddress.toLowerCase() === item.contractAddress.toLowerCase() &&
+        (!off.tokenId || off.tokenId === item.tokenId)
+      ) {
+        off.status = 'FULFILLED';
+      }
+    }
+
+    item.ownershipStatus = 'OWNED';
+    item.listingStatus = 'PENDING_LISTING';
+    item.saleConfirmation = undefined;
     this.inventory.set(item.identifier, item);
+
+    // Independent NFT tracking record
+    let tracked = this.trackedNfts.get(key);
+    if (!tracked) {
+      tracked = {
+        identifier: key,
+        tokenId: item.tokenId,
+        collectionSlug: item.collectionSlug,
+        contractAddress: item.contractAddress,
+        network: item.network,
+        name: item.name,
+        ownershipStatus: 'OWNED',
+        listingStatus: 'PENDING_LISTING',
+        activeOffers: [],
+        acquiredPriceEth: item.acquiredPriceEth,
+        acquiredPriceUsd: item.acquiredPriceUsd,
+        acquiredAtTimestamp: item.acquiredAtTimestamp
+      };
+      this.trackedNfts.set(key, tracked);
+    } else {
+      tracked.ownershipStatus = 'OWNED';
+      tracked.listingStatus = 'PENDING_LISTING';
+      tracked.saleConfirmation = undefined;
+      tracked.acquiredPriceEth = item.acquiredPriceEth;
+      tracked.acquiredPriceUsd = item.acquiredPriceUsd;
+      tracked.acquiredAtTimestamp = item.acquiredAtTimestamp;
+      tracked.activeOffers = tracked.activeOffers.filter((o) => o.status === 'ACTIVE' && o.expiresTimestamp > Date.now());
+    }
+
     logger.info(
       {
         identifier: item.identifier,
+        tokenId: item.tokenId,
+        collection: item.collectionSlug,
         acquiredPriceEth: item.acquiredPriceEth,
         acquiredPriceUsd: item.acquiredPriceUsd
       },
@@ -208,7 +355,16 @@ export class InventoryManager {
       item.currentListingPriceUsd = listPriceUsd;
       item.listingOrderId = orderId;
       item.status = 'LISTED';
+      item.listingStatus = 'LISTED';
       logger.info({ identifier, listPriceEth, listPriceUsd }, 'Item listed on OpenSea');
+    }
+
+    const tracked = this.trackedNfts.get(identifier.toLowerCase());
+    if (tracked) {
+      tracked.listingStatus = 'LISTED';
+      tracked.currentListingPriceEth = listPriceEth;
+      tracked.currentListingPriceUsd = listPriceUsd;
+      tracked.listingOrderId = orderId;
     }
   }
 
@@ -216,28 +372,40 @@ export class InventoryManager {
     const item = this.inventory.get(identifier);
     if (item) {
       item.status = 'HOLDING';
+      item.listingStatus = 'HOLDING';
       item.holdReason = holdReason;
       logger.info({ identifier, holdReason }, 'Item held in inventory due to Floor Dump Protection');
+    }
+
+    const tracked = this.trackedNfts.get(identifier.toLowerCase());
+    if (tracked) {
+      tracked.listingStatus = 'HOLDING';
+      tracked.holdReason = holdReason;
     }
   }
 
   /**
    * Called when an NFT sells on OpenSea.
-   * Releases capital and computes realized profit.
+   * Releases capital, records confirmed sale, and resolves trade.
    */
   public markItemSold(
     identifier: string,
     salePriceEth?: number,
     ethPriceUsd: number = 2700,
     feeBps: number = 100, // Combined OpenSea + royalty bps
-    gasUsd: number = 0.01
-  ): { realizedProfitUsd: number; newTotalCapitalUsd: number } {
+    gasUsd: number = 0.01,
+    txHash?: string
+  ): { realizedProfitUsd: number; newTotalCapitalUsd: number; saleConfirmation: NftSaleConfirmation } {
     const item = this.inventory.get(identifier);
+    const key = identifier.toLowerCase();
     let realizedProfitUsd = 0;
+    let soldEth = salePriceEth ?? item?.currentListingPriceEth ?? item?.acquiredPriceEth ?? 0;
 
     if (item) {
       item.status = 'SOLD';
-      const soldEth = salePriceEth ?? item.currentListingPriceEth ?? item.acquiredPriceEth;
+      item.ownershipStatus = 'SOLD';
+      item.listingStatus = 'SOLD';
+      soldEth = salePriceEth ?? item.currentListingPriceEth ?? item.acquiredPriceEth;
       const acquiredEth = item.acquiredPriceEth;
 
       const feeEth = soldEth * (feeBps / 10000);
@@ -251,22 +419,54 @@ export class InventoryManager {
       item.salePriceUsd = roundToPrecision(soldEth * ethPriceUsd, 2);
 
       this.inventory.delete(identifier);
-
-      logger.info(
-        {
-          identifier,
-          soldEth,
-          acquiredEth,
-          realizedProfitUsd,
-          newTotalCapitalUsd: this.getTotalCapitalUsd()
-        },
-        'NFT Sold! Capital released and profit added to trading balance.'
-      );
     }
+
+    const soldUsd = roundToPrecision(soldEth * ethPriceUsd, 2);
+    const saleConfirmation: NftSaleConfirmation = {
+      confirmed: true,
+      soldAtTimestamp: Date.now(),
+      salePriceEth: soldEth,
+      salePriceUsd: soldUsd,
+      realizedProfitUsd,
+      transactionHash: txHash
+    };
+
+    let tracked = this.trackedNfts.get(key);
+    if (tracked) {
+      tracked.ownershipStatus = 'SOLD';
+      tracked.listingStatus = 'SOLD';
+      tracked.saleConfirmation = saleConfirmation;
+      tracked.activeOffers = [];
+    } else {
+      const parts = identifier.split(':');
+      tracked = {
+        identifier: key,
+        contractAddress: parts[0] || '',
+        tokenId: parts[1] || '',
+        collectionSlug: item?.collectionSlug || '',
+        ownershipStatus: 'SOLD',
+        listingStatus: 'SOLD',
+        activeOffers: [],
+        saleConfirmation
+      };
+      this.trackedNfts.set(key, tracked);
+    }
+
+    logger.info(
+      {
+        identifier,
+        soldEth,
+        realizedProfitUsd,
+        saleConfirmed: true,
+        newTotalCapitalUsd: this.getTotalCapitalUsd()
+      },
+      'NFT Sold & Sale Confirmed! Capital released, trade resolved, and profit added to balance.'
+    );
 
     return {
       realizedProfitUsd,
-      newTotalCapitalUsd: this.getTotalCapitalUsd()
+      newTotalCapitalUsd: this.getTotalCapitalUsd(),
+      saleConfirmation
     };
   }
 
@@ -298,10 +498,37 @@ export class InventoryManager {
   }
 
   public registerActiveOffer(offer: ActiveOffer): void {
-    this.activeOffers.set(offer.collectionSlug, offer);
+    // Unique key: orderHash or collectionSlug fallback
+    const key = offer.orderHash || offer.collectionSlug;
+    this.activeOffers.set(key, offer);
+
+    // If offer is on a specific token, track independently under trackedNfts
+    if (offer.tokenId && offer.contractAddress) {
+      const nftKey = this.getNftKey(offer.contractAddress, offer.tokenId);
+      let tracked = this.trackedNfts.get(nftKey);
+      if (!tracked) {
+        tracked = {
+          identifier: nftKey,
+          tokenId: offer.tokenId,
+          collectionSlug: offer.collectionSlug,
+          contractAddress: offer.contractAddress,
+          network: offer.network,
+          ownershipStatus: 'NONE',
+          listingStatus: 'UNLISTED',
+          activeOffers: []
+        };
+        this.trackedNfts.set(nftKey, tracked);
+      }
+      if (!tracked.activeOffers.some((o) => o.orderHash === offer.orderHash)) {
+        tracked.activeOffers.push(offer);
+      }
+    }
+
     logger.info(
       {
+        orderHash: offer.orderHash,
         collection: offer.collectionSlug,
+        tokenId: offer.tokenId,
         priceEth: offer.priceEth,
         priceUsd: offer.priceUsd,
         expiresInMinutes: this.config.general.offerExpirationMinutes
@@ -310,18 +537,66 @@ export class InventoryManager {
     );
   }
 
-  public getActiveOffer(collectionSlug: string): ActiveOffer | undefined {
+  public getActiveOffer(key: string): ActiveOffer | undefined {
     this.cleanupExpiredOffers();
-    return this.activeOffers.get(collectionSlug);
+    // 1. Lookup by orderHash
+    if (this.activeOffers.has(key)) {
+      return this.activeOffers.get(key);
+    }
+    // 2. Lookup by collectionSlug
+    for (const offer of this.activeOffers.values()) {
+      if (offer.status === 'ACTIVE' && offer.collectionSlug.toLowerCase() === key.toLowerCase()) {
+        return offer;
+      }
+    }
+    // 3. Lookup by NFT identifier (contract:tokenId)
+    for (const offer of this.activeOffers.values()) {
+      if (
+        offer.status === 'ACTIVE' &&
+        offer.tokenId &&
+        `${offer.contractAddress.toLowerCase()}:${offer.tokenId}` === key.toLowerCase()
+      ) {
+        return offer;
+      }
+    }
+    return undefined;
+  }
+
+  public hasActiveOfferOnNft(contractAddress: string, tokenId: string): boolean {
+    this.cleanupExpiredOffers();
+    const key = this.getNftKey(contractAddress, tokenId);
+    const tracked = this.trackedNfts.get(key);
+    if (tracked && tracked.activeOffers.some((o) => o.status === 'ACTIVE' && o.expiresTimestamp > Date.now())) {
+      return true;
+    }
+    for (const offer of this.activeOffers.values()) {
+      if (
+        offer.status === 'ACTIVE' &&
+        offer.expiresTimestamp > Date.now() &&
+        offer.tokenId === tokenId &&
+        offer.contractAddress.toLowerCase() === contractAddress.toLowerCase()
+      ) {
+        return true;
+      }
+    }
+    return false;
   }
 
   public cleanupExpiredOffers(): void {
     const now = Date.now();
-    for (const [slug, offer] of this.activeOffers.entries()) {
+    for (const [key, offer] of this.activeOffers.entries()) {
       if (offer.status === 'ACTIVE' && offer.expiresTimestamp <= now) {
         offer.status = 'EXPIRED';
-        this.activeOffers.delete(slug);
-        logger.info({ collectionSlug: slug }, 'Offer expired. Capital released back to pool.');
+        this.activeOffers.delete(key);
+        logger.info({ orderHash: offer.orderHash, collectionSlug: offer.collectionSlug, tokenId: offer.tokenId }, 'Offer expired. Capital released back to pool.');
+
+        if (offer.tokenId && offer.contractAddress) {
+          const nftKey = this.getNftKey(offer.contractAddress, offer.tokenId);
+          const tracked = this.trackedNfts.get(nftKey);
+          if (tracked) {
+            tracked.activeOffers = tracked.activeOffers.filter((o) => o.orderHash !== offer.orderHash);
+          }
+        }
       }
     }
   }
@@ -331,11 +606,13 @@ export class InventoryManager {
   }
 
   public cancelActiveOffer(collectionSlug: string): void {
-    const offer = this.activeOffers.get(collectionSlug);
-    if (offer) {
-      offer.status = 'CANCELLED';
-      this.activeOffers.delete(collectionSlug);
-      logger.info({ collectionSlug }, 'Offer cancelled. Capital released.');
+    for (const [key, offer] of this.activeOffers.entries()) {
+      if (offer.collectionSlug.toLowerCase() === collectionSlug.toLowerCase()) {
+        offer.status = 'CANCELLED';
+        this.activeOffers.delete(key);
+        logger.info({ collectionSlug, orderHash: offer.orderHash }, 'Offer cancelled. Capital released.');
+      }
     }
   }
 }
+
