@@ -561,5 +561,129 @@ export class SeaportService {
       return false;
     }
   }
+
+  /**
+   * Query on-chain native ETH balance of trading signer on the target network
+   */
+  public async getNativeBalance(networkKey?: string): Promise<number> {
+    const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
+    const networkInfo = this.config.networks?.[activeNetworkKey];
+    if (!networkInfo) return 0;
+    try {
+      const provider = this.signer.provider || new ethers.JsonRpcProvider(networkInfo.rpcUrl);
+      const bal = await provider.getBalance(this.signer.address);
+      return parseFloat(ethers.formatEther(bal));
+    } catch (err: any) {
+      logger.debug({ network: activeNetworkKey, err: err.message }, 'Could not query native ETH balance');
+      return 0;
+    }
+  }
+
+  /**
+   * Automatic Post-Sale ETH to WETH Swap Rule:
+   * Once an NFT is sold at the floor price, the ETH received must be automatically swapped
+   * back into WETH immediately via the canonical WETH deposit() function.
+   *
+   * @param amountEth Optional specific amount of ETH to wrap. If omitted, wraps all available native ETH above the gas reserve.
+   * @param networkKey Target network (defaults to configured network or 'robinhood')
+   */
+  public async swapEthToWeth(
+    amountEth?: number,
+    networkKey?: string
+  ): Promise<{ success: boolean; txHash?: string; amountWrappedEth: number; error?: string }> {
+    const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
+    const networkInfo = this.config.networks?.[activeNetworkKey];
+    const wethAddress = networkInfo?.wethAddress || this.wethAddress;
+
+    logger.info(
+      { network: activeNetworkKey, targetAmountEth: amountEth, wethAddress },
+      'AUTOMATIC WETH SWAP: Initiating immediate swap of received ETH into WETH...'
+    );
+
+    try {
+      // Simulation mode guard
+      if (process.env.BOT_MODE === 'SIMULATION') {
+        const wrapAmount = amountEth && amountEth > 0 ? amountEth : 0.002;
+        const simTxHash = `0xsim_weth_deposit_${Date.now()}`;
+        logger.info(
+          { network: activeNetworkKey, amountWrappedEth: wrapAmount, txHash: simTxHash },
+          `[SIMULATION] ✅ Swapped ${wrapAmount} ETH to WETH successfully`
+        );
+        return { success: true, txHash: simTxHash, amountWrappedEth: wrapAmount };
+      }
+
+      const provider = this.signer.provider || new ethers.JsonRpcProvider(networkInfo?.rpcUrl);
+      const connectedSigner = this.signer.provider ? this.signer : (this.signer as any).connect(provider);
+
+      // 1. Fetch current on-chain native ETH balance
+      const nativeBalWei = await provider.getBalance(this.signer.address);
+      const nativeBalEth = parseFloat(ethers.formatEther(nativeBalWei));
+
+      // 2. Determine reserve to keep for network gas
+      const minReserveEth = this.config.general.minBalanceReserveEth ?? 0.0001;
+      const maxWrappableEth = Math.max(0, nativeBalEth - minReserveEth);
+
+      if (maxWrappableEth <= 0.000005) {
+        logger.warn(
+          { nativeBalEth, minReserveEth, maxWrappableEth },
+          'AUTOMATIC WETH SWAP: Native ETH balance is at or below gas reserve threshold. No ETH available to wrap.'
+        );
+        return { success: true, amountWrappedEth: 0 };
+      }
+
+      // If specific amount requested, wrap min(requested, maxWrappable); otherwise wrap all wrappable ETH
+      const amountToWrap = amountEth && amountEth > 0
+        ? Math.min(amountEth, maxWrappableEth)
+        : maxWrappableEth;
+
+      if (amountToWrap <= 0.000005) {
+        logger.debug({ amountToWrap }, 'AUTOMATIC WETH SWAP: Amount to wrap is negligible, skipping transaction.');
+        return { success: true, amountWrappedEth: 0 };
+      }
+
+      logger.info(
+        {
+          network: activeNetworkKey,
+          amountToWrapEth: amountToWrap,
+          nativeBalanceBefore: nativeBalEth,
+          reserveRetained: minReserveEth
+        },
+        `AUTOMATIC WETH SWAP: Executing deposit() to wrap ${amountToWrap} ETH -> WETH...`
+      );
+
+      // 3. Execute WETH deposit({ value }) on-chain
+      const wethContract = new ethers.Contract(
+        wethAddress,
+        [
+          'function deposit() public payable',
+          'function balanceOf(address) view returns (uint256)'
+        ],
+        connectedSigner
+      );
+
+      const valueWei = ethers.parseEther(amountToWrap.toFixed(18));
+      const tx = await wethContract.deposit({ value: valueWei });
+      logger.info({ txHash: tx.hash }, 'WETH deposit transaction broadcasted. Waiting for confirmation...');
+      const receipt = await tx.wait(1);
+
+      logger.info(
+        {
+          network: activeNetworkKey,
+          amountWrappedEth: amountToWrap,
+          txHash: receipt.hash,
+          wethAddress
+        },
+        `✅ AUTOMATIC WETH SWAP COMPLETE: Successfully swapped ${amountToWrap} ETH to WETH immediately!`
+      );
+
+      return { success: true, txHash: receipt.hash, amountWrappedEth: amountToWrap };
+    } catch (err: any) {
+      logger.error(
+        { network: activeNetworkKey, error: err.message, wethAddress },
+        '❌ AUTOMATIC WETH SWAP FAILED: Could not swap received ETH to WETH'
+      );
+      return { success: false, error: err.message, amountWrappedEth: 0 };
+    }
+  }
 }
 

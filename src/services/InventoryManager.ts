@@ -1,4 +1,4 @@
-import { BotConfig, InventoryItem, ActiveOffer, TrackedNft, NftSaleConfirmation } from '../types';
+import { BotConfig, InventoryItem, ActiveOffer, TrackedNft, NftSaleConfirmation, MarkItemSoldResult } from '../types';
 import { roundToPrecision } from '../utils/math';
 import { logger } from '../utils/logger';
 
@@ -145,12 +145,12 @@ export class InventoryManager {
   /**
    * Reconciles in-memory inventory against on-chain wallet items.
    * If an NFT held in inventory is no longer present in wallet, it was sold or transferred.
-   * Automatically clears it and releases the committed capital.
+   * Automatically clears it, releases committed capital, and returns details for automatic ETH->WETH swapping.
    */
   public reconcileWalletInventory(
     ownedNfts: Array<{ contract?: string; identifier?: string }>,
     ethPriceUsd: number = 2700
-  ): string[] {
+  ): Array<{ identifier: string; network?: string; netProceedsEth: number; soldEth: number }> {
     const ownedSet = new Set(
       ownedNfts
         .filter((n) => n.contract && n.identifier)
@@ -158,7 +158,7 @@ export class InventoryManager {
     );
 
     const itemsToCheck = Array.from(this.inventory.values());
-    const removedIdentifiers: string[] = [];
+    const removedSoldItems: Array<{ identifier: string; network?: string; netProceedsEth: number; soldEth: number }> = [];
 
     for (const item of itemsToCheck) {
       if (item.status !== 'SOLD' && !ownedSet.has(item.identifier.toLowerCase())) {
@@ -166,11 +166,16 @@ export class InventoryManager {
           { identifier: item.identifier, collectionSlug: item.collectionSlug, status: item.status },
           'Wallet reconciliation: NFT is no longer in wallet (sold or transferred). Clearing from inventory and releasing capital.'
         );
-        this.markItemSold(item.identifier, undefined, ethPriceUsd);
-        removedIdentifiers.push(item.identifier);
+        const res = this.markItemSold(item.identifier, undefined, ethPriceUsd);
+        removedSoldItems.push({
+          identifier: item.identifier,
+          network: item.network,
+          netProceedsEth: res.netProceedsEth,
+          soldEth: res.saleConfirmation.salePriceEth || 0
+        });
       }
     }
-    return removedIdentifiers;
+    return removedSoldItems;
   }
 
   public getActiveTradesCount(): number {
@@ -411,11 +416,15 @@ export class InventoryManager {
     feeBps: number = 100, // Combined OpenSea + royalty bps
     gasUsd: number = 0.01,
     txHash?: string
-  ): { realizedProfitUsd: number; newTotalCapitalUsd: number; saleConfirmation: NftSaleConfirmation } {
+  ): MarkItemSoldResult {
     const item = this.inventory.get(identifier);
+    const soldItem = item ? { ...item } : undefined;
     const key = identifier.toLowerCase();
     let realizedProfitUsd = 0;
     let soldEth = salePriceEth ?? item?.currentListingPriceEth ?? item?.acquiredPriceEth ?? 0;
+
+    const feeEth = soldEth * (feeBps / 10000);
+    const netProceedsEth = roundToPrecision(Math.max(0, soldEth - feeEth), 6);
 
     if (item) {
       item.status = 'SOLD';
@@ -424,7 +433,6 @@ export class InventoryManager {
       soldEth = salePriceEth ?? item.currentListingPriceEth ?? item.acquiredPriceEth;
       const acquiredEth = item.acquiredPriceEth;
 
-      const feeEth = soldEth * (feeBps / 10000);
       const gasEth = gasUsd / ethPriceUsd;
       const profitEth = soldEth - feeEth - acquiredEth - gasEth;
       realizedProfitUsd = roundToPrecision(profitEth * ethPriceUsd, 2);
@@ -472,6 +480,7 @@ export class InventoryManager {
       {
         identifier,
         soldEth,
+        netProceedsEth,
         realizedProfitUsd,
         saleConfirmed: true,
         newTotalCapitalUsd: this.getTotalCapitalUsd()
@@ -482,7 +491,9 @@ export class InventoryManager {
     return {
       realizedProfitUsd,
       newTotalCapitalUsd: this.getTotalCapitalUsd(),
-      saleConfirmation
+      saleConfirmation,
+      soldItem,
+      netProceedsEth
     };
   }
 
