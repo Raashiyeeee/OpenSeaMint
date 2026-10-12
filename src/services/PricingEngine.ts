@@ -53,7 +53,7 @@ export class PricingEngine {
       availableCapitalUsd = this.config.capital?.totalTradingCapitalUsd ?? 10.0,
       minNetProfitUsd = this.config.capital?.minNetProfitUsd ?? 2.0,
       liquidityDiscountPercent = 0.0,
-      minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40,
+      minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30,
       enforceFloorRatio = false
     } = params;
 
@@ -81,7 +81,7 @@ export class PricingEngine {
     // Check B: Profitability check
     const checkBProfitPassed = expectedNetProfitUsd >= minNetProfitUsd && expectedNetProfitUsd > 0;
 
-    // Check F: Minimum Floor Difference (Rule 3 & 4: Floor Price >= Offer Price * 1.40, excluding creator fees from this comparison)
+    // Check F: Minimum Floor Difference (Formula: Floor Price >= Offer Price * 1.30, excluding creator fees from this comparison)
     const checkFFloorRatioPassed = offerPriceUsd > 0 && floorPriceUsd >= (offerPriceUsd * minFloorMultiplier - 0.000001);
 
     // Condition 1: Incomplete Public Mint Protection
@@ -107,7 +107,7 @@ export class PricingEngine {
     } else if (!checkBProfitPassed) {
       reason = `Check B Failed: Expected net profit ($${expectedNetProfitUsd.toFixed(2)}) is below minimum threshold ($${minNetProfitUsd.toFixed(2)})`;
     } else if (enforceFloorRatio && !checkFFloorRatioPassed) {
-      reason = `Floor Ratio Check Failed: Current floor ($${floorPriceUsd.toFixed(2)}) is not at least ${((minFloorMultiplier - 1) * 100).toFixed(0)}% above offer ($${offerPriceUsd.toFixed(2)}). Formula Floor Price >= Offer Price * 1.40 required (creator fees excluded).`;
+      reason = `Floor Ratio Check Failed: Current floor ($${floorPriceUsd.toFixed(2)}) is not at least ${((minFloorMultiplier - 1) * 100).toFixed(0)}% above offer ($${offerPriceUsd.toFixed(2)}). Formula Floor Price >= Offer Price * ${minFloorMultiplier.toFixed(2)} required (creator fees excluded).`;
     }
 
     return {
@@ -157,20 +157,20 @@ export class PricingEngine {
       offerPriceEth,
       sales3HoursNativeEth,
       minSales3Hours = this.config.liquidity?.minSales3Hours ?? 10,
-      minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40
+      minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30
     } = params;
 
     const nativeEthFloorSalesPassed = sales3HoursNativeEth >= minSales3Hours;
-    // Rule 3 & 4: Floor difference calculation compares raw Floor Price to Offer Price directly without creator fees
+    // Floor difference calculation compares raw Floor Price to Offer Price directly without creator fees
     const floorDifferencePassed = offerPriceEth > 0 && floorPriceEth >= (offerPriceEth * minFloorMultiplier - 0.000001);
 
     const eligible = nativeEthFloorSalesPassed && floorDifferencePassed;
-    let reason = 'All NFT offer eligibility rules passed (10+ native ETH floor sales in 3h & Floor >= Offer * 1.40 without creator fees)';
+    let reason = `All NFT offer eligibility rules passed (10+ native ETH floor sales in 3h & Floor >= Offer * ${minFloorMultiplier.toFixed(2)} without creator fees)`;
 
     if (!nativeEthFloorSalesPassed) {
       reason = `Mandatory Rejection ❌: Only ${sales3HoursNativeEth}/${minSales3Hours} completed native ETH floor sales in last 3 hours (WETH and offer acceptances excluded).`;
     } else if (!floorDifferencePassed) {
-      reason = `Mandatory Rejection ❌: Floor price (${floorPriceEth} ETH) is not at least 40% higher than offer price (${offerPriceEth} ETH). Formula Floor Price >= Offer Price * ${minFloorMultiplier.toFixed(2)} required (creator fees excluded).`;
+      reason = `Mandatory Rejection ❌: Floor price (${floorPriceEth} ETH) is not at least ${((minFloorMultiplier - 1) * 100).toFixed(0)}% higher than offer price (${offerPriceEth} ETH). Formula Floor Price >= Offer Price * ${minFloorMultiplier.toFixed(2)} required (creator fees excluded).`;
     }
 
     return {
@@ -246,8 +246,8 @@ export class PricingEngine {
     const minMarginPercent = targetConfig?.minMarginPercent ?? this.config.profitTargets.defaultMinMarginPercent ?? 15.0;
     const maxMarginBidEth = netProceedsAfterGasEth / (1 + (minMarginPercent / 100));
     
-    // Floor ratio ceiling (Rule 3 & 4: Floor Price >= Offer Price * 1.40, excluding creator fees from this comparison)
-    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40;
+    // Floor ratio ceiling (Floor Price >= Offer Price * 1.30, excluding creator fees from this comparison)
+    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30;
     const maxOfferFloorRuleEth = floor / minFloorMultiplier;
 
     // Larry's strategy: floor price multiple (e.g. 0.85 = 15% discount)
@@ -349,7 +349,7 @@ export class PricingEngine {
     } else if (!checkLLiquidityPassed) {
       reason = marketData.liquidityReason || `Liquidity Check Failed: ${sales3Hours}/${minSales} qualified floor sales in last 3h, ${uniqueWallets3Hours}/${minWallets} unique wallets (offer sales excluded).`;
     } else if (!checkFFloorRatioPassed) {
-      reason = `Floor Ratio Check Failed: Current floor ($${floorUsd.toFixed(2)}) is not at least ${((minFloorMultiplier - 1) * 100).toFixed(0)}% above offer ($${bidPriceUsd.toFixed(2)}). Formula Floor Price >= Offer Price * 1.40 required (creator fees excluded).`;
+      reason = `Floor Ratio Check Failed: Current floor ($${floorUsd.toFixed(2)}) is not at least ${((minFloorMultiplier - 1) * 100).toFixed(0)}% above offer ($${bidPriceUsd.toFixed(2)}). Formula Floor Price >= Offer Price * ${minFloorMultiplier.toFixed(2)} required (creator fees excluded).`;
     } else if (bidPriceUsd > maxBuyPriceUsd) {
       reason = `Check A Failed: Required bid ($${bidPriceUsd.toFixed(2)}) exceeds maximum buy price limit ($${maxBuyPriceUsd.toFixed(2)})`;
     } else if (!checkACapitalPassed) {
