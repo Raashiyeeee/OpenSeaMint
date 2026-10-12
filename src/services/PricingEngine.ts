@@ -23,6 +23,7 @@ export class PricingEngine {
     networkGasUsd?: number;
     availableCapitalUsd?: number;
     minNetProfitUsd?: number;
+    minOfferPriceUsd?: number;
     liquidityDiscountPercent?: number; // e.g. 0% for exact floor, or 1% undercut
     minFloorMultiplier?: number;
     enforceFloorRatio?: boolean;
@@ -33,6 +34,7 @@ export class PricingEngine {
     gasUsd: number;
     expectedNetProfitUsd: number;
     checkACapitalPassed: boolean;
+    checkMinOfferPassed: boolean;
     checkBProfitPassed: boolean;
     checkFFloorRatioPassed: boolean;
     checkMintCompletedPassed: boolean;
@@ -52,8 +54,9 @@ export class PricingEngine {
       networkGasUsd = 0.0,
       availableCapitalUsd = this.config.capital?.totalTradingCapitalUsd ?? 10.0,
       minNetProfitUsd = this.config.capital?.minNetProfitUsd ?? 2.0,
+      minOfferPriceUsd = this.config.capital?.minOfferPriceUsd ?? 1.00,
       liquidityDiscountPercent = 0.0,
-      minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30,
+      minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40,
       enforceFloorRatio = false
     } = params;
 
@@ -78,10 +81,13 @@ export class PricingEngine {
     // Check A: Capital check
     const checkACapitalPassed = offerPriceUsd <= availableCapitalUsd && offerPriceUsd > 0;
 
+    // Check A2: Minimum Offer Price Rule ($1.00 minimum offer per NFT)
+    const checkMinOfferPassed = offerPriceUsd >= minOfferPriceUsd;
+
     // Check B: Profitability check
     const checkBProfitPassed = expectedNetProfitUsd >= minNetProfitUsd && expectedNetProfitUsd > 0;
 
-    // Check F: Minimum Floor Difference (Formula: Floor Price >= Offer Price * 1.30, excluding creator fees from this comparison)
+    // Check F: Minimum Floor Difference (Formula: Floor Price >= Offer Price * 1.40, excluding creator fees from this comparison)
     const checkFFloorRatioPassed = offerPriceUsd > 0 && floorPriceUsd >= (offerPriceUsd * minFloorMultiplier - 0.000001);
 
     // Condition 1: Incomplete Public Mint Protection
@@ -92,11 +98,13 @@ export class PricingEngine {
     const floorDeclinePercent = refFloorUsd > 0 ? roundToPrecision(((refFloorUsd - floorPriceUsd) / refFloorUsd) * 100, 2) : 0;
     const checkMarketDumpPassed = floorDeclinePercent < 40.0;
 
-    const isProfitable = checkACapitalPassed && checkBProfitPassed && (enforceFloorRatio ? checkFFloorRatioPassed : true) && checkMintCompletedPassed && checkMarketDumpPassed;
+    const isProfitable = checkACapitalPassed && checkMinOfferPassed && checkBProfitPassed && (enforceFloorRatio ? checkFFloorRatioPassed : true) && checkMintCompletedPassed && checkMarketDumpPassed;
     const decision: 'ACCEPT' | 'REJECT' = isProfitable ? 'ACCEPT' : 'REJECT';
 
     let reason = 'All criteria passed';
-    if (!checkMintCompletedPassed) {
+    if (!checkMinOfferPassed) {
+      reason = `Minimum Offer Price Failed: Proposed offer ($${offerPriceUsd.toFixed(2)}) is below the required minimum offer price of $${minOfferPriceUsd.toFixed(2)}. Offers below $1.00 are strictly prohibited ❌`;
+    } else if (!checkMintCompletedPassed) {
       reason = 'Incomplete Public Mint: Public mint has not completed successfully or collection lacks sufficient mint demand. Strict Rejection ❌';
     } else if (!checkMarketDumpPassed) {
       reason = `Market Dump Protection: Floor declined by ${floorDeclinePercent.toFixed(1)}% >= 40% threshold (Reference: $${refFloorUsd.toFixed(2)}, Current: $${floorPriceUsd.toFixed(2)}). Strict Rejection ❌`;
@@ -117,6 +125,7 @@ export class PricingEngine {
       gasUsd: roundToPrecision(gasUsd, 2),
       expectedNetProfitUsd: roundToPrecision(expectedNetProfitUsd, 2),
       checkACapitalPassed,
+      checkMinOfferPassed,
       checkBProfitPassed,
       checkFFloorRatioPassed,
       checkMintCompletedPassed,
@@ -157,7 +166,7 @@ export class PricingEngine {
       offerPriceEth,
       sales3HoursNativeEth,
       minSales3Hours = this.config.liquidity?.minSales3Hours ?? 10,
-      minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30
+      minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40
     } = params;
 
     const nativeEthFloorSalesPassed = sales3HoursNativeEth >= minSales3Hours;
@@ -246,8 +255,8 @@ export class PricingEngine {
     const minMarginPercent = targetConfig?.minMarginPercent ?? this.config.profitTargets.defaultMinMarginPercent ?? 15.0;
     const maxMarginBidEth = netProceedsAfterGasEth / (1 + (minMarginPercent / 100));
     
-    // Floor ratio ceiling (Floor Price >= Offer Price * 1.30, excluding creator fees from this comparison)
-    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30;
+    // Floor ratio ceiling (Floor Price >= Offer Price * 1.40, excluding creator fees from this comparison)
+    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40;
     const maxOfferFloorRuleEth = floor / minFloorMultiplier;
 
     // Larry's strategy: floor price multiple (e.g. 0.85 = 15% discount)
@@ -326,6 +335,12 @@ export class PricingEngine {
     // Rule 3 & 4: Floor difference calculation compares raw Floor Price to Offer Price directly without creator fees
     const checkFFloorRatioPassed = finalBidEth > 0 && floor >= (finalBidEth * minFloorMultiplier - 0.000001);
     const checkACapitalPassed = finalBidEth <= maxCapitalEth && finalBidEth > 0 && bidPriceUsd <= maxBuyPriceUsd;
+
+    // Minimum Offer Price Rule ($1.00 minimum offer per NFT)
+    const minOfferPriceUsd = this.config.capital?.minOfferPriceUsd ?? 1.00;
+    const minOfferPriceEth = minOfferPriceUsd / ethPriceUsd;
+    const checkMinOfferPassed = bidPriceUsd >= minOfferPriceUsd && finalBidEth >= (minOfferPriceEth - 0.000001);
+
     const checkBProfitPassed = netProfitUsd > 0 && marginPercent >= (minMarginPercent - 0.5) && competitivePassed;
 
     // Condition 1: Incomplete Public Mint Protection
@@ -338,11 +353,13 @@ export class PricingEngine {
     const checkMarketDumpPassed = floorDeclinePercent < 40.0;
 
     // Rule 5: Mandatory Rejection if any condition fails
-    const isProfitable = checkLLiquidityPassed && checkFFloorRatioPassed && checkACapitalPassed && checkBProfitPassed && checkMintCompletedPassed && checkMarketDumpPassed;
+    const isProfitable = checkLLiquidityPassed && checkFFloorRatioPassed && checkACapitalPassed && checkMinOfferPassed && checkBProfitPassed && checkMintCompletedPassed && checkMarketDumpPassed;
     const decision: 'ACCEPT' | 'REJECT' = isProfitable ? 'ACCEPT' : 'REJECT';
 
     let reason = 'All criteria passed: Liquidity, Floor Ratio, Capital, and Profitability verified';
-    if (!checkMintCompletedPassed) {
+    if (!checkMinOfferPassed) {
+      reason = `Minimum Offer Price Failed: Required bid ($${bidPriceUsd.toFixed(2)}) is below the minimum offer price of $${minOfferPriceUsd.toFixed(2)}. Offers below $1.00 are strictly prohibited ❌`;
+    } else if (!checkMintCompletedPassed) {
       reason = mintCheck.reason;
     } else if (!checkMarketDumpPassed) {
       reason = `Market Dump Protection: Floor declined by ${floorDeclinePercent.toFixed(1)}% (Reference: ${refFloorEth} ETH, Current: ${floor} ETH), reaching or exceeding 40% decline limit. Strict Rejection ❌`;

@@ -26,6 +26,7 @@ const CapitalSchema = z.object({
   totalTradingCapitalUsd: z.number().positive().default(10.0),
   maxActiveTrades: z.number().int().positive().default(999),
   minNetProfitUsd: z.number().nonnegative().default(0.20),
+  minOfferPriceUsd: z.number().positive().default(1.00),
   maxBuyPriceUsd: z.number().positive().default(5.0),
   maxOfferCapitalPercent: z.number().positive().max(100).default(60.0)
 });
@@ -33,7 +34,7 @@ const CapitalSchema = z.object({
 const LiquiditySchema = z.object({
   minSales3Hours: z.number().int().nonnegative().default(10),
   minUniqueWallets3Hours: z.number().int().nonnegative().default(5),
-  minFloorMultiplier: z.number().positive().default(1.30),
+  minFloorMultiplier: z.number().positive().default(1.40),
   floorRangeMinPercent: z.number().nonnegative().default(80.0),
   floorRangeMaxPercent: z.number().nonnegative().default(135.0),
   minSales24Hours: z.number().int().nonnegative().optional(),
@@ -66,7 +67,7 @@ const BotConfigSchema = z.object({
     ignoredCollections: z.array(z.string()).optional()
   }),
   capital: CapitalSchema,
-  liquidity: LiquiditySchema.default({ minSales3Hours: 10, minUniqueWallets3Hours: 5, minFloorMultiplier: 1.30 }),
+  liquidity: LiquiditySchema.default({ minSales3Hours: 10, minUniqueWallets3Hours: 5, minFloorMultiplier: 1.40 }),
   networks: z.record(NetworkInfoSchema),
   fees: z.object({
     openseaFeeBps: z.number().nonnegative(),

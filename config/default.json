@@ -12,6 +12,7 @@
   "capital": {
     "totalTradingCapitalUsd": 10.0,
     "maxActiveTrades": 999,
+    "minOfferPriceUsd": 1.0,
     "maxBuyPriceUsd": 5.0,
     "minNetProfitUsd": 0.20,
     "maxOfferCapitalPercent": 60.0
@@ -19,7 +20,7 @@
   "liquidity": {
     "minSales3Hours": 10,
     "minUniqueWallets3Hours": 5,
-    "minFloorMultiplier": 1.30,
+    "minFloorMultiplier": 1.40,
     "floorRangeMinPercent": 80.0,
     "floorRangeMaxPercent": 135.0
   },

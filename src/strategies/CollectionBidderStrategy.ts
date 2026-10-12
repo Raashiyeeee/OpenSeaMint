@@ -140,7 +140,9 @@ export class CollectionBidderStrategy {
       `Starting bidding cycle: Simultaneous offers enabled across all qualifying NFTs (up to ${offerLimitPercent}% capital allocation).`
     );
 
-    const minFloorUsd = 0.20;
+    const minOfferPriceUsd = this.config.capital?.minOfferPriceUsd ?? 1.00;
+    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40;
+    const minFloorUsd = roundToPrecision(minOfferPriceUsd * minFloorMultiplier, 2); // $1.40 minimum floor
     const maxFloorUsd = 8.00; // Expanded to include high-volume collections like Hex-lings ($4.57) and Project Shiesty ($5.12)
 
     const processedThisCycle = new Set<string>();
@@ -342,7 +344,8 @@ export class CollectionBidderStrategy {
         checkMint_Completion: 'PASSED ✅ (100% Mint-out verified and secondary demand confirmed)',
         checkDump_Protection: `PASSED ✅ (Floor decline ${calculation.floorDeclinePercent ?? 0}% < 40% threshold)`,
         checkL_Liquidity: 'PASSED ✅ (>= 10 genuine native ETH floor sales & >= 5 wallets in 3h, WETH & offers excluded)',
-        checkF_FloorRatio: 'PASSED ✅ (Floor >= Offer * 1.30, >= 30% floor difference excluding creator fees)',
+        checkF_FloorRatio: 'PASSED ✅ (Floor >= Offer * 1.40, >= 40% floor difference excluding creator fees)',
+        checkMinOffer_Price: 'PASSED ✅ (Offer >= $1.00 minimum offer price per NFT)',
         checkA_Capital: 'PASSED ✅ (within active-offer capital allocation)',
         checkB_Profitability: 'PASSED ✅'
       },
@@ -359,12 +362,35 @@ export class CollectionBidderStrategy {
       return;
     }
 
-    // 7.8. FINAL OFFER-EXECUTION STAGE ENFORCEMENT (Rule 6: Core rule - If mint-out is not 100% complete, DO NOT OFFER)
+    // 7.8. FINAL OFFER-EXECUTION STAGE ENFORCEMENT
+    // 1) 100% Mint-Out Rule
     const finalMintCheck = this.pricingEngine.verifyMintCompletion(marketData);
     if (!finalMintCheck.passed) {
       logger.error(
         { slug: target.slug, network: targetNetwork, reason: finalMintCheck.reason },
         `FINAL OFFER-EXECUTION BLOCKED 🛑: Collection has not fully minted out. ${finalMintCheck.reason}`
+      );
+      return;
+    }
+
+    // 2) Minimum Offer Price Rule ($1.00 minimum per NFT)
+    const minOfferPriceUsd = this.config.capital?.minOfferPriceUsd ?? 1.00;
+    if (calculation.bidPriceUsd < minOfferPriceUsd) {
+      logger.error(
+        { slug: target.slug, bidPriceUsd: calculation.bidPriceUsd, minOfferPriceUsd },
+        `FINAL OFFER-EXECUTION BLOCKED 🛑: Proposed offer ($${calculation.bidPriceUsd.toFixed(2)}) is below $1.00 minimum offer price.`
+      );
+      return;
+    }
+
+    // 3) Minimum Floor Price Requirement (Floor >= Offer * 1.40, creator fees excluded)
+    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40;
+    const currentFloorUsd = marketData.floorPriceEth * (marketData.ethPriceUsd || 2700);
+    const requiredMinFloorUsd = calculation.bidPriceUsd * minFloorMultiplier;
+    if (currentFloorUsd < requiredMinFloorUsd - 0.001) {
+      logger.error(
+        { slug: target.slug, currentFloorUsd, requiredMinFloorUsd, bidPriceUsd: calculation.bidPriceUsd },
+        `FINAL OFFER-EXECUTION BLOCKED 🛑: Current floor ($${currentFloorUsd.toFixed(2)}) is not at least 40% higher than offer ($${calculation.bidPriceUsd.toFixed(2)}). Required: >= $${requiredMinFloorUsd.toFixed(2)}`
       );
       return;
     }
@@ -551,7 +577,8 @@ export class CollectionBidderStrategy {
       return { success: false, reason: `Insufficient WETH balance (${availableWeth} available vs ${calculation.bidPriceEth} required)` };
     }
 
-    // 4.9. FINAL OFFER-EXECUTION STAGE ENFORCEMENT (Rule 6: Core rule - If mint-out is not 100% complete, DO NOT OFFER)
+    // 4.9. FINAL OFFER-EXECUTION STAGE ENFORCEMENT
+    // 1) 100% Mint-Out Rule
     const finalItemMintCheck = this.pricingEngine.verifyMintCompletion(marketData);
     if (!finalItemMintCheck.passed) {
       logger.error(
@@ -559,6 +586,28 @@ export class CollectionBidderStrategy {
         `FINAL OFFER-EXECUTION BLOCKED 🛑: Collection has not fully minted out. ${finalItemMintCheck.reason}`
       );
       return { success: false, reason: finalItemMintCheck.reason };
+    }
+
+    // 2) Minimum Offer Price Rule ($1.00 minimum per NFT)
+    const minOfferUsd = this.config.capital?.minOfferPriceUsd ?? 1.00;
+    if (calculation.bidPriceUsd < minOfferUsd) {
+      logger.error(
+        { contractAddress: params.contractAddress, tokenId: params.tokenId, bidPriceUsd: calculation.bidPriceUsd, minOfferUsd },
+        `FINAL OFFER-EXECUTION BLOCKED 🛑: Proposed offer ($${calculation.bidPriceUsd.toFixed(2)}) is below $1.00 minimum offer price.`
+      );
+      return { success: false, reason: `Proposed offer ($${calculation.bidPriceUsd.toFixed(2)}) is below $1.00 minimum offer price.` };
+    }
+
+    // 3) Minimum Floor Price Requirement (Floor >= Offer * 1.40, creator fees excluded)
+    const itemFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40;
+    const itemFloorUsd = marketData.floorPriceEth * (marketData.ethPriceUsd || 2700);
+    const requiredItemFloorUsd = calculation.bidPriceUsd * itemFloorMultiplier;
+    if (itemFloorUsd < requiredItemFloorUsd - 0.001) {
+      logger.error(
+        { contractAddress: params.contractAddress, tokenId: params.tokenId, itemFloorUsd, requiredItemFloorUsd },
+        `FINAL OFFER-EXECUTION BLOCKED 🛑: Floor ($${itemFloorUsd.toFixed(2)}) is not at least 40% higher than offer ($${calculation.bidPriceUsd.toFixed(2)}).`
+      );
+      return { success: false, reason: `Floor ($${itemFloorUsd.toFixed(2)}) is not at least 40% higher than offer ($${calculation.bidPriceUsd.toFixed(2)}).` };
     }
 
     // 5. Sign & Post Item Offer
