@@ -173,6 +173,32 @@ export class OpenSeaApiService {
       // 4. Fetch Liquidity Metrics with floor reference
       const liquidity = await this.getCollectionLiquidity(collectionSlug, floorPriceEth, sales24Hours);
 
+      // 5. Incomplete Public Mint & Mint Demand Metrics
+      const isMinting = collectionData?.is_minting === true;
+      const totalSupply = typeof collectionData?.total_supply === 'number'
+        ? collectionData.total_supply
+        : (typeof collectionData?.stats?.total_supply === 'number' ? collectionData.stats.total_supply : undefined);
+      const maxSupply = typeof collectionData?.max_supply === 'number' ? collectionData.max_supply : undefined;
+
+      let mintCompleted = true;
+      let mintDemandPassed = true;
+      let mintDemandReason: string | undefined;
+
+      if (isMinting) {
+        if (maxSupply && totalSupply !== undefined && totalSupply < maxSupply * 0.98) {
+          mintCompleted = false;
+          mintDemandPassed = false;
+          mintDemandReason = `Public mint is still active and supply remains incomplete (${totalSupply}/${maxSupply}). Collection struggling to sell out.`;
+        }
+      }
+
+      if (!liquidity.liquidityPassed) {
+        mintDemandPassed = false;
+        if (!mintDemandReason) {
+          mintDemandReason = `Collection lacks reliable secondary-market liquidity (${liquidity.liquidityReason || 'low sales/wallets'}).`;
+        }
+      }
+
       return {
         slug: collectionSlug,
         contractAddress,
@@ -194,7 +220,13 @@ export class OpenSeaApiService {
         sales24Hours,
         floorSalesCount: liquidity.sales3Hours,
         liquidityPassed: liquidity.liquidityPassed,
-        liquidityReason: liquidity.liquidityReason
+        liquidityReason: liquidity.liquidityReason,
+        isMinting,
+        mintCompleted,
+        totalSupply,
+        maxSupply,
+        mintDemandPassed,
+        mintDemandReason
       };
     } catch (err: any) {
       logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch OpenSea market data via API, generating conservative market estimate');
@@ -215,7 +247,11 @@ export class OpenSeaApiService {
         sales3Hours: 0,
         uniqueWallets3Hours: 0,
         liquidityPassed: false,
-        liquidityReason: 'Conservative fallback on error'
+        liquidityReason: 'Conservative fallback on error',
+        isMinting: false,
+        mintCompleted: false,
+        mintDemandPassed: false,
+        mintDemandReason: 'Conservative fallback on error'
       };
     }
   }

@@ -2,6 +2,7 @@ import assert from 'assert';
 import { PricingEngine } from '../src/services/PricingEngine';
 import { InventoryManager } from '../src/services/InventoryManager';
 import { OpenSeaApiService } from '../src/services/OpenSeaApiService';
+import { CircuitBreaker } from '../src/security/CircuitBreaker';
 import { loadConfig } from '../src/config/schema';
 import { CollectionMarketData } from '../src/types';
 
@@ -741,11 +742,119 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   assert.strictEqual(rebiddingAllowedPostSale.allowed, true, 'Re-bidding on same NFT must now be allowed after confirmed sale');
   console.log('Case 15j PASSED: Re-bidding on same NFT allowed after confirmed sale ✅\n');
 
+  // --------------------------------------------------------------------------
+  // TEST 16: Failed Mint & Market Dump Protection Rules
+  // Condition 1: Incomplete Public Mint — Strict Rejection
+  // Condition 2: Market Dump Protection (30% eligible, 40% reject, 99% exclude)
+  // --------------------------------------------------------------------------
+  console.log('--- Test 16: Incomplete Public Mint & Market Dump Protection Rules ---');
+  const circuitBreaker = new CircuitBreaker(config);
+
+  // Case 16a: Incomplete public mint flag (mintCompleted: false) -> REJECT
+  const incompleteMintMarketData: CollectionMarketData = {
+    slug: 'incomplete-mint-nft',
+    contractAddress: '0x1234000000000000000000000000000000000001',
+    floorPriceEth: 0.002,
+    topOfferEth: 0.001,
+    numListings: 10,
+    openseaFeeBps: 50,
+    royaltyFeeBps: 100,
+    ethPriceUsd: 2700,
+    timestamp: Date.now(),
+    sales3Hours: 15,
+    uniqueWallets3Hours: 10,
+    liquidityPassed: true,
+    mintCompleted: false,
+    mintDemandReason: 'Incomplete Public Mint: Public mint has not completed successfully. Strict Rejection ❌'
+  };
+  const calcIncompleteMint = pricingEngine.calculateMaxBid(incompleteMintMarketData, 0.20, 10.0, 'robinhood');
+  assert.strictEqual(calcIncompleteMint.checkMintCompletedPassed, false, 'checkMintCompletedPassed must be false when mintCompleted is false');
+  assert.strictEqual(calcIncompleteMint.decision, 'REJECT', 'Must REJECT offer when public mint is incomplete');
+  assert(calcIncompleteMint.reason?.includes('Incomplete Public Mint'), 'Reason must specify Incomplete Public Mint');
+  console.log('Case 16a PASSED: Incomplete public mint flag triggers strict rejection ✅');
+
+  // Case 16b: Active public mint with incomplete supply (isMinting: true, 500/5000 minted) -> REJECT
+  const activeUnsoldMintData: CollectionMarketData = {
+    ...incompleteMintMarketData,
+    slug: 'struggling-mint-nft',
+    mintCompleted: undefined, // Dynamic detection
+    isMinting: true,
+    totalSupply: 500,
+    maxSupply: 5000
+  };
+  const calcActiveUnsold = pricingEngine.calculateMaxBid(activeUnsoldMintData, 0.20, 10.0, 'robinhood');
+  assert.strictEqual(calcActiveUnsold.checkMintCompletedPassed, false, 'checkMintCompletedPassed must be false when supply is struggling to sell out');
+  assert.strictEqual(calcActiveUnsold.decision, 'REJECT', 'Must REJECT offer when mint supply remains incomplete');
+  console.log('Case 16b PASSED: Active mint struggling to sell supply triggers strict rejection ✅');
+
+  // Case 16c: Mint-demand failed / unreliable secondary market liquidity -> REJECT
+  const poorLiquidityMintData: CollectionMarketData = {
+    ...incompleteMintMarketData,
+    slug: 'low-demand-mint-nft',
+    mintCompleted: true,
+    liquidityPassed: false,
+    liquidityReason: 'Low secondary-market liquidity: 2 sales in 3h'
+  };
+  const calcPoorLiquidity = pricingEngine.calculateMaxBid(poorLiquidityMintData, 0.20, 10.0, 'robinhood');
+  assert.strictEqual(calcPoorLiquidity.checkMintCompletedPassed, false, 'checkMintCompletedPassed must fail when secondary market liquidity is unreliable');
+  assert.strictEqual(calcPoorLiquidity.decision, 'REJECT', 'Must REJECT offer when secondary market demand fails');
+  console.log('Case 16c PASSED: Incomplete secondary-market demand triggers strict rejection ✅');
+
+  // Case 16d: Valid mint completion & healthy secondary demand -> Passed
+  const validMintData: CollectionMarketData = {
+    ...incompleteMintMarketData,
+    slug: 'completed-mint-nft',
+    mintCompleted: true,
+    liquidityPassed: true,
+    sales3Hours: 12,
+    uniqueWallets3Hours: 8
+  };
+  const mintVerification = pricingEngine.verifyMintCompletion(validMintData);
+  assert.strictEqual(mintVerification.passed, true, 'Mint completion check must pass when mint ended and liquidity is verified');
+  console.log('Case 16d PASSED: Verified mint completion and secondary-market demand passed ✅');
+
+  // Case 16e: Market Dump Protection - 30% floor decline ($1.00 -> $0.70)
+  // Reference Floor: $1.00, Current Floor: $0.70 -> 30% decline -> ELIGIBLE
+  const dump30Check = circuitBreaker.evaluateMarketDumpProtection('dump-test-slug', 0.00025926, 0.00037037); // $0.70 vs $1.00 @ 2700 ETH
+  assert.strictEqual(dump30Check.allowed, true, '30% floor decline must be allowed for further checks');
+  assert.strictEqual(dump30Check.action, 'ELIGIBLE', '30% floor decline action must be ELIGIBLE');
+  assert(Math.abs(dump30Check.declinePercent - 30.0) < 0.5, 'Decline percent should be ~30%');
+  console.log('Case 16e PASSED: 30% floor decline allows collection for further checks (ELIGIBLE) ✅');
+
+  // Case 16f: Market Dump Protection - 40% floor decline ($1.00 -> $0.60) -> REJECT
+  // Reference Floor: $1.00, Current Floor: $0.60 -> 40% decline -> AUTOMATIC REJECTION
+  const dump40Check = circuitBreaker.evaluateMarketDumpProtection('dump-test-slug', 0.00022222, 0.00037037); // $0.60 vs $1.00 @ 2700 ETH
+  assert.strictEqual(dump40Check.allowed, false, '40% floor decline must NOT be allowed');
+  assert.strictEqual(dump40Check.action, 'REJECT', '40% floor decline action must be REJECT');
+  assert(Math.abs(dump40Check.declinePercent - 40.0) < 0.5, 'Decline percent should be ~40%');
+  console.log('Case 16f PASSED: 40% floor decline automatically rejected (REJECT) ✅');
+
+  // Case 16g: Market Dump Protection - 99% extreme collapse ($1.00 -> $0.01) -> EXCLUDE
+  // Reference Floor: $1.00, Current Floor: $0.01 -> 99% collapse -> PERMANENT EXCLUSION
+  const dump99Check = circuitBreaker.evaluateMarketDumpProtection('collapsed-slug', 0.0000037, 0.00037037); // $0.01 vs $1.00 @ 2700 ETH
+  assert.strictEqual(dump99Check.allowed, false, '99% floor collapse must NOT be allowed');
+  assert.strictEqual(dump99Check.action, 'EXCLUDE', '99% floor collapse action must be EXCLUDE');
+  assert.strictEqual(circuitBreaker.isCollectionPermanentlyExcluded('collapsed-slug'), true, 'Collapsed collection must be added to permanentlyExcludedCollections');
+  console.log('Case 16g PASSED: 99% collapse permanently excludes collection from new offers (EXCLUDE) ✅');
+
+  // Case 16h: Subsequent offer attempts on permanently excluded collection are strictly blocked
+  const subsequentBlocked = circuitBreaker.evaluateMarketDumpProtection('collapsed-slug', 0.00025926); // Even if price attempts recovery
+  assert.strictEqual(subsequentBlocked.allowed, false, 'Subsequent attempts on permanently excluded collection must remain blocked');
+  assert.strictEqual(subsequentBlocked.action, 'EXCLUDE', 'Action must remain EXCLUDE');
+  console.log('Case 16h PASSED: Permanently excluded collection remains blocked on subsequent attempts ✅');
+
+  // Case 16i: User reviews and explicitly re-enables collection -> Exclusion cleared
+  circuitBreaker.reEnableCollection('collapsed-slug');
+  assert.strictEqual(circuitBreaker.isCollectionPermanentlyExcluded('collapsed-slug'), false, 'Collection must no longer be permanently excluded after user re-enables it');
+  const postReEnableCheck = circuitBreaker.evaluateMarketDumpProtection('collapsed-slug', 0.00037037);
+  assert.strictEqual(postReEnableCheck.allowed, true, 'Collection must be allowed after explicit re-enable');
+  console.log('Case 16i PASSED: User review and explicit re-enable clears permanent exclusion ✅\n');
+
   console.log('================================================================');
-  console.log('All 15 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory, NFT Eligibility & Re-Bidding tests passed successfully!');
+  console.log('All 16 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory, NFT Eligibility, Re-Bidding, Mint & Market Dump tests passed successfully!');
   console.log('================================================================');
 })().catch((err) => {
-  console.error('Test 14/15 Failed:', err);
+  console.error('Test Failed:', err);
   process.exit(1);
 });
 

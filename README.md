@@ -63,6 +63,34 @@ Only when **BOTH** pass is an offer placed.
 4. **Independent NFT Tracking**: The bot tracks each NFT separately, including its token ID, collection, active offers, ownership status, listing status, and sale confirmation.
 * **Core Rule**: Never place another offer on the same NFT before its previous position is sold. After confirmed sale, re-bidding is allowed only if all criteria pass again. Offers on different eligible NFTs may run simultaneously within the capital limit.
 
+### Rule 7: Failed Mint & Market Dump Protection Rules
+
+#### Condition 1: Incomplete Public Mint — Strict Rejection
+The bot must never place an offer on an NFT collection whose public mint has not completed successfully.
+* **Pre-Offer Verifications**:
+  * The public mint has ended or the collection has demonstrably completed its intended mint phase.
+  * The project has achieved its intended mint completion status.
+  * The collection is not still struggling to sell its available mint supply.
+  * Actual secondary-market demand exists.
+* **Mandatory Rejection Conditions**:
+  * Public mint is still active and the intended mint supply remains significantly incomplete.
+  * The project has failed to attract sufficient mint demand.
+  * The collection has low or unreliable secondary-market liquidity.
+  * A collection is never considered safe merely because some buyers purchase at floor.
+* **Strict Rule**: If the public mint is incomplete and the collection fails required mint-demand checks, **DO NOT PLACE AN OFFER ❌**.
+
+#### Condition 2: Market Dump Protection
+The bot evaluates the collection's floor-price decline before placing an offer using recent pre-decline market reference price:
+$$\text{Floor Decline \%} = \left(\frac{\text{Reference Floor} - \text{Current Floor}}{\text{Reference Floor}}\right) \times 100$$
+* **$\le 30\%$ Floor Decline**: Eligible for consideration **only** if all existing liquidity, sales volume, wallet diversity, and profitability requirements pass (no automatic approval).
+* **$\ge 40\%$ Floor Decline**: **Automatically reject** the collection and do not place an offer.
+* **Extreme Decline / $\approx 99\%$ Collapse ($\ge 90\%$)**: **Permanently exclude** the collection from new offers unless explicitly reviewed and re-enabled by the user (`reEnableCollection`).
+
+#### Final Mandatory Rule
+* **NEVER BID** on an incompletely minted collection that fails its mint-demand requirements.
+* **NEVER BID** on a collection whose floor has declined by 40% or more from its valid reference price.
+* Only collections that pass both protections and every existing liquidity, native ETH sales, profitability, and capital-allocation requirement may receive an offer.
+
 ---
 
 ## 3. Required Trading Logic Flow
