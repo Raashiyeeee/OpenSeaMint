@@ -17,9 +17,9 @@
     "maxOfferCapitalPercent": 60.0
   },
   "liquidity": {
-    "minSales3Hours": 20,
+    "minSales3Hours": 10,
     "minUniqueWallets3Hours": 5,
-    "minFloorMultiplier": 1.15,
+    "minFloorMultiplier": 1.40,
     "floorRangeMinPercent": 80.0,
     "floorRangeMaxPercent": 135.0
   },

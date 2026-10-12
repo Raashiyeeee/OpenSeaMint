@@ -1,6 +1,7 @@
 import assert from 'assert';
 import { PricingEngine } from '../src/services/PricingEngine';
 import { InventoryManager } from '../src/services/InventoryManager';
+import { OpenSeaApiService } from '../src/services/OpenSeaApiService';
 import { loadConfig } from '../src/config/schema';
 import { CollectionMarketData } from '../src/types';
 
@@ -432,6 +433,188 @@ assert.strictEqual(reconcileInvManager.getInventoryCount(), 0, 'Inventory count 
 assert.strictEqual(reconcileInvManager.canBidOnCollection('slug-a', 5), true, 'Bidding must be allowed once inventory is cleared');
 console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT, frees capital, and clears inventory cap!\n');
 
-console.log('================================================================');
-console.log('All 13 Capital Allocation, Liquidity, Floor Protection, Creator Fee & Inventory tests passed successfully!');
-console.log('================================================================');
+// --------------------------------------------------------------------------
+// TEST 14: NFT Offer Eligibility Rules
+// Rule 1: Native ETH Sales (>= 10 floor sales in last 3h paid in native ETH. WETH must not count)
+// Rule 2: Actual Floor Sales (genuine sales around floor. Offer acceptances and WETH sales must not count)
+// Rule 3: Minimum Floor Difference (Floor Price >= Offer Price * 1.40, floor at least 40% higher)
+// Rule 4: Creator Fee Exclusion (calculate 40% difference without including creator fees in comparison)
+// Rule 5: Mandatory Rejection (if any condition fails, bot must not place an offer)
+// --------------------------------------------------------------------------
+(async () => {
+  console.log('--- Test 14: NFT Offer Eligibility Rules ---');
+  const apiService = new OpenSeaApiService(config);
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  // Case 14a: WETH Sales Exclusion (Rule 1 & Rule 2)
+  // 15 total sales in last 3h: 7 native ETH floor sales + 8 WETH sales
+  // WETH sales must NOT count -> Only 7 valid sales -> REJECT!
+  (apiService as any).client = {
+    get: async () => ({
+      data: {
+        asset_events: [
+          // 7 Native ETH floor sales (0.001 ETH)
+          ...Array.from({ length: 7 }, (_, i) => ({
+            event_timestamp: nowSec - 1800,
+            payment: { symbol: 'ETH', quantity: '1000000000000000', decimals: 18 },
+            buyer: `0xbuyer_${i}`,
+            seller: `0xseller_${i}`
+          })),
+          // 8 WETH sales (must NOT count)
+          ...Array.from({ length: 8 }, (_, i) => ({
+            event_timestamp: nowSec - 1800,
+            payment: { symbol: 'WETH', quantity: '1000000000000000', decimals: 18 },
+            buyer: `0xbuyer_weth_${i}`,
+            seller: `0xseller_weth_${i}`
+          }))
+        ]
+      }
+    })
+  };
+
+  const wethExcludedResult = await apiService.getCollectionLiquidity('test-weth-exclude', 0.001);
+  assert.strictEqual(wethExcludedResult.sales3Hours, 7, 'WETH sales must not count toward 3h sales count');
+  assert.strictEqual(wethExcludedResult.liquidityPassed, false, 'Must reject when native ETH floor sales < 10');
+  assert(wethExcludedResult.liquidityReason?.includes('WETH and offer acceptances excluded'), 'Reason must state WETH/offers excluded');
+  console.log('Case 14a PASSED: WETH sales excluded. Only 7/10 native ETH sales -> REJECTED ✅');
+
+  // Case 14b: Offer Acceptances Exclusion (Rule 2)
+  // 12 sales in last 3h: 8 direct floor buys in ETH + 4 offer acceptances in ETH
+  // Offer acceptances must NOT count -> Only 8 valid sales -> REJECT!
+  (apiService as any).client = {
+    get: async () => ({
+      data: {
+        asset_events: [
+          // 8 Genuine floor buys in ETH
+          ...Array.from({ length: 8 }, (_, i) => ({
+            event_timestamp: nowSec - 1800,
+            payment: { symbol: 'ETH', quantity: '1000000000000000', decimals: 18 },
+            order_type: 'listing',
+            buyer: `0xbuyer_${i}`,
+            seller: `0xseller_${i}`
+          })),
+          // 4 Offer acceptances in ETH (must NOT count)
+          ...Array.from({ length: 4 }, (_, i) => ({
+            event_timestamp: nowSec - 1800,
+            payment: { symbol: 'ETH', quantity: '1000000000000000', decimals: 18 },
+            order_type: 'offer',
+            buyer: `0xbuyer_offer_${i}`,
+            seller: `0xseller_offer_${i}`
+          }))
+        ]
+      }
+    })
+  };
+
+  const offerAcceptanceExcluded = await apiService.getCollectionLiquidity('test-offer-exclude', 0.001);
+  assert.strictEqual(offerAcceptanceExcluded.sales3Hours, 8, 'Offer acceptances must not count toward floor sales');
+  assert.strictEqual(offerAcceptanceExcluded.liquidityPassed, false, 'Must reject when genuine floor sales < 10');
+  console.log('Case 14b PASSED: Offer acceptances excluded. Only 8/10 floor sales -> REJECTED ✅');
+
+  // Case 14c: Genuine Floor Sales Around Current Floor Price (Rule 2)
+  // Floor is 0.001 ETH. 12 native ETH sales:
+  // 10 sales at 0.001 ETH (within 80% - 135% floor range)
+  // 1 sale at 0.0003 ETH (far below floor, offer/dump) -> Excluded
+  // 1 sale at 0.0050 ETH (far above floor, rare outlier) -> Excluded
+  // Result: Exactly 10 genuine floor sales across 10 unique wallets -> PASSES!
+  (apiService as any).client = {
+    get: async () => ({
+      data: {
+        asset_events: [
+          ...Array.from({ length: 10 }, (_, i) => ({
+            event_timestamp: nowSec - 1800,
+            payment: { symbol: 'ETH', quantity: '1000000000000000', decimals: 18 },
+            buyer: `0xbuyer_floor_${i}`,
+            seller: `0xseller_floor_${i}`
+          })),
+          {
+            event_timestamp: nowSec - 1800,
+            payment: { symbol: 'ETH', quantity: '300000000000000', decimals: 18 }, // 0.0003 ETH (too low)
+            buyer: '0xbuyer_low',
+            seller: '0xseller_low'
+          },
+          {
+            event_timestamp: nowSec - 1800,
+            payment: { symbol: 'ETH', quantity: '5000000000000000', decimals: 18 }, // 0.005 ETH (outlier)
+            buyer: '0xbuyer_high',
+            seller: '0xseller_high'
+          }
+        ]
+      }
+    })
+  };
+
+  const floorRangeResult = await apiService.getCollectionLiquidity('test-floor-range', 0.001);
+  assert.strictEqual(floorRangeResult.sales3Hours, 10, 'Only genuine sales within floor range must count');
+  assert.strictEqual(floorRangeResult.liquidityPassed, true, 'At least 10 genuine floor sales passes liquidity check');
+  console.log('Case 14c PASSED: Outlier & below-floor sales excluded. Exactly 10/10 genuine floor sales -> PASSED ✅');
+
+  // Case 14d: Minimum Floor Difference Formula (Rule 3 & Rule 5)
+  // Formula: Floor Price >= Offer Price * 1.40
+  // Floor: 0.0014 ETH, Offer: 0.0010 ETH -> 0.0014 >= 0.0010 * 1.40 -> Exactly 40% -> PASSES
+  const floor40Pass = pricingEngine.evaluateOfferEligibility({
+    floorPriceEth: 0.0014,
+    offerPriceEth: 0.0010,
+    sales3HoursNativeEth: 10
+  });
+  assert.strictEqual(floor40Pass.eligible, true, 'Offer with 40% floor premium must be eligible');
+  assert.strictEqual(floor40Pass.floorDifferencePassed, true, 'Floor difference check must pass');
+  console.log('Case 14d PASSED: Floor 0.0014 ETH >= Offer 0.0010 ETH * 1.40 -> PASSED ✅');
+
+  // Case 14e: Floor Difference Fails (Rule 3 & Rule 5 Mandatory Rejection)
+  // Floor: 0.00139 ETH, Offer: 0.0010 ETH -> 0.00139 < 0.00140 (only 39% higher) -> REJECT!
+  const floor39Fail = pricingEngine.evaluateOfferEligibility({
+    floorPriceEth: 0.00139,
+    offerPriceEth: 0.0010,
+    sales3HoursNativeEth: 10
+  });
+  assert.strictEqual(floor39Fail.eligible, false, 'Offer below 40% floor premium must be rejected');
+  assert.strictEqual(floor39Fail.floorDifferencePassed, false, 'Floor difference check must fail');
+  assert(floor39Fail.reason.includes('Mandatory Rejection'), 'Must state Mandatory Rejection');
+  console.log('Case 14e PASSED: Floor 0.00139 ETH < Offer 0.0010 ETH * 1.40 -> MANDATORY REJECTION ✅');
+
+  // Case 14f: Creator Fee Exclusion from 40% Floor Difference Calculation (Rule 4)
+  // The 40% comparison is strictly between raw Floor Price and Offer Price without subtracting creator fees.
+  // With 10% creator fee (royaltyFeeBps: 1000), Floor = 0.0014 ETH and Offer = 0.0010 ETH:
+  // Floor Price (0.0014) is still >= Offer Price (0.0010) * 1.40 because creator fee is NOT deducted in this ratio check!
+  const marketDataWithRoyalty: CollectionMarketData = {
+    slug: 'creator-fee-excluded-ratio',
+    contractAddress: '0x8888888888888888888888888888888888888888',
+    floorPriceEth: 0.0014, // Raw floor
+    topOfferEth: 0.0005,
+    numListings: 10,
+    openseaFeeBps: 50,
+    royaltyFeeBps: 1000, // 10% creator fee!
+    mandatoryRoyaltyFeeBps: 1000,
+    ethPriceUsd: 2700,
+    timestamp: Date.now(),
+    sales3Hours: 12,
+    uniqueWallets3Hours: 6,
+    liquidityPassed: true
+  };
+  const calcWithRoyalty = pricingEngine.calculateMaxBid(marketDataWithRoyalty, 0.10, 10.0, 'robinhood');
+  // Bid calculated by pricing engine must respect floor / 1.40 ceiling (0.0014 / 1.40 = 0.0010 ETH)
+  assert(calcWithRoyalty.bidPriceEth <= 0.0010, `Calculated bid (${calcWithRoyalty.bidPriceEth}) must not exceed Floor / 1.40 (0.0010)`);
+  assert.strictEqual(calcWithRoyalty.checkFFloorRatioPassed, true, '40% floor ratio comparison must pass excluding creator fees');
+  console.log('Case 14f PASSED: Creator fee excluded in 40% floor difference calculation -> PASSED ✅');
+
+  // Case 14g: Mandatory Rejection in evaluateOfferScenario with enforceFloorRatio (Rule 5)
+  const rejectedScenario = pricingEngine.evaluateOfferScenario({
+    offerPriceUsd: 1.00,
+    floorPriceUsd: 1.30, // Only 30% above offer (< 40%)
+    royaltyPercent: 0,
+    minNetProfitUsd: 0.10,
+    enforceFloorRatio: true
+  });
+  assert.strictEqual(rejectedScenario.decision, 'REJECT', 'Scenario failing 40% floor difference must be REJECTED');
+  assert.strictEqual(rejectedScenario.checkFFloorRatioPassed, false, 'checkFFloorRatioPassed must be false');
+  console.log('Case 14g PASSED: evaluateOfferScenario with enforceFloorRatio rejects sub-40% trades -> MANDATORY REJECTION ✅\n');
+
+  console.log('================================================================');
+  console.log('All 14 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory & NFT Eligibility tests passed successfully!');
+  console.log('================================================================');
+})().catch((err) => {
+  console.error('Test 14 Failed:', err);
+  process.exit(1);
+});
+
