@@ -5,7 +5,7 @@
     "minBalanceReserveEth": 0.0001,
     "maxTotalActiveOfferVolumeEth": 0.004,
     "loopIntervalMs": 15000,
-    "offerExpirationMinutes": 60,
+    "offerExpirationMinutes": 20,
     "listingExpirationDays": 7,
     "ignoredCollections": ["robin-owls-269031093", "robin-owls"]
   },

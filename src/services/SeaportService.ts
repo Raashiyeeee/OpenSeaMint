@@ -502,4 +502,64 @@ export class SeaportService {
 
     logger.debug('Creator fee check passed: Optional creator fees verified disabled, mandatory fees preserved.');
   }
+
+  /**
+   * On-chain Seaport order cancellation fallback
+   */
+  public async cancelOrderOnChain(orderComponents: any, networkKey?: string): Promise<{ success: boolean; txHash?: string; error?: string }> {
+    if (process.env.BOT_MODE === 'SIMULATION' || !orderComponents) {
+      logger.info({ networkKey }, '[SIMULATION] Simulated on-chain Seaport cancelOrder');
+      return { success: true, txHash: `0xsim_cancel_${Date.now()}` };
+    }
+
+    try {
+      const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
+      const networkInfo = this.config.networks?.[activeNetworkKey];
+      const seaportAddress = networkInfo?.seaportAddress || this.config.seaport.contractAddress;
+      const provider = this.signer.provider || new ethers.JsonRpcProvider(networkInfo?.rpcUrl);
+      const connectedSigner = this.signer.provider ? this.signer : (this.signer as any).connect(provider);
+
+      const seaportContract = new ethers.Contract(
+        seaportAddress,
+        ['function cancel(tuple(address offerer, address zone, tuple(uint8 itemType, address token, uint256 identifierOrCriteria, uint256 startAmount, uint256 endAmount)[] offer, tuple(uint8 itemType, address token, uint256 identifierOrCriteria, uint256 startAmount, uint256 endAmount, address recipient)[] consideration, uint8 orderType, uint256 startTime, uint256 endTime, bytes32 zoneHash, uint256 salt, bytes32 conduitKey, uint256 counter)[] orders) external returns (bool)'],
+        connectedSigner
+      );
+
+      const tx = await seaportContract.cancel([orderComponents]);
+      const receipt = await tx.wait(1);
+      logger.info({ txHash: receipt.hash, network: activeNetworkKey }, '✅ On-chain Seaport order cancellation confirmed');
+      return { success: true, txHash: receipt.hash };
+    } catch (err: any) {
+      logger.error({ error: err.message }, 'Failed on-chain Seaport order cancellation');
+      return { success: false, error: err.message };
+    }
+  }
+
+  /**
+   * Queries on-chain Seaport order status
+   */
+  public async isOrderCancelledOnChain(orderHash: string, networkKey?: string): Promise<boolean> {
+    if (process.env.BOT_MODE === 'SIMULATION') {
+      return true;
+    }
+    try {
+      const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
+      const networkInfo = this.config.networks?.[activeNetworkKey];
+      const seaportAddress = networkInfo?.seaportAddress || this.config.seaport.contractAddress;
+      const provider = this.signer.provider || new ethers.JsonRpcProvider(networkInfo?.rpcUrl);
+
+      const seaportContract = new ethers.Contract(
+        seaportAddress,
+        ['function getOrderStatus(bytes32 orderHash) view returns (bool isValidated, bool isCancelled, uint256 totalFilled, uint256 totalSize)'],
+        provider
+      );
+
+      const status = await seaportContract.getOrderStatus(orderHash);
+      return status.isCancelled === true;
+    } catch (err: any) {
+      logger.debug({ orderHash, err: err.message }, 'Could not query on-chain Seaport order status');
+      return false;
+    }
+  }
 }
+

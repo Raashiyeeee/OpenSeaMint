@@ -223,6 +223,8 @@ export interface InventoryItem {
   isExternalWalletItem?: boolean;
 }
 
+export type OfferStatus = 'ACTIVE' | 'EXPIRED' | 'FULFILLED' | 'CANCELLED' | 'CANCELLATION_PENDING' | 'CANCELLATION_FAILED';
+
 export interface ActiveOffer {
   orderHash: string;
   collectionSlug: string;
@@ -233,5 +235,13 @@ export interface ActiveOffer {
   priceUsd: number;
   createdTimestamp: number;
   expiresTimestamp: number;
-  status: 'ACTIVE' | 'EXPIRED' | 'FULFILLED' | 'CANCELLED';
+  status: OfferStatus;
+  cancellationAttempts?: number;
+  cancellationVerified?: boolean;
+  cancellationError?: string;
+  lastCancellationAttempt?: number;
+  flaggedForAttention?: boolean;
+  orderComponents?: any;
+  signature?: string;
 }
+

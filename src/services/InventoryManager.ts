@@ -33,9 +33,14 @@ export class InventoryManager {
 
     let allocatedUsd = 0;
 
-    // Capital committed to active offers
+    // Capital committed to active offers or unverified cancellations (must not assume capital released!)
     for (const offer of this.activeOffers.values()) {
-      if (offer.status === 'ACTIVE' && offer.expiresTimestamp > Date.now()) {
+      const locksCapital =
+        offer.status === 'ACTIVE' ||
+        offer.status === 'CANCELLATION_PENDING' ||
+        offer.status === 'CANCELLATION_FAILED' ||
+        (offer.status === 'CANCELLED' && !offer.cancellationVerified);
+      if (locksCapital) {
         allocatedUsd += offer.priceUsd || (offer.priceEth * ethPriceUsd);
       }
     }
@@ -62,13 +67,19 @@ export class InventoryManager {
   }
 
   /**
-   * Returns capital committed across all currently active, unexpired offers.
+   * Returns capital committed across all currently active offers and unverified cancellations.
+   * Under the 20-minute rule, capital remains committed until cancellation is verified.
    */
   public getActiveOffersCapitalUsd(ethPriceUsd: number = 2700): number {
     this.cleanupExpiredOffers();
     let sumUsd = 0;
     for (const offer of this.activeOffers.values()) {
-      if (offer.status === 'ACTIVE' && offer.expiresTimestamp > Date.now()) {
+      const locksCapital =
+        offer.status === 'ACTIVE' ||
+        offer.status === 'CANCELLATION_PENDING' ||
+        offer.status === 'CANCELLATION_FAILED' ||
+        (offer.status === 'CANCELLED' && !offer.cancellationVerified);
+      if (locksCapital) {
         sumUsd += offer.priceUsd || (offer.priceEth * ethPriceUsd);
       }
     }
@@ -166,7 +177,12 @@ export class InventoryManager {
     this.cleanupExpiredOffers();
     let count = 0;
     for (const offer of this.activeOffers.values()) {
-      if (offer.status === 'ACTIVE' && offer.expiresTimestamp > Date.now()) {
+      const locksCapital =
+        offer.status === 'ACTIVE' ||
+        offer.status === 'CANCELLATION_PENDING' ||
+        offer.status === 'CANCELLATION_FAILED' ||
+        (offer.status === 'CANCELLED' && !offer.cancellationVerified);
+      if (locksCapital) {
         count++;
       }
     }
@@ -498,6 +514,11 @@ export class InventoryManager {
   }
 
   public registerActiveOffer(offer: ActiveOffer): void {
+    offer.createdTimestamp = offer.createdTimestamp || Date.now();
+    offer.expiresTimestamp = offer.expiresTimestamp || (offer.createdTimestamp + (this.config.general.offerExpirationMinutes || 20) * 60 * 1000);
+    offer.status = offer.status || 'ACTIVE';
+    offer.cancellationVerified = false;
+
     // Unique key: orderHash or collectionSlug fallback
     const key = offer.orderHash || offer.collectionSlug;
     this.activeOffers.set(key, offer);
@@ -531,28 +552,210 @@ export class InventoryManager {
         tokenId: offer.tokenId,
         priceEth: offer.priceEth,
         priceUsd: offer.priceUsd,
-        expiresInMinutes: this.config.general.offerExpirationMinutes
+        createdTimestamp: offer.createdTimestamp,
+        expiresInMinutes: this.config.general.offerExpirationMinutes || 20
       },
       'Active offer registered. Capital is now locked to this trade.'
     );
+  }
+
+  /**
+   * Automatic Offer Cancellation — 20-Minute Rule:
+   * Returns all unaccepted offers whose creation time exceeds the 20-minute limit (or cutoffMs).
+   */
+  public getOffersExceeding20Minutes(cutoffMs: number = 20 * 60 * 1000): ActiveOffer[] {
+    const now = Date.now();
+    const expired: ActiveOffer[] = [];
+
+    for (const offer of this.activeOffers.values()) {
+      // Must not be fulfilled and either still ACTIVE or pending/failed cancellation awaiting resolution
+      if (offer.status !== 'FULFILLED' && (!offer.cancellationVerified || offer.status !== 'CANCELLED')) {
+        const ageMs = now - offer.createdTimestamp;
+        if (ageMs >= cutoffMs || offer.expiresTimestamp <= now) {
+          expired.push(offer);
+        }
+      }
+    }
+    return expired;
+  }
+
+  /**
+   * Automatic Cancellation: Initiates cancellation for an offer.
+   * Marks status as CANCELLATION_PENDING and increments attempt count.
+   * Capital remains locked until verification is confirmed.
+   */
+  public initiateOfferCancellation(orderHashOrKey: string): ActiveOffer | undefined {
+    let offer = this.activeOffers.get(orderHashOrKey);
+    if (!offer) {
+      for (const off of this.activeOffers.values()) {
+        if (off.orderHash === orderHashOrKey || off.collectionSlug.toLowerCase() === orderHashOrKey.toLowerCase()) {
+          offer = off;
+          break;
+        }
+      }
+    }
+    if (!offer) return undefined;
+
+    offer.status = 'CANCELLATION_PENDING';
+    offer.cancellationAttempts = (offer.cancellationAttempts || 0) + 1;
+    offer.lastCancellationAttempt = Date.now();
+
+    logger.info(
+      {
+        orderHash: offer.orderHash,
+        collection: offer.collectionSlug,
+        attempt: offer.cancellationAttempts,
+        status: offer.status
+      },
+      'Automatic Offer Cancellation initiated: Offer marked CANCELLATION_PENDING. Capital remains locked until verification.'
+    );
+
+    return offer;
+  }
+
+  /**
+   * Cancellation Verification: Verifies and confirms that the offer is no longer active.
+   * ONLY when cancellation is confirmed is the capital released!
+   */
+  public confirmOfferCancellation(orderHashOrKey: string): boolean {
+    let foundKey: string | undefined;
+    let offer: ActiveOffer | undefined;
+
+    if (this.activeOffers.has(orderHashOrKey)) {
+      foundKey = orderHashOrKey;
+      offer = this.activeOffers.get(orderHashOrKey);
+    } else {
+      for (const [k, off] of this.activeOffers.entries()) {
+        if (off.orderHash === orderHashOrKey || off.collectionSlug.toLowerCase() === orderHashOrKey.toLowerCase()) {
+          foundKey = k;
+          offer = off;
+          break;
+        }
+      }
+    }
+
+    if (!offer || !foundKey) {
+      return false;
+    }
+
+    offer.status = 'CANCELLED';
+    offer.cancellationVerified = true;
+    this.activeOffers.delete(foundKey);
+
+    // Clean up from trackedNfts if single item offer
+    if (offer.tokenId && offer.contractAddress) {
+      const nftKey = this.getNftKey(offer.contractAddress, offer.tokenId);
+      const tracked = this.trackedNfts.get(nftKey);
+      if (tracked) {
+        tracked.activeOffers = tracked.activeOffers.filter((o) => o.orderHash !== offer!.orderHash);
+      }
+    }
+
+    logger.info(
+      { orderHash: offer.orderHash, collection: offer.collectionSlug, priceUsd: offer.priceUsd },
+      'Cancellation verified & confirmed ✅: Offer is no longer active. Capital released back to pool.'
+    );
+
+    return true;
+  }
+
+  /**
+   * Cancellation Failure & Flagging:
+   * If cancellation fails or cannot be verified, it must retry or flag the offer for immediate attention
+   * and must NOT assume the capital has been released.
+   */
+  public failOfferCancellation(
+    orderHashOrKey: string,
+    errorReason: string,
+    maxRetries: number = 3
+  ): { flagged: boolean; attempts: number } {
+    let offer = this.activeOffers.get(orderHashOrKey);
+    if (!offer) {
+      for (const off of this.activeOffers.values()) {
+        if (off.orderHash === orderHashOrKey || off.collectionSlug.toLowerCase() === orderHashOrKey.toLowerCase()) {
+          offer = off;
+          break;
+        }
+      }
+    }
+
+    if (!offer) {
+      return { flagged: false, attempts: 0 };
+    }
+
+    offer.cancellationError = errorReason;
+    const attempts = offer.cancellationAttempts || 1;
+
+    if (attempts >= maxRetries) {
+      offer.status = 'CANCELLATION_FAILED';
+      offer.flaggedForAttention = true;
+      logger.error(
+        {
+          orderHash: offer.orderHash,
+          collection: offer.collectionSlug,
+          attempts,
+          error: errorReason
+        },
+        'CRITICAL ALERT 🚨: Cancellation verification failed after max retries! Flagged for immediate manual attention. Capital remains LOCKED and must NOT be released.'
+      );
+      return { flagged: true, attempts };
+    } else {
+      offer.status = 'CANCELLATION_PENDING';
+      logger.warn(
+        {
+          orderHash: offer.orderHash,
+          collection: offer.collectionSlug,
+          attempt: attempts,
+          maxRetries,
+          error: errorReason
+        },
+        'Cancellation verification attempt failed. Offer remains CANCELLATION_PENDING to retry. Capital remains LOCKED.'
+      );
+      return { flagged: false, attempts };
+    }
+  }
+
+  /**
+   * Checks if cancellation has been confirmed for an offer.
+   */
+  public isOfferCancellationVerified(orderHash: string): boolean {
+    const offer = this.activeOffers.get(orderHash);
+    if (offer) {
+      return offer.status === 'CANCELLED' && offer.cancellationVerified === true;
+    }
+    return true;
+  }
+
+  public getAllActiveOffers(): ActiveOffer[] {
+    return Array.from(this.activeOffers.values());
+  }
+
+  public getOffersFlaggedForAttention(): ActiveOffer[] {
+    return Array.from(this.activeOffers.values()).filter((o) => o.flaggedForAttention || o.status === 'CANCELLATION_FAILED');
   }
 
   public getActiveOffer(key: string): ActiveOffer | undefined {
     this.cleanupExpiredOffers();
     // 1. Lookup by orderHash
     if (this.activeOffers.has(key)) {
-      return this.activeOffers.get(key);
+      const off = this.activeOffers.get(key)!;
+      if (off.status === 'ACTIVE' || off.status === 'CANCELLATION_PENDING' || off.status === 'CANCELLATION_FAILED') {
+        return off;
+      }
     }
     // 2. Lookup by collectionSlug
     for (const offer of this.activeOffers.values()) {
-      if (offer.status === 'ACTIVE' && offer.collectionSlug.toLowerCase() === key.toLowerCase()) {
+      if (
+        (offer.status === 'ACTIVE' || offer.status === 'CANCELLATION_PENDING' || offer.status === 'CANCELLATION_FAILED') &&
+        offer.collectionSlug.toLowerCase() === key.toLowerCase()
+      ) {
         return offer;
       }
     }
     // 3. Lookup by NFT identifier (contract:tokenId)
     for (const offer of this.activeOffers.values()) {
       if (
-        offer.status === 'ACTIVE' &&
+        (offer.status === 'ACTIVE' || offer.status === 'CANCELLATION_PENDING' || offer.status === 'CANCELLATION_FAILED') &&
         offer.tokenId &&
         `${offer.contractAddress.toLowerCase()}:${offer.tokenId}` === key.toLowerCase()
       ) {
@@ -566,37 +769,38 @@ export class InventoryManager {
     this.cleanupExpiredOffers();
     const key = this.getNftKey(contractAddress, tokenId);
     const tracked = this.trackedNfts.get(key);
-    if (tracked && tracked.activeOffers.some((o) => o.status === 'ACTIVE' && o.expiresTimestamp > Date.now())) {
+    if (
+      tracked &&
+      tracked.activeOffers.some(
+        (o) =>
+          (o.status === 'ACTIVE' || o.status === 'CANCELLATION_PENDING' || o.status === 'CANCELLATION_FAILED') &&
+          !o.cancellationVerified
+      )
+    ) {
       return true;
     }
     for (const offer of this.activeOffers.values()) {
       if (
-        offer.status === 'ACTIVE' &&
-        offer.expiresTimestamp > Date.now() &&
         offer.tokenId === tokenId &&
         offer.contractAddress.toLowerCase() === contractAddress.toLowerCase()
       ) {
-        return true;
+        if (
+          (offer.status === 'ACTIVE' || offer.status === 'CANCELLATION_PENDING' || offer.status === 'CANCELLATION_FAILED') &&
+          !offer.cancellationVerified
+        ) {
+          return true;
+        }
       }
     }
     return false;
   }
 
   public cleanupExpiredOffers(): void {
-    const now = Date.now();
+    // Under the 20-Minute Rule, unaccepted offers that reach 20 minutes must NOT be silently dropped!
+    // They must go through cancellation verification before release.
     for (const [key, offer] of this.activeOffers.entries()) {
-      if (offer.status === 'ACTIVE' && offer.expiresTimestamp <= now) {
-        offer.status = 'EXPIRED';
+      if (offer.status === 'CANCELLED' && offer.cancellationVerified) {
         this.activeOffers.delete(key);
-        logger.info({ orderHash: offer.orderHash, collectionSlug: offer.collectionSlug, tokenId: offer.tokenId }, 'Offer expired. Capital released back to pool.');
-
-        if (offer.tokenId && offer.contractAddress) {
-          const nftKey = this.getNftKey(offer.contractAddress, offer.tokenId);
-          const tracked = this.trackedNfts.get(nftKey);
-          if (tracked) {
-            tracked.activeOffers = tracked.activeOffers.filter((o) => o.orderHash !== offer.orderHash);
-          }
-        }
       }
     }
   }
@@ -609,10 +813,12 @@ export class InventoryManager {
     for (const [key, offer] of this.activeOffers.entries()) {
       if (offer.collectionSlug.toLowerCase() === collectionSlug.toLowerCase()) {
         offer.status = 'CANCELLED';
+        offer.cancellationVerified = true;
         this.activeOffers.delete(key);
         logger.info({ collectionSlug, orderHash: offer.orderHash }, 'Offer cancelled. Capital released.');
       }
     }
   }
 }
+
 

@@ -6,6 +6,7 @@ export class OpenSeaApiService {
   private client: AxiosInstance;
   private config: BotConfig;
   private ethPriceCache: { price: number; timestamp: number } | null = null;
+  private mockOrderStates: Map<string, { isCancelled: boolean; cancellationFails?: boolean; verificationFails?: boolean }> = new Map();
 
   constructor(config: BotConfig) {
     this.config = config;
@@ -423,6 +424,116 @@ export class OpenSeaApiService {
       throw new Error(`OpenSea API Error: ${JSON.stringify(errorDetail)}`);
     }
   }
+
+  /**
+   * Set mock state for an order hash (used in automated testing of cancellation and verification)
+   */
+  public setMockOrderState(orderHash: string, state: { isCancelled: boolean; cancellationFails?: boolean; verificationFails?: boolean }): void {
+    this.mockOrderStates.set(orderHash, state);
+  }
+
+  /**
+   * Clear all mock order states
+   */
+  public clearMockOrderStates(): void {
+    this.mockOrderStates.clear();
+  }
+
+  /**
+   * Automatic Offer Cancellation: Initiates cancellation of an active offer via OpenSea API / Seaport
+   */
+  public async cancelOffer(orderHash: string, chain: string = 'robinhood'): Promise<{ success: boolean; error?: string }> {
+    // 1. Mock state check for testing
+    const mock = this.mockOrderStates.get(orderHash);
+    if (mock) {
+      if (mock.cancellationFails) {
+        logger.warn({ orderHash, chain }, 'Mock cancellation failed as configured for test.');
+        return { success: false, error: 'Simulated cancellation network/API failure' };
+      }
+      mock.isCancelled = true;
+      return { success: true };
+    }
+
+    // 2. Simulation mode
+    if (process.env.BOT_MODE === 'SIMULATION') {
+      if (orderHash.includes('fail_cancel')) {
+        logger.warn({ orderHash, chain }, '[SIMULATION] Simulated offer cancellation failure.');
+        return { success: false, error: 'Simulated offer cancellation rejection' };
+      }
+      logger.info({ orderHash, chain }, '[SIMULATION] Offer cancellation submitted successfully.');
+      return { success: true };
+    }
+
+    // 3. Live OpenSea v2 API cancellation
+    try {
+      const chainSlug = chain === 'mainnet' ? 'ethereum' : chain;
+      const res = await this.client.post(`/orders/${chainSlug}/seaport/offers/cancel`, {
+        order_hash: orderHash
+      });
+      logger.info({ orderHash, chain: chainSlug, data: res.data }, 'OpenSea accepted offer cancellation request');
+      return { success: true };
+    } catch (err: any) {
+      const errorDetail = err.response?.data?.errors || err.response?.data || err.message;
+      logger.error({ orderHash, chain, error: errorDetail }, 'OpenSea failed to cancel offer');
+      return { success: false, error: typeof errorDetail === 'string' ? errorDetail : JSON.stringify(errorDetail) };
+    }
+  }
+
+  /**
+   * Cancellation Verification: Verifies that the offer is no longer active before treating it as cancelled.
+   * If verification fails or order is still active, must return isInactive: false.
+   */
+  public async verifyOfferInactive(orderHash: string, chain: string = 'robinhood'): Promise<{ isInactive: boolean; status?: string; error?: string }> {
+    // 1. Mock state check for testing
+    const mock = this.mockOrderStates.get(orderHash);
+    if (mock) {
+      if (mock.verificationFails) {
+        return { isInactive: false, status: 'ACTIVE', error: 'Verification failed: Order remains active on marketplace.' };
+      }
+      if (mock.isCancelled) {
+        return { isInactive: true, status: 'CANCELLED' };
+      }
+      return { isInactive: false, status: 'ACTIVE', error: 'Order is still active in marketplace.' };
+    }
+
+    // 2. Simulation mode
+    if (process.env.BOT_MODE === 'SIMULATION') {
+      if (orderHash.includes('fail_verify') || orderHash.includes('still_active')) {
+        return { isInactive: false, status: 'ACTIVE', error: '[SIMULATION] Simulated verification failure: offer still active' };
+      }
+      return { isInactive: true, status: 'CANCELLED' };
+    }
+
+    // 3. Live OpenSea v2 API query to verify inactive status
+    try {
+      const chainSlug = chain === 'mainnet' ? 'ethereum' : chain;
+      const seaportAddress = this.config.seaport.contractAddress;
+      const res = await this.client.get(`/orders/chain/${chainSlug}/protocol/${seaportAddress}/${orderHash}`);
+      const order = res.data?.order || res.data;
+      const status = (order?.status || '').toLowerCase();
+
+      // If status is cancelled, expired, or fulfilled -> it is inactive
+      if (status === 'cancelled' || status === 'expired' || status === 'filled' || status === 'inactive') {
+        return { isInactive: true, status: status.toUpperCase() };
+      }
+
+      // If status is active or valid -> it is still active!
+      if (status === 'active' || status === 'valid') {
+        return { isInactive: false, status: 'ACTIVE', error: `Offer ${orderHash} is still reported as ACTIVE on OpenSea.` };
+      }
+
+      // Unknown status -> conservative: assume still active
+      return { isInactive: false, status, error: `Unverified offer status: ${status}` };
+    } catch (err: any) {
+      // 404 indicates order no longer found or expired/purged from active orderbook
+      if (err.response?.status === 404) {
+        return { isInactive: true, status: 'NOT_FOUND' };
+      }
+      const errorMsg = err.response?.data?.errors || err.message;
+      return { isInactive: false, error: `Could not verify offer status via API: ${JSON.stringify(errorMsg)}` };
+    }
+  }
+
 
   /**
    * Fetches latest minted tokens in a collection (Larry's COLLECTION_ASSETS_URL idea)
