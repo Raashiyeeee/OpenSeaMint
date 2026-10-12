@@ -112,9 +112,22 @@ async function main() {
       const slug = eventData.collection?.slug || '';
       const contract = eventData.item?.nft_id?.split('/')?.[1] || '';
       const tokenId = eventData.item?.nft_id?.split('/')?.[2] || '';
-      const priceEth = parseFloat(eventData.payment_token?.eth_price || '0.0035');
+      let priceEth = parseFloat(eventData.payment_token?.eth_price || '0');
+      if (!priceEth || priceEth <= 0 || priceEth >= 0.003) {
+        const activeOffer = inventoryManager.getActiveOffer(slug);
+        if (activeOffer && activeOffer.priceEth > 0) {
+          priceEth = activeOffer.priceEth;
+        } else {
+          try {
+            const marketData = await apiService.getCollectionMarketData(slug, contract);
+            priceEth = marketData.topOfferEth > 0 ? marketData.topOfferEth : (marketData.floorPriceEth * 0.85);
+          } catch {
+            priceEth = 0.0004;
+          }
+        }
+      }
 
-      logger.info({ slug, tokenId }, 'Incoming transfer received! Triggering automatic relist.');
+      logger.info({ slug, tokenId, priceEth }, 'Incoming transfer received! Triggering automatic relist.');
       await relisterStrategy.handleItemAcquired(slug, contract, tokenId, priceEth);
     } catch (err: any) {
       logger.error({ err }, 'Error processing nft_received event');
