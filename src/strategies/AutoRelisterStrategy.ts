@@ -128,8 +128,20 @@ export class AutoRelisterStrategy {
     }
 
     // Reconcile wallet holdings: If an NFT previously in inventory was sold or transferred,
-    // automatically clear it and release its locked capital and inventory slot.
-    this.inventoryManager.reconcileWalletInventory(allOwnedNfts, ethPriceUsd);
+    // automatically clear it, release its locked capital and inventory slot, and swap ETH back to WETH.
+    const soldItems = this.inventoryManager.reconcileWalletInventory(allOwnedNfts, ethPriceUsd);
+    for (const sold of soldItems) {
+      const net = sold.network || this.config.general.network || 'robinhood';
+      logger.info(
+        { identifier: sold.identifier, network: net, netProceedsEth: sold.netProceedsEth },
+        'NFT SALE CONFIRMED (RECONCILIATION): Automatically swapping received ETH back into WETH immediately...'
+      );
+      try {
+        await this.seaportService.swapEthToWeth(sold.netProceedsEth, net);
+      } catch (err: any) {
+        logger.error({ identifier: sold.identifier, err: err.message }, 'Failed to swap received ETH to WETH');
+      }
+    }
 
     // 2. Relist all unlisted or held items in inventory
     const unlisted = this.inventoryManager

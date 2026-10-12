@@ -1221,8 +1221,84 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   assert(activeReoffer?.expiresTimestamp > Date.now(), 'Fresh 20-minute countdown initialized');
   console.log('Case 17m PASSED: Re-offer placed successfully after confirmed cancellation and all eligibility filters pass again! ✅\n');
 
+  // --------------------------------------------------------------------------
+  // TEST 18: Automatic Post-Sale ETH to WETH Swap Rule
+  // Once the NFT is sold at the floor price, the ETH received must be automatically swapped
+  // back into WETH immediately via the WETH deposit() function.
+  // --------------------------------------------------------------------------
+  console.log('--- Test 18: Automatic Post-Sale ETH to WETH Swap Rule ---');
+  const postSaleInvManager = new InventoryManager(config);
+  const testSoldContract = '0x9999888877776666555544443333222211110000';
+  const testSoldTokenId = '777';
+  const testSoldIdentifier = `${testSoldContract.toLowerCase()}:${testSoldTokenId}`;
+
+  // Step 1: Add acquired NFT to inventory and list it at floor price (0.002 ETH)
+  postSaleInvManager.addInventoryItem({
+    identifier: testSoldIdentifier,
+    collectionSlug: 'swap-rule-collection',
+    contractAddress: testSoldContract,
+    tokenId: testSoldTokenId,
+    acquiredPriceEth: 0.001,
+    currentListingPriceEth: 0.002,
+    network: 'robinhood',
+    acquiredAtTimestamp: Date.now(),
+    status: 'LISTED'
+  });
+
+  // Step 2: Simulate NFT is sold at floor price on OpenSea (0.002 ETH with 100 bps combined fee)
+  // Fee = 0.002 * 1% = 0.00002 ETH. Net Proceeds = 0.002 - 0.00002 = 0.00198 ETH
+  const saleEventResult = postSaleInvManager.markItemSold(
+    testSoldIdentifier,
+    0.002, // floor price
+    2700,
+    100 // 100 bps fee
+  );
+
+  assert.strictEqual(saleEventResult.netProceedsEth, 0.00198, 'Net proceeds must equal floor price minus fees (0.00198 ETH)');
+  assert.strictEqual(saleEventResult.soldItem?.network, 'robinhood', 'Sold item must retain network metadata');
+  console.log('Case 18a PASSED: NFT sold at floor price. Net proceeds calculated accurately: ' + saleEventResult.netProceedsEth + ' ETH ✅');
+
+  // Step 3: Execute immediate automatic swap from received ETH to WETH via SeaportService
+  const testSigner = Wallet.createRandom();
+  const testSeaport = new SeaportService(config, testSigner);
+
+  // Set BOT_MODE to SIMULATION to test swap logic
+  const originalBotMode = process.env.BOT_MODE;
+  process.env.BOT_MODE = 'SIMULATION';
+
+  const swapResult = await testSeaport.swapEthToWeth(saleEventResult.netProceedsEth, 'robinhood');
+  assert.strictEqual(swapResult.success, true, 'Immediate ETH to WETH swap must succeed');
+  assert.strictEqual(swapResult.amountWrappedEth, 0.00198, 'Amount wrapped must match net ETH proceeds received from floor sale');
+  assert(swapResult.txHash?.startsWith('0xsim_weth_deposit_'), 'Swap transaction hash must be recorded');
+  console.log('Case 18b PASSED: Received ETH (' + swapResult.amountWrappedEth + ' ETH) automatically swapped back into WETH immediately! ✅');
+
+  // Step 4: Test wallet reconciliation trigger for immediate WETH swap
+  postSaleInvManager.addInventoryItem({
+    identifier: `${testSoldContract.toLowerCase()}:888`,
+    collectionSlug: 'swap-rule-collection',
+    contractAddress: testSoldContract,
+    tokenId: '888',
+    acquiredPriceEth: 0.001,
+    currentListingPriceEth: 0.0025,
+    network: 'robinhood',
+    acquiredAtTimestamp: Date.now(),
+    status: 'LISTED'
+  });
+
+  // Reconcile when NFT is sold on-chain (disappears from wallet)
+  const reconciledSales = postSaleInvManager.reconcileWalletInventory([]);
+  assert.strictEqual(reconciledSales.length, 1, 'Reconciliation must detect 1 sold NFT');
+  assert.strictEqual(reconciledSales[0].netProceedsEth, 0.002475, 'Reconciled sale proceeds must be 0.002475 ETH (0.0025 - 1% fee)');
+
+  const reconcileSwap = await testSeaport.swapEthToWeth(reconciledSales[0].netProceedsEth, reconciledSales[0].network);
+  assert.strictEqual(reconcileSwap.success, true, 'Reconciled sale ETH to WETH swap must succeed');
+  assert.strictEqual(reconcileSwap.amountWrappedEth, 0.002475, 'Reconciled amount wrapped must match proceeds');
+  console.log('Case 18c PASSED: Reconciled sale automatically triggers immediate ETH to WETH swap! ✅\n');
+
+  process.env.BOT_MODE = originalBotMode;
+
   console.log('================================================================');
-  console.log('All 17 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory, NFT Eligibility, Re-Bidding, Mint & Market Dump, and 20-Minute Offer Cancellation tests passed successfully!');
+  console.log('All 18 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory, NFT Eligibility, Re-Bidding, Mint & Market Dump, 20-Minute Cancellation, and Post-Sale WETH Swap tests passed successfully!');
   console.log('================================================================');
 })().catch((err) => {
   console.error('Test Failed:', err);

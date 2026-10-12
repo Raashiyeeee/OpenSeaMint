@@ -247,3 +247,11 @@ export interface ActiveOffer {
   signature?: string;
 }
 
+export interface MarkItemSoldResult {
+  realizedProfitUsd: number;
+  newTotalCapitalUsd: number;
+  saleConfirmation: NftSaleConfirmation;
+  soldItem?: InventoryItem;
+  netProceedsEth: number;
+}
+
