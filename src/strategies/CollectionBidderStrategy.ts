@@ -32,6 +32,87 @@ export class CollectionBidderStrategy {
   }
 
   /**
+   * Automatic Offer Cancellation — 20-Minute Rule:
+   * 1. Offer Expiry: Every NFT offer placed by the bot must be automatically cancelled if it has not been accepted within 20 minutes of creation.
+   * 2. Automatic Cancellation: The bot must track each offer's creation time and initiate cancellation when the 20-minute limit expires.
+   * 3. Cancellation Verification: The bot must verify that the offer is no longer active before treating it as cancelled. If cancellation fails, it must retry or flag the offer for immediate attention and must not assume the capital has been released.
+   */
+  public async processAutomaticOfferCancellations(maxAgeMinutes: number = 20): Promise<{
+    cancelled: number;
+    failed: number;
+    pending: number;
+  }> {
+    const cutoffMs = maxAgeMinutes * 60 * 1000;
+    const expiredOffers = this.inventoryManager.getOffersExceeding20Minutes(cutoffMs);
+
+    if (expiredOffers.length === 0) {
+      return { cancelled: 0, failed: 0, pending: 0 };
+    }
+
+    logger.info(
+      { count: expiredOffers.length, maxAgeMinutes },
+      `Automatic Offer Cancellation (20-Minute Rule): Initiating cancellation & verification for ${expiredOffers.length} unaccepted offer(s)...`
+    );
+
+    let cancelled = 0;
+    let failed = 0;
+    let pending = 0;
+
+    for (const offer of expiredOffers) {
+      const orderHash = offer.orderHash;
+      const network = offer.network || 'robinhood';
+
+      // 1. Mark status CANCELLATION_PENDING (capital stays locked!)
+      this.inventoryManager.initiateOfferCancellation(orderHash);
+
+      try {
+        // 2. Request marketplace cancellation
+        const cancelRes = await this.apiService.cancelOffer(orderHash, network);
+        if (!cancelRes.success) {
+          logger.warn(
+            { orderHash, network, error: cancelRes.error },
+            'Marketplace cancel request failed or queued. Will perform verification check.'
+          );
+        }
+
+        // 3. Verify offer is inactive before releasing capital
+        const verification = await this.apiService.verifyOfferInactive(orderHash, network);
+
+        if (verification.isInactive) {
+          // Verification confirmed: release capital
+          this.inventoryManager.confirmOfferCancellation(orderHash);
+          cancelled++;
+          logger.info(
+            { orderHash, collection: offer.collectionSlug, network },
+            'Automatic Offer Cancellation: Cancellation verified and confirmed ✅ Capital released.'
+          );
+        } else {
+          // Verification failed: DO NOT assume capital has been released!
+          const failRes = this.inventoryManager.failOfferCancellation(
+            orderHash,
+            verification.error || 'Offer still active after cancellation request'
+          );
+          if (failRes.flagged) {
+            failed++;
+          } else {
+            pending++;
+          }
+        }
+      } catch (err: any) {
+        logger.error({ orderHash, err: err.message }, 'Unexpected error during offer cancellation process');
+        const failRes = this.inventoryManager.failOfferCancellation(orderHash, err.message);
+        if (failRes.flagged) {
+          failed++;
+        } else {
+          pending++;
+        }
+      }
+    }
+
+    return { cancelled, failed, pending };
+  }
+
+  /**
    * Evaluates collections across ALL active networks (Robinhood & Ethereum) automatically.
    */
   public async evaluateAndPlaceBids(): Promise<void> {
@@ -39,6 +120,10 @@ export class CollectionBidderStrategy {
       logger.warn('Circuit breaker is tripped. Skipping bidding cycle.');
       return;
     }
+
+    // 0. Automatic Offer Cancellation — 20-Minute Rule:
+    // Every NFT offer placed by the bot must be automatically cancelled if unaccepted within 20 minutes.
+    await this.processAutomaticOfferCancellations(this.config.general.offerExpirationMinutes || 20);
 
     const activeNetworks = this.config.general.activeNetworks || ['robinhood', 'mainnet'];
     const totalCapitalUsd = this.inventoryManager.getTotalCapitalUsd();
@@ -220,11 +305,20 @@ export class CollectionBidderStrategy {
       return;
     }
 
-    // 7. CHECK IF EXISTING OFFER ALREADY ACTIVE
+    // 7. CHECK IF EXISTING OFFER ALREADY ACTIVE OR UNVERIFIED
     const existingOffer = this.inventoryManager.getActiveOffer(target.slug);
-    if (existingOffer && existingOffer.priceEth === calculation.bidPriceEth && existingOffer.expiresTimestamp > Date.now()) {
-      logger.debug({ slug: target.slug, network: targetNetwork, price: existingOffer.priceEth }, 'Active offer already in place at target price');
-      return;
+    if (existingOffer) {
+      if (existingOffer.status === 'ACTIVE' && existingOffer.expiresTimestamp > Date.now()) {
+        logger.debug({ slug: target.slug, network: targetNetwork, price: existingOffer.priceEth }, 'Active offer already in place at target price');
+        return;
+      }
+      if (existingOffer.status === 'CANCELLATION_PENDING' || existingOffer.status === 'CANCELLATION_FAILED' || !existingOffer.cancellationVerified) {
+        logger.warn(
+          { slug: target.slug, orderHash: existingOffer.orderHash, status: existingOffer.status },
+          'Cannot place new offer: Previous offer cancellation is not yet confirmed/verified. Capital remains locked.'
+        );
+        return;
+      }
     }
 
     logger.info(
@@ -337,8 +431,10 @@ export class CollectionBidderStrategy {
               priceEth: calculation.bidPriceEth,
               priceUsd: calculation.bidPriceUsd,
               createdTimestamp: Date.now(),
-              expiresTimestamp: Date.now() + this.config.general.offerExpirationMinutes * 60 * 1000,
-              status: 'ACTIVE'
+              expiresTimestamp: Date.now() + (this.config.general.offerExpirationMinutes || 20) * 60 * 1000,
+              status: 'ACTIVE',
+              orderComponents: itemComponents,
+              signature: itemSig
             });
           } catch (singleErr: any) {
             logger.debug({ tokenId: tok.tokenId, err: singleErr.message }, 'Single offer info');
@@ -358,8 +454,10 @@ export class CollectionBidderStrategy {
       priceEth: calculation.bidPriceEth,
       priceUsd: calculation.bidPriceUsd,
       createdTimestamp: Date.now(),
-      expiresTimestamp: Date.now() + this.config.general.offerExpirationMinutes * 60 * 1000,
-      status: 'ACTIVE'
+      expiresTimestamp: Date.now() + (this.config.general.offerExpirationMinutes || 20) * 60 * 1000,
+      status: 'ACTIVE',
+      orderComponents,
+      signature
     });
 
     this.circuitBreaker.registerSuccess();
@@ -472,8 +570,10 @@ export class CollectionBidderStrategy {
       priceEth: calculation.bidPriceEth,
       priceUsd: calculation.bidPriceUsd,
       createdTimestamp: Date.now(),
-      expiresTimestamp: Date.now() + this.config.general.offerExpirationMinutes * 60 * 1000,
-      status: 'ACTIVE'
+      expiresTimestamp: Date.now() + (this.config.general.offerExpirationMinutes || 20) * 60 * 1000,
+      status: 'ACTIVE',
+      orderComponents,
+      signature
     });
 
     logger.info({ contractAddress: params.contractAddress, tokenId: params.tokenId, orderHash }, 'Item offer placed successfully and tracked independently');

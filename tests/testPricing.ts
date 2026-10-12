@@ -1,8 +1,11 @@
 import assert from 'assert';
+import { Wallet } from 'ethers';
 import { PricingEngine } from '../src/services/PricingEngine';
 import { InventoryManager } from '../src/services/InventoryManager';
 import { OpenSeaApiService } from '../src/services/OpenSeaApiService';
+import { SeaportService } from '../src/services/SeaportService';
 import { CircuitBreaker } from '../src/security/CircuitBreaker';
+import { CollectionBidderStrategy } from '../src/strategies/CollectionBidderStrategy';
 import { loadConfig } from '../src/config/schema';
 import { CollectionMarketData } from '../src/types';
 
@@ -850,12 +853,278 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   assert.strictEqual(postReEnableCheck.allowed, true, 'Collection must be allowed after explicit re-enable');
   console.log('Case 16i PASSED: User review and explicit re-enable clears permanent exclusion ✅\n');
 
+  // --------------------------------------------------------------------------
+  // TEST 17: Automatic Offer Cancellation — 20-Minute Rule
+  // 1. Offer Expiry: Automatically cancelled if unaccepted within 20 minutes.
+  // 2. Automatic Cancellation: Tracks creation time and initiates cancellation at 20 minutes.
+  // 3. Cancellation Verification: Verify offer is no longer active before treating as cancelled.
+  //    If cancellation fails, retry or flag for immediate attention; must not assume capital released.
+  // 4. Re-Filtering Before Re-Offering: All eligibility checks must run again.
+  // 5. Re-Offer Rule: If all pass -> place new offer. If any fail -> skip NFT.
+  // --------------------------------------------------------------------------
+  console.log('--- Test 17: Automatic Offer Cancellation — 20-Minute Rule ---');
+  const cancelTestInv = new InventoryManager(config);
+  const ephemeralWallet = Wallet.createRandom();
+  const cancelTestSeaport = new SeaportService(config, ephemeralWallet);
+  const cancelTestApi = new OpenSeaApiService(config);
+  const cancelTestCb = new CircuitBreaker(config);
+  const cancelBidder = new CollectionBidderStrategy(
+    config,
+    cancelTestApi,
+    pricingEngine,
+    cancelTestSeaport,
+    cancelTestInv,
+    cancelTestCb
+  );
+
+  const t0 = Date.now();
+
+  // Case 17a: Offer Expiry & Tracking creation time
+  // Active offer placed tracks creation time and locks capital
+  cancelTestInv.registerActiveOffer({
+    orderHash: 'offer_test_20m',
+    collectionSlug: 'cryptopunks-minimal',
+    contractAddress: '0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb',
+    tokenId: '1001',
+    network: 'robinhood',
+    priceEth: 0.001,
+    priceUsd: 2.70,
+    createdTimestamp: t0,
+    expiresTimestamp: t0 + 20 * 60 * 1000,
+    status: 'ACTIVE'
+  });
+
+  assert.strictEqual(cancelTestInv.getActiveOffersCapitalUsd(), 2.70, 'Capital must be locked for active offer');
+  assert.strictEqual(cancelTestInv.getAvailableCapitalUsd(), 7.30, 'Available capital must be $7.30');
+
+  // When offer is < 20 minutes old (e.g. 5m elapsed), must NOT be cancelled prematurely
+  const youngOffers = cancelTestInv.getOffersExceeding20Minutes(20 * 60 * 1000);
+  assert.strictEqual(youngOffers.length, 0, 'Offers < 20 minutes old must NOT be marked for cancellation');
+  console.log('Case 17a PASSED: Offer creation tracks creation time and is NOT prematurely cancelled under 20 minutes ✅');
+
+  // Case 17b: Automatic Cancellation: 20-minute limit expires -> Initiates cancellation
+  // Simulate 20 minutes and 1 second having elapsed
+  const offerToCancel = cancelTestInv.getActiveOffer('offer_test_20m')!;
+  offerToCancel.createdTimestamp = t0 - (20 * 60 * 1000 + 1000); // 20m 1s ago
+  offerToCancel.expiresTimestamp = t0 - 1000;
+
+  const expiredOffers = cancelTestInv.getOffersExceeding20Minutes(20 * 60 * 1000);
+  assert.strictEqual(expiredOffers.length, 1, 'Offer exceeding 20 minutes must be identified for cancellation');
+  assert.strictEqual(expiredOffers[0].orderHash, 'offer_test_20m', 'Correct offer must be targeted');
+  console.log('Case 17b PASSED: Bot tracks creation time and identifies unaccepted offer at 20-minute limit ✅');
+
+  // Case 17c: Cancellation Verification: Fails verification -> Capital is NOT assumed released!
+  cancelTestApi.setMockOrderState('offer_test_20m', { isCancelled: false, verificationFails: true });
+  await cancelBidder.processAutomaticOfferCancellations(20);
+
+  // Capital must STILL be locked ($2.70 locked, $7.30 available)!
+  assert.strictEqual(
+    cancelTestInv.getActiveOffersCapitalUsd(),
+    2.70,
+    'Capital must NOT be released when cancellation verification fails!'
+  );
+  assert.strictEqual(
+    cancelTestInv.getAvailableCapitalUsd(),
+    7.30,
+    'Available capital must not increase when cancellation fails!'
+  );
+  assert.strictEqual(
+    offerToCancel.status,
+    'CANCELLATION_PENDING',
+    'Offer status must remain CANCELLATION_PENDING on first verification failure'
+  );
+  console.log('Case 17c PASSED: Cancellation failure/unverified state strictly keeps capital locked ✅');
+
+  // Case 17d: Cancellation Verification: Repeated failures flag offer for immediate attention and capital remains locked
+  await cancelBidder.processAutomaticOfferCancellations(20); // Attempt 2
+  await cancelBidder.processAutomaticOfferCancellations(20); // Attempt 3 (reaches max retries)
+
+  assert.strictEqual(offerToCancel.status, 'CANCELLATION_FAILED', 'Status must transition to CANCELLATION_FAILED');
+  assert.strictEqual(offerToCancel.flaggedForAttention, true, 'Offer must be flagged for immediate manual attention');
+  assert.strictEqual(cancelTestInv.getOffersFlaggedForAttention().length, 1, 'Flagged list must contain the failed offer');
+  assert.strictEqual(
+    cancelTestInv.getActiveOffersCapitalUsd(),
+    2.70,
+    'Capital must STILL remain locked even after failure flagging!'
+  );
+  console.log('Case 17d PASSED: Max cancellation retries flag offer for immediate attention without releasing capital ✅');
+
+  // Case 17e: Re-offering blocked while cancellation is unverified / failed
+  const reOfferBeforeVerify = cancelTestInv.canPlaceOfferOnNft(
+    '0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb',
+    '1001',
+    2.70
+  );
+  assert.strictEqual(
+    reOfferBeforeVerify.allowed,
+    false,
+    'Re-offering must be blocked while previous offer cancellation is unverified / pending / failed'
+  );
+  console.log('Case 17e PASSED: Re-offering strictly blocked while previous offer cancellation is unconfirmed ✅');
+
+  // Case 17f: Cancellation Verification confirmed -> Capital is released!
+  cancelTestApi.setMockOrderState('offer_test_20m', { isCancelled: true, verificationFails: false });
+  await cancelBidder.processAutomaticOfferCancellations(20);
+
+  assert.strictEqual(
+    cancelTestInv.getActiveOffersCapitalUsd(),
+    0.0,
+    'Capital must be fully released only after cancellation is confirmed!'
+  );
+  assert.strictEqual(
+    cancelTestInv.getAvailableCapitalUsd(),
+    10.0,
+    'Total available capital must return to $10.00 after confirmed cancellation'
+  );
+  assert.strictEqual(
+    cancelTestInv.getActiveOffer('offer_test_20m'),
+    undefined,
+    'Offer must be cleared from active tracking once confirmed cancelled'
+  );
+  console.log('Case 17f PASSED: Cancellation verified and confirmed releases capital back to pool ✅');
+
+  // Case 17g: Re-Filtering - Native ETH floor-sales criteria fails (< 10 sales in 3h) -> Skip NFT
+  const baseEligibleData: CollectionMarketData = {
+    slug: 'cryptopunks-minimal',
+    contractAddress: '0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb',
+    floorPriceEth: 0.002,
+    topOfferEth: 0.0008,
+    numListings: 15,
+    openseaFeeBps: 50,
+    royaltyFeeBps: 0,
+    ethPriceUsd: 2700,
+    timestamp: Date.now(),
+    sales3Hours: 6, // FAILING: Only 6 sales in 3h (< 10 required)
+    uniqueWallets3Hours: 6,
+    liquidityPassed: false,
+    liquidityReason: 'Only 6 native ETH floor sales in last 3h (< 10 required)',
+    mintCompleted: true
+  };
+  const calcFailedSales = pricingEngine.calculateMaxBid(baseEligibleData, 0.20, 10.0, 'robinhood');
+  assert.strictEqual(calcFailedSales.checkLLiquidityPassed, false, 'Liquidity check must fail on sales volume');
+  assert.strictEqual(calcFailedSales.decision, 'REJECT', 'Must REJECT offer when floor sales < 10');
+  console.log('Case 17g PASSED: Re-filtering rejects NFT when native ETH floor sales < 10 in 3h ✅');
+
+  // Case 17h: Re-Filtering - Unique-wallet count fails (< 5 unique wallets in 3h) -> Skip NFT
+  const failedWalletsData: CollectionMarketData = {
+    ...baseEligibleData,
+    sales3Hours: 12,
+    uniqueWallets3Hours: 3, // FAILING: Only 3 unique wallets (< 5 required)
+    liquidityPassed: false,
+    liquidityReason: 'Only 3 unique wallets in last 3h (< 5 required)'
+  };
+  const calcFailedWallets = pricingEngine.calculateMaxBid(failedWalletsData, 0.20, 10.0, 'robinhood');
+  assert.strictEqual(calcFailedWallets.checkLLiquidityPassed, false, 'Liquidity check must fail on unique wallets');
+  assert.strictEqual(calcFailedWallets.decision, 'REJECT', 'Must REJECT offer when unique wallets < 5');
+  console.log('Case 17h PASSED: Re-filtering rejects NFT when unique wallets < 5 in 3h ✅');
+
+  // Case 17i: Re-Filtering - Market Dump Protection triggers (>= 40% decline) -> Skip NFT
+  const dumpReCheck = cancelTestCb.evaluateMarketDumpProtection('cryptopunks-minimal', 0.00055, 0.0010); // 45% decline
+  assert.strictEqual(dumpReCheck.allowed, false, 'Market Dump Protection must reject collection with >= 40% decline');
+  assert.strictEqual(dumpReCheck.action, 'REJECT', 'Action must be REJECT');
+  console.log('Case 17i PASSED: Re-filtering rejects NFT when floor dumped by >= 40% ✅');
+
+  // Case 17j: Re-Filtering - Incomplete Public Mint fails -> Skip NFT
+  const failedMintData: CollectionMarketData = {
+    ...baseEligibleData,
+    sales3Hours: 15,
+    uniqueWallets3Hours: 8,
+    liquidityPassed: true,
+    mintCompleted: false, // FAILING
+    mintDemandReason: 'Incomplete Public Mint: Public mint has not completed successfully'
+  };
+  const mintCheckResult = pricingEngine.verifyMintCompletion(failedMintData);
+  assert.strictEqual(mintCheckResult.passed, false, 'Mint completion check must fail');
+  const calcFailedMint = pricingEngine.calculateMaxBid(failedMintData, 0.20, 10.0, 'robinhood');
+  assert.strictEqual(calcFailedMint.decision, 'REJECT', 'Must REJECT offer when public mint is incomplete');
+  console.log('Case 17j PASSED: Re-filtering rejects NFT when public mint is incomplete ✅');
+
+  // Case 17k: Re-Filtering - Floor ratio requirement fails (Floor < 1.40 * Offer) -> Skip NFT
+  const failedFloorRatio = pricingEngine.evaluateOfferScenario({
+    offerPriceUsd: 2.00,
+    floorPriceUsd: 2.30, // Floor $2.30 < $2.00 * 1.40 = $2.80 (Only 15% higher instead of 40%)
+    royaltyPercent: 0,
+    availableCapitalUsd: 10.0,
+    minNetProfitUsd: 0.20,
+    enforceFloorRatio: true
+  });
+  assert.strictEqual(failedFloorRatio.checkFFloorRatioPassed, false, 'Floor ratio check must fail');
+  assert.strictEqual(failedFloorRatio.decision, 'REJECT', 'Must REJECT offer when floor < 1.40 * offer');
+  console.log('Case 17k PASSED: Re-filtering rejects NFT when floor price is < 1.40 * offer price ✅');
+
+  // Case 17l: Re-Filtering - Capital allocation limit fails (> 60% of total capital) -> Skip NFT
+  // Register $5.50 active offer in another collection
+  cancelTestInv.registerActiveOffer({
+    orderHash: 'other_active_offer',
+    collectionSlug: 'other-collection',
+    contractAddress: '0x2222000000000000000000000000000000000002',
+    priceEth: 0.002,
+    priceUsd: 5.50,
+    createdTimestamp: Date.now(),
+    expiresTimestamp: Date.now() + 20 * 60 * 1000,
+    status: 'ACTIVE'
+  });
+  // Attempting $1.50 offer: $5.50 + $1.50 = $7.00 > $6.00 (60% of $10.00)
+  const capitalExceededCheck = cancelTestInv.canAllocateCapitalForOffer(1.50);
+  assert.strictEqual(capitalExceededCheck.allowed, false, 'Must reject offer that exceeds 60% active offer allocation limit');
+  assert(capitalExceededCheck.reason?.includes('allocation limit'), 'Reason must specify capital allocation limit');
+  console.log('Case 17l PASSED: Re-filtering rejects NFT when active offer capital limit (>60%) would be exceeded ✅');
+
+  // Case 17m: Re-Offer Rule - All conditions pass -> New offer permitted!
+  cancelTestInv.cancelActiveOffer('other-collection'); // Clear the temporary offer
+  assert.strictEqual(cancelTestInv.getActiveOffersCapitalUsd(), 0.0);
+
+  const allPassingData: CollectionMarketData = {
+    slug: 'cryptopunks-minimal',
+    contractAddress: '0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb',
+    floorPriceEth: 0.0016, // ~$4.32 floor
+    topOfferEth: 0.0006,
+    numListings: 20,
+    openseaFeeBps: 50,
+    royaltyFeeBps: 0,
+    ethPriceUsd: 2700,
+    timestamp: Date.now(),
+    sales3Hours: 16, // PASSED: >= 10
+    uniqueWallets3Hours: 9, // PASSED: >= 5
+    liquidityPassed: true,
+    mintCompleted: true,
+    referenceFloorEth: 0.00165,
+    floorDeclinePercent: 3.0 // PASSED: < 40%
+  };
+
+  const calcPassing = pricingEngine.calculateMaxBid(allPassingData, 0.20, 10.0, 'robinhood');
+  assert.strictEqual(calcPassing.checkLLiquidityPassed, true, 'Liquidity check must pass');
+  assert.strictEqual(calcPassing.checkFFloorRatioPassed, true, 'Floor ratio check must pass');
+  assert.strictEqual(calcPassing.checkACapitalPassed, true, 'Capital check must pass');
+  assert.strictEqual(calcPassing.checkBProfitPassed, true, 'Profit check must pass');
+  assert.strictEqual(calcPassing.decision, 'ACCEPT', 'Decision must be ACCEPT');
+  assert.strictEqual(calcPassing.isProfitable, true, 'Trade must be profitable');
+
+  // Place fresh re-offer after confirmed cancellation and passing all filters
+  cancelTestInv.registerActiveOffer({
+    orderHash: 'new_reoffer_punks',
+    collectionSlug: 'cryptopunks-minimal',
+    contractAddress: '0xb47e3cd837ddf8e4c57f05d70ab865de6e193bbb',
+    priceEth: calcPassing.bidPriceEth,
+    priceUsd: calcPassing.bidPriceUsd,
+    createdTimestamp: Date.now(),
+    expiresTimestamp: Date.now() + 20 * 60 * 1000,
+    status: 'ACTIVE'
+  });
+
+  const activeReoffer = cancelTestInv.getActiveOffer('new_reoffer_punks');
+  assert(activeReoffer !== undefined, 'New offer must be placed and actively tracked');
+  assert.strictEqual(activeReoffer?.status, 'ACTIVE', 'New offer must be active');
+  assert(activeReoffer?.expiresTimestamp > Date.now(), 'Fresh 20-minute countdown initialized');
+  console.log('Case 17m PASSED: Re-offer placed successfully after confirmed cancellation and all eligibility filters pass again! ✅\n');
+
   console.log('================================================================');
-  console.log('All 16 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory, NFT Eligibility, Re-Bidding, Mint & Market Dump tests passed successfully!');
+  console.log('All 17 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory, NFT Eligibility, Re-Bidding, Mint & Market Dump, and 20-Minute Offer Cancellation tests passed successfully!');
   console.log('================================================================');
 })().catch((err) => {
   console.error('Test Failed:', err);
   process.exit(1);
 });
+
 
 
