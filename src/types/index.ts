@@ -62,6 +62,8 @@ export interface BotConfig {
     floorPriceDropThresholdPercent: number;
     maxConsecutiveErrors: number;
     emergencyStopOnLargeDrawdown: boolean;
+    maxAllowedFloorDeclinePercent?: number; // e.g. 40.0% decline ceiling
+    extremeFloorDeclinePercent?: number;    // e.g. 90.0% - 99.0% permanent exclusion
   };
   targetCollections: TargetCollectionConfig[];
   seaport: {
@@ -116,6 +118,16 @@ export interface CollectionMarketData {
   floorSalesCount?: number;
   liquidityPassed: boolean;
   liquidityReason?: string;
+  // Mint & Market Dump Protection
+  isMinting?: boolean;
+  mintCompleted?: boolean;
+  totalSupply?: number;
+  maxSupply?: number;
+  mintDemandPassed?: boolean;
+  mintDemandReason?: string;
+  referenceFloorEth?: number;
+  referenceFloorUsd?: number;
+  floorDeclinePercent?: number;
 }
 
 export interface ProfitCalculationResult {
@@ -145,6 +157,9 @@ export interface ProfitCalculationResult {
   checkFFloorRatioPassed: boolean;
   checkACapitalPassed: boolean;
   checkBProfitPassed: boolean;
+  checkMintCompletedPassed?: boolean;
+  checkMarketDumpPassed?: boolean;
+  floorDeclinePercent?: number;
   isProfitable: boolean;
   decision: 'ACCEPT' | 'REJECT';
   reason?: string;

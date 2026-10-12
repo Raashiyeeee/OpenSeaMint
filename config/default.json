@@ -64,7 +64,9 @@
     "maxTotalInventoryItems": 999,
     "floorPriceDropThresholdPercent": 15.0,
     "maxConsecutiveErrors": 5,
-    "emergencyStopOnLargeDrawdown": true
+    "emergencyStopOnLargeDrawdown": true,
+    "maxAllowedFloorDeclinePercent": 40.0,
+    "extremeFloorDeclinePercent": 90.0
   },
   "targetCollections": [
     {

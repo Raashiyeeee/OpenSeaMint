@@ -113,6 +113,14 @@ export class CollectionBidderStrategy {
     const targetNetwork = networkKey || target.network || 'robinhood';
 
     // 1. SCAN NFT & Check collection-level capacity
+    if (this.circuitBreaker.isCollectionPermanentlyExcluded(target.slug)) {
+      logger.warn(
+        { slug: target.slug },
+        'OFFER REJECTED ❌: Collection is permanently excluded due to extreme floor collapse (Market Dump Protection).'
+      );
+      return;
+    }
+
     const canBid = this.inventoryManager.canBidOnCollection(target.slug, target.maxInventory ?? 5);
     if (!canBid) return;
 
@@ -129,9 +137,38 @@ export class CollectionBidderStrategy {
     // 3. FETCH LATEST MARKET DATA
     const marketData = await this.apiService.getCollectionMarketData(target.slug, target.contractAddress);
 
-    // 4. CHECK FLOOR STABILITY WITH CIRCUIT BREAKER
-    const isStable = this.circuitBreaker.checkFloorPriceMovement(target.slug, marketData.floorPriceEth);
+    // 4. CHECK MARKET DUMP PROTECTION & FLOOR STABILITY WITH CIRCUIT BREAKER
+    const dumpCheck = this.circuitBreaker.evaluateMarketDumpProtection(
+      target.slug,
+      marketData.floorPriceEth,
+      marketData.referenceFloorEth
+    );
+    if (!dumpCheck.allowed) {
+      logger.info(
+        {
+          slug: target.slug,
+          network: targetNetwork,
+          declinePercent: dumpCheck.declinePercent,
+          referenceFloor: dumpCheck.referenceFloor,
+          floorPriceEth: marketData.floorPriceEth
+        },
+        `MARKET DUMP PROTECTION REJECTION ❌: ${dumpCheck.reason}`
+      );
+      return;
+    }
+
+    const isStable = this.circuitBreaker.checkFloorPriceMovement(target.slug, marketData.floorPriceEth, marketData.referenceFloorEth);
     if (!isStable) return;
+
+    // 4.5. CHECK INCOMPLETE PUBLIC MINT PROTECTION
+    const mintCheck = this.pricingEngine.verifyMintCompletion(marketData);
+    if (!mintCheck.passed) {
+      logger.info(
+        { slug: target.slug, network: targetNetwork, reason: mintCheck.reason },
+        `INCOMPLETE PUBLIC MINT REJECTION ❌: ${mintCheck.reason}`
+      );
+      return;
+    }
 
     // 5. CALCULATE EXPECTED RESALE, ROYALTIES, MARKETPLACE FEES, GAS & NET PROFIT
     const calculation = this.pricingEngine.calculateMaxBid(
@@ -208,6 +245,8 @@ export class CollectionBidderStrategy {
         estimatedGasCostUsd: `$${calculation.estimatedGasCostUsd}`,
         expectedNetProfitUsd: `$${calculation.netProfitUsd}`,
         marginPercent: `${calculation.marginPercent}%`,
+        checkMint_Completion: 'PASSED ✅ (Public mint completed and secondary demand verified)',
+        checkDump_Protection: `PASSED ✅ (Floor decline ${calculation.floorDeclinePercent ?? 0}% < 40% threshold)`,
         checkL_Liquidity: 'PASSED ✅ (>= 10 genuine native ETH floor sales & >= 5 wallets in 3h, WETH & offers excluded)',
         checkF_FloorRatio: 'PASSED ✅ (Floor >= Offer * 1.40, >= 40% floor difference excluding creator fees)',
         checkA_Capital: 'PASSED ✅ (within active-offer capital allocation)',
@@ -340,7 +379,15 @@ export class CollectionBidderStrategy {
   }): Promise<{ success: boolean; reason?: string }> {
     const targetNetwork = params.network || 'robinhood';
 
-    // 1. Same NFT Re-Bidding Restriction & Capital Allocation Check
+    // 1. Permanent Exclusion Check (Market Dump Protection)
+    if (this.circuitBreaker.isCollectionPermanentlyExcluded(params.collectionSlug)) {
+      return {
+        success: false,
+        reason: 'Collection is permanently excluded due to extreme floor collapse (Market Dump Protection)'
+      };
+    }
+
+    // 2. Same NFT Re-Bidding Restriction & Capital Allocation Check
     const availableCapitalUsd = this.inventoryManager.getAvailableCapitalUsd();
     const nftCheck = this.inventoryManager.canPlaceOfferOnNft(params.contractAddress, params.tokenId);
     if (!nftCheck.allowed) {
@@ -348,8 +395,26 @@ export class CollectionBidderStrategy {
       return { success: false, reason: nftCheck.reason };
     }
 
-    // 2. Market Data & Pricing Calculation
+    // 3. Market Data & Pre-Checks
     const marketData = await this.apiService.getCollectionMarketData(params.collectionSlug, params.contractAddress);
+
+    // 3.1. Market Dump Protection Check
+    const dumpCheck = this.circuitBreaker.evaluateMarketDumpProtection(
+      params.collectionSlug,
+      marketData.floorPriceEth,
+      marketData.referenceFloorEth
+    );
+    if (!dumpCheck.allowed) {
+      return { success: false, reason: dumpCheck.reason };
+    }
+
+    // 3.2. Incomplete Public Mint Protection Check
+    const mintCheck = this.pricingEngine.verifyMintCompletion(marketData);
+    if (!mintCheck.passed) {
+      return { success: false, reason: mintCheck.reason };
+    }
+
+    // 4. Pricing Calculation & Profitability
     const calculation = this.pricingEngine.calculateMaxBid(
       marketData,
       params.targetNetProfitUsd ?? this.config.capital?.minNetProfitUsd ?? 0.20,

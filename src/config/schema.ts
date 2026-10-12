@@ -85,7 +85,9 @@ const BotConfigSchema = z.object({
     maxTotalInventoryItems: z.number().int().positive(),
     floorPriceDropThresholdPercent: z.number().positive(),
     maxConsecutiveErrors: z.number().int().positive(),
-    emergencyStopOnLargeDrawdown: z.boolean()
+    emergencyStopOnLargeDrawdown: z.boolean(),
+    maxAllowedFloorDeclinePercent: z.number().positive().default(40.0),
+    extremeFloorDeclinePercent: z.number().positive().default(90.0)
   }),
   targetCollections: z.array(TargetCollectionSchema),
   seaport: z.object({

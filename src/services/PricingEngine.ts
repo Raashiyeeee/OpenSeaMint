@@ -16,6 +16,8 @@ export class PricingEngine {
   public evaluateOfferScenario(params: {
     offerPriceUsd: number;
     floorPriceUsd: number;
+    referenceFloorUsd?: number;
+    mintCompleted?: boolean;
     royaltyPercent: number; // e.g. 10 for 10%
     marketplaceFeePercent?: number; // e.g. 0.5 for 0.5%
     networkGasUsd?: number;
@@ -33,6 +35,9 @@ export class PricingEngine {
     checkACapitalPassed: boolean;
     checkBProfitPassed: boolean;
     checkFFloorRatioPassed: boolean;
+    checkMintCompletedPassed: boolean;
+    checkMarketDumpPassed: boolean;
+    floorDeclinePercent: number;
     isProfitable: boolean;
     decision: 'ACCEPT' | 'REJECT';
     reason: string;
@@ -40,6 +45,8 @@ export class PricingEngine {
     const {
       offerPriceUsd,
       floorPriceUsd,
+      referenceFloorUsd,
+      mintCompleted = true,
       royaltyPercent,
       marketplaceFeePercent = 0.5,
       networkGasUsd = 0.0,
@@ -77,11 +84,23 @@ export class PricingEngine {
     // Check F: Minimum Floor Difference (Rule 3 & 4: Floor Price >= Offer Price * 1.40, excluding creator fees from this comparison)
     const checkFFloorRatioPassed = offerPriceUsd > 0 && floorPriceUsd >= (offerPriceUsd * minFloorMultiplier - 0.000001);
 
-    const isProfitable = checkACapitalPassed && checkBProfitPassed && (enforceFloorRatio ? checkFFloorRatioPassed : true);
+    // Condition 1: Incomplete Public Mint Protection
+    const checkMintCompletedPassed = mintCompleted !== false;
+
+    // Condition 2: Market Dump Protection
+    const refFloorUsd = referenceFloorUsd && referenceFloorUsd > 0 ? referenceFloorUsd : floorPriceUsd;
+    const floorDeclinePercent = refFloorUsd > 0 ? roundToPrecision(((refFloorUsd - floorPriceUsd) / refFloorUsd) * 100, 2) : 0;
+    const checkMarketDumpPassed = floorDeclinePercent < 40.0;
+
+    const isProfitable = checkACapitalPassed && checkBProfitPassed && (enforceFloorRatio ? checkFFloorRatioPassed : true) && checkMintCompletedPassed && checkMarketDumpPassed;
     const decision: 'ACCEPT' | 'REJECT' = isProfitable ? 'ACCEPT' : 'REJECT';
 
     let reason = 'All criteria passed';
-    if (!checkACapitalPassed) {
+    if (!checkMintCompletedPassed) {
+      reason = 'Incomplete Public Mint: Public mint has not completed successfully or collection lacks sufficient mint demand. Strict Rejection ❌';
+    } else if (!checkMarketDumpPassed) {
+      reason = `Market Dump Protection: Floor declined by ${floorDeclinePercent.toFixed(1)}% >= 40% threshold (Reference: $${refFloorUsd.toFixed(2)}, Current: $${floorPriceUsd.toFixed(2)}). Strict Rejection ❌`;
+    } else if (!checkACapitalPassed) {
       reason = `Check A Failed: Required capital ($${offerPriceUsd.toFixed(2)}) exceeds available capital ($${availableCapitalUsd.toFixed(2)})`;
     } else if (expectedNetProfitUsd <= 0) {
       reason = `Check B Failed: Trade yields negative or zero net profit ($${expectedNetProfitUsd.toFixed(2)}) after royalties ($${royaltyUsd.toFixed(2)}), fees ($${marketplaceFeeUsd.toFixed(2)}), and gas ($${gasUsd.toFixed(2)})`;
@@ -100,6 +119,9 @@ export class PricingEngine {
       checkACapitalPassed,
       checkBProfitPassed,
       checkFFloorRatioPassed,
+      checkMintCompletedPassed,
+      checkMarketDumpPassed,
+      floorDeclinePercent,
       isProfitable,
       decision,
       reason
@@ -286,12 +308,13 @@ export class PricingEngine {
     const netProfitUsd = roundToPrecision(netProfitEth * ethPriceUsd, 2);
     const marginPercent = finalBidEth > 0 ? (netProfitEth / finalBidEth) * 100 : 0;
 
-    // Final Buy Filter (NFT Offer Eligibility Rules):
+    // Final Buy Filter (NFT Offer Eligibility Rules & Protections):
     // Rule 1: 10+ completed sales within 3 hours in native ETH (WETH strictly excluded)
     // Rule 2: Genuine completed sales around current floor-price range (offer acceptances excluded)
     // Rule 3: Floor Price >= Offer Price * 1.40 (current floor at least 40% higher than offer)
     // Rule 4: Creator fee excluded from the 40% floor-to-offer price comparison
-    // Rule 5: Mandatory rejection if any condition fails
+    // Condition 1: Incomplete Public Mint — Strict Rejection
+    // Condition 2: Market Dump Protection — Floor decline < 40%
     const sales3Hours = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
     const uniqueWallets3Hours = marketData.uniqueWallets3Hours ?? marketData.uniqueWallets1Hour ?? 0;
     const minSales = this.config.liquidity?.minSales3Hours ?? 10;
@@ -305,12 +328,25 @@ export class PricingEngine {
     const checkACapitalPassed = finalBidEth <= maxCapitalEth && finalBidEth > 0 && bidPriceUsd <= maxBuyPriceUsd;
     const checkBProfitPassed = netProfitUsd > 0 && marginPercent >= (minMarginPercent - 0.5) && competitivePassed;
 
+    // Condition 1: Incomplete Public Mint Protection
+    const mintCheck = this.verifyMintCompletion(marketData);
+    const checkMintCompletedPassed = mintCheck.passed;
+
+    // Condition 2: Market Dump Protection
+    const refFloorEth = marketData.referenceFloorEth && marketData.referenceFloorEth > 0 ? marketData.referenceFloorEth : floor;
+    const floorDeclinePercent = refFloorEth > 0 ? roundToPrecision(((refFloorEth - floor) / refFloorEth) * 100, 2) : 0;
+    const checkMarketDumpPassed = floorDeclinePercent < 40.0;
+
     // Rule 5: Mandatory Rejection if any condition fails
-    const isProfitable = checkLLiquidityPassed && checkFFloorRatioPassed && checkACapitalPassed && checkBProfitPassed;
+    const isProfitable = checkLLiquidityPassed && checkFFloorRatioPassed && checkACapitalPassed && checkBProfitPassed && checkMintCompletedPassed && checkMarketDumpPassed;
     const decision: 'ACCEPT' | 'REJECT' = isProfitable ? 'ACCEPT' : 'REJECT';
 
     let reason = 'All criteria passed: Liquidity, Floor Ratio, Capital, and Profitability verified';
-    if (!checkLLiquidityPassed) {
+    if (!checkMintCompletedPassed) {
+      reason = mintCheck.reason;
+    } else if (!checkMarketDumpPassed) {
+      reason = `Market Dump Protection: Floor declined by ${floorDeclinePercent.toFixed(1)}% (Reference: ${refFloorEth} ETH, Current: ${floor} ETH), reaching or exceeding 40% decline limit. Strict Rejection ❌`;
+    } else if (!checkLLiquidityPassed) {
       reason = marketData.liquidityReason || `Liquidity Check Failed: ${sales3Hours}/${minSales} qualified floor sales in last 3h, ${uniqueWallets3Hours}/${minWallets} unique wallets (offer sales excluded).`;
     } else if (!checkFFloorRatioPassed) {
       reason = `Floor Ratio Check Failed: Current floor ($${floorUsd.toFixed(2)}) is not at least ${((minFloorMultiplier - 1) * 100).toFixed(0)}% above offer ($${bidPriceUsd.toFixed(2)}). Formula Floor Price >= Offer Price * 1.40 required (creator fees excluded).`;
@@ -353,9 +389,51 @@ export class PricingEngine {
       checkFFloorRatioPassed,
       checkACapitalPassed,
       checkBProfitPassed,
+      checkMintCompletedPassed,
+      checkMarketDumpPassed,
+      floorDeclinePercent,
       isProfitable,
       decision,
       reason
+    };
+  }
+
+  /**
+   * Condition 1: Incomplete Public Mint — Strict Rejection
+   * Verifies that the public mint has ended or demonstrably completed its intended mint phase.
+   */
+  public verifyMintCompletion(marketData: CollectionMarketData): {
+    passed: boolean;
+    reason: string;
+  } {
+    if (marketData.mintCompleted === false) {
+      return {
+        passed: false,
+        reason: marketData.mintDemandReason || 'Incomplete Public Mint: Public mint has not completed successfully. Strict Rejection ❌'
+      };
+    }
+
+    if (marketData.isMinting === true) {
+      const total = marketData.totalSupply || 0;
+      const max = marketData.maxSupply || total;
+      if (max > 0 && total < max * 0.98) {
+        return {
+          passed: false,
+          reason: `Incomplete Public Mint: Public mint is still active and supply remains incomplete (${total}/${max} minted). Collection is still struggling to sell out available supply. Strict Rejection ❌`
+        };
+      }
+    }
+
+    if (marketData.liquidityPassed === false) {
+      return {
+        passed: false,
+        reason: `Mint-Demand / Secondary Demand Failed: Collection lacks verified secondary-market liquidity (${marketData.liquidityReason || 'low volume/diversity'}). Strict Rejection ❌`
+      };
+    }
+
+    return {
+      passed: true,
+      reason: 'Mint completion and secondary-market demand verified ✅'
     };
   }
 
