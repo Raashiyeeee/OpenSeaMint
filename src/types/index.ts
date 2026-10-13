@@ -219,7 +219,7 @@ export interface InventoryItem {
   currentListingPriceEth?: number;
   currentListingPriceUsd?: number;
   listingOrderId?: string;
-  status: 'PENDING_LISTING' | 'LISTED' | 'HOLDING' | 'SOLD' | 'ERROR';
+  status: 'PENDING_LISTING' | 'LISTED' | 'HOLDING' | 'SOLD' | 'ERROR' | 'TRANSFERRED';
   ownershipStatus?: NftOwnershipStatus;
   listingStatus?: NftListingStatus;
   saleConfirmation?: NftSaleConfirmation;
@@ -249,6 +249,7 @@ export interface ActiveOffer {
   cancellationError?: string;
   lastCancellationAttempt?: number;
   flaggedForAttention?: boolean;
+  fillableUntil?: number; // offchain-cancelled offer may still be filled until this time (ms)
   orderComponents?: any;
   signature?: string;
 }
@@ -267,4 +268,14 @@ export interface OfferCyclePauseState {
   pausedAt?: number;
   purchasedCountAtPause: number;
   soldSincePause: number;
+}
+
+export interface MintSupplySources {
+  collectionTotalSupply?: number;
+  collectionIsMinting?: boolean;
+  dropTotalSupply?: number;
+  dropMaxSupply?: number;
+  dropIsMinting?: boolean;
+  onChainTotalSupply?: number;
+  onChainMaxSupply?: number;
 }

@@ -460,8 +460,8 @@ reconcileInvManager.addInventoryItem({
 });
 assert.strictEqual(reconcileInvManager.getInventoryCount(), 1, 'Inventory count should be 1');
 
-// Now simulate user sold the NFT on OpenSea/wallet: Wallet now has 0 NFTs
-const removed = reconcileInvManager.reconcileWalletInventory([]);
+// Now simulate user sold the NFT on OpenSea/wallet: Wallet now has 0 NFTs and a confirmed sale event exists
+const removed = reconcileInvManager.reconcileWalletInventory([], 2700, new Map([['0xcontract1:100', { salePriceEth: 0.0015, txHash: '0xsale13' }]]));
 assert.strictEqual(removed.length, 1, 'Should reconcile and remove sold NFT');
 assert.strictEqual(reconcileInvManager.getInventoryCount(), 0, 'Inventory count must reset to 0');
 assert.strictEqual(reconcileInvManager.canBidOnCollection('slug-a', 5), true, 'Bidding must be allowed once inventory is cleared');
@@ -1472,8 +1472,8 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     status: 'LISTED'
   });
 
-  // Reconcile when NFT is sold on-chain (disappears from wallet)
-  const reconciledSales = postSaleInvManager.reconcileWalletInventory([]);
+  // Reconcile when NFT is sold on-chain (disappears from wallet AND a confirmed sale event exists)
+  const reconciledSales = postSaleInvManager.reconcileWalletInventory([], 2700, new Map([[`${testSoldContract.toLowerCase()}:888`, { salePriceEth: 0.0025, txHash: '0xsale18c' }]]));
   assert.strictEqual(reconciledSales.length, 1, 'Reconciliation must detect 1 sold NFT');
   assert.strictEqual(reconciledSales[0].netProceedsEth, 0.002475, 'Reconciled sale proceeds must be 0.002475 ETH (0.0025 - 1% fee)');
 

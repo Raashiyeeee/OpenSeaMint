@@ -142,7 +142,14 @@ async function main() {
       const tokenId = eventData.item?.nft_id?.split('/')?.[2] || '';
       const contract = eventData.item?.nft_id?.split('/')?.[1] || '';
       const identifier = `${contract.toLowerCase()}:${tokenId}`;
-      const salePriceEth = parseFloat(eventData.payment_token?.eth_price || '0');
+      // Stream item_sold: sale_price is the total in the payment token's base units; convert to ETH via
+      // payment_token.decimals and payment_token.eth_price (1 for ETH).
+      const decimals = Number(eventData.payment_token?.decimals ?? 18);
+      const tokenEthPrice = parseFloat(eventData.payment_token?.eth_price || '1') || 1;
+      const salePriceEth = eventData.sale_price
+        ? (parseFloat(eventData.sale_price) / Math.pow(10, decimals)) * tokenEthPrice
+        : 0;
+      const txHash: string | undefined = eventData.transaction?.hash;
       const ethPriceUsd = await apiService.getEthPriceUsd();
       const gasUsd = config.networks['robinhood']?.estimatedGasCostUsd || 0.01;
 
@@ -151,7 +158,8 @@ async function main() {
         salePriceEth > 0 ? salePriceEth : undefined,
         ethPriceUsd,
         100,
-        gasUsd
+        gasUsd,
+        txHash
       );
       logger.info(
         {

@@ -9,13 +9,15 @@ A production-grade, secure, and event-driven NFT trading bot designed to trade o
 | Parameter | Robinhood Chain | Ethereum Mainnet |
 | :--- | :--- | :--- |
 | **Network Name** | Robinhood Chain | Ethereum Mainnet |
-| **Chain ID** | `466` | `1` |
-| **RPC URL** | `https://rpc.robinhoodchain.com` | `https://ethereum-rpc.publicnode.com` |
+| **Chain ID** | `4663` | `1` |
+| **RPC URL** | `https://rpc.mainnet.chain.robinhood.com` (public, rate-limited; override with `ROBINHOOD_RPC_URL`) | `https://ethereum-rpc.publicnode.com` (override with `ETHEREUM_RPC_URL`) |
 | **Currency** | `ETH` | `ETH` |
-| **Block Explorer** | [Robinhood Explorer](https://explorer.robinhoodchain.com) | [Etherscan](https://etherscan.io) |
+| **Block Explorer** | [Robinhood Explorer](https://robinhoodchain.blockscout.com) | [Etherscan](https://etherscan.io) |
 | **Estimated Gas** | ~$0.01 (Micro-fee friendly) | ~$3.50+ (Gas check protects capital) |
 
-Switch networks simply by setting `NETWORK=robinhood` or `NETWORK=mainnet` in `.env`.
+Select networks with `ACTIVE_NETWORKS=robinhood` or `ACTIVE_NETWORKS=robinhood,mainnet` in `.env`.
+
+**RPC keys:** never put provider API keys in `config/default.json`. Set private RPC URLs (e.g. `https://robinhood-mainnet.g.alchemy.com/v2/<YOUR_KEY>`) only via `ROBINHOOD_RPC_URL` / `ETHEREUM_RPC_URL` in your untracked `.env`.
 
 ---
 
@@ -144,8 +146,11 @@ cp .env.example .env
 ```
 Edit `.env` to select network:
 ```env
-NETWORK=robinhood
-RPC_URL=https://rpc.robinhoodchain.com
+ACTIVE_NETWORKS=robinhood
+ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com   # or your private provider URL (keep it in .env only)
+ETHEREUM_RPC_URL=https://ethereum-rpc.publicnode.com
+OPENSEA_API_KEY=your_opensea_api_key_here
+INVENTORY_STATE_PATH=./data/inventory-state.json            # persisted owned-NFT / pause state
 BOT_MODE=SIMULATION # Or LIVE
 PRIVATE_KEY=your_private_key_here
 ```
