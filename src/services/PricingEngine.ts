@@ -69,8 +69,8 @@ export class PricingEngine {
       minOfferPriceUsd = this.config.capital?.minOfferPriceUsd ?? 1.00,
       liquidityDiscountPercent = 0.0,
       minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30,
-      enforceFloorRatio = false,
-      minMarginPercent,
+      enforceFloorRatio = true,
+      minMarginPercent = this.config.profitTargets?.defaultMinMarginPercent ?? 15.0,
       sales3Hours,
       minSales3Hours = this.config.liquidity?.minSales3Hours ?? 10
     } = params;
@@ -114,7 +114,7 @@ export class PricingEngine {
     const checkMinOfferPassed = offerPriceUsd >= minOfferPriceUsd;
 
     // Check B: Profitability check (including creator fees and all costs)
-    const marginCheckPassed = minMarginPercent !== undefined ? marginPercent >= minMarginPercent : true;
+    const marginCheckPassed = marginPercent >= minMarginPercent;
     const checkBProfitPassed = expectedNetProfitUsd >= minNetProfitUsd && expectedNetProfitUsd > 0 && marginCheckPassed;
 
     // Check F: Minimum Floor Difference (Formula 1: Floor Price >= Offer Price * 1.30, excluding creator fees from this comparison)
@@ -156,7 +156,7 @@ export class PricingEngine {
     } else if (expectedNetProfitUsd <= 0) {
       reason = `Check B Failed: Trade yields negative or zero net profit ($${expectedNetProfitUsd.toFixed(2)}) after royalties ($${royaltyUsd.toFixed(2)}), fees ($${marketplaceFeeUsd.toFixed(2)}), and gas ($${gasUsd.toFixed(2)})`;
     } else if (!checkBProfitPassed) {
-      reason = `Check B Failed: Expected net profit ($${expectedNetProfitUsd.toFixed(2)}) is below minimum threshold ($${minNetProfitUsd.toFixed(2)})`;
+      reason = `Check B Failed: Expected net profit ($${expectedNetProfitUsd.toFixed(2)}, margin ${marginPercent.toFixed(1)}%) is below minimum threshold ($${minNetProfitUsd.toFixed(2)} / ${minMarginPercent}% margin)`;
     } else if (enforceFloorRatio && !checkFFloorRatioPassed) {
       reason = `Floor Ratio Check Failed: Current floor ($${floorPriceUsd.toFixed(2)}) is not at least ${((minFloorMultiplier - 1) * 100).toFixed(0)}% above offer ($${offerPriceUsd.toFixed(2)}). Formula Floor Price >= Offer Price * ${minFloorMultiplier.toFixed(2)} required (creator fees excluded).`;
     }
@@ -414,10 +414,11 @@ export class PricingEngine {
 
     // Fee percentages
     const openseaFeeRate = marketData.openseaFeeBps / 10000;
-    const royaltyFeeRate = Math.min(
-      marketData.royaltyFeeBps / 10000,
-      this.config.fees.maxAcceptableRoyaltyBps / 10000
-    );
+    // Profitability Rule: the FULL applicable (mandatory) creator fee is included in costs.
+    // It is never capped down to maxAcceptableRoyaltyBps (that would understate costs); instead,
+    // collections whose mandatory creator fee exceeds the acceptable ceiling are rejected below.
+    const royaltyFeeRate = Math.max(0, marketData.royaltyFeeBps || 0) / 10000;
+    const royaltyWithinCeiling = (marketData.royaltyFeeBps || 0) <= this.config.fees.maxAcceptableRoyaltyBps;
     const totalFeeRate = openseaFeeRate + royaltyFeeRate;
 
     // Fees on sale
@@ -443,6 +444,8 @@ export class PricingEngine {
     // 1. Calculate Maximum Profitable Bid Price
     const minMarginPercent = targetConfig?.minMarginPercent ?? this.config.profitTargets.defaultMinMarginPercent ?? 15.0;
     const maxMarginBidEth = netProceedsAfterGasEth / (1 + (minMarginPercent / 100));
+    // Minimum required net profit (USD) ceiling: bid + all costs + minNetProfit <= expected revenue
+    const maxNetProfitBidEth = netProceedsAfterGasEth - targetProfitEth;
     
     // Floor ratio ceiling (Floor Price >= Offer Price * 1.30, excluding creator fees from this comparison)
     const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30;
@@ -456,6 +459,7 @@ export class PricingEngine {
 
     let maxProfitableBidEth = Math.min(
       maxMarginBidEth,
+      maxNetProfitBidEth,
       maxOfferFloorRuleEth,
       floorDiscountLimit,
       maxCapitalEth,
@@ -527,8 +531,9 @@ export class PricingEngine {
     // Rule 4: Creator fee excluded from the 30% floor-to-offer price comparison
     // Condition 1: Incomplete Public Mint — Strict Rejection
     // Condition 2: Market Dump Protection — Floor decline < 40%
-    const sales3Hours = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
-    const uniqueWallets3Hours = marketData.uniqueWallets3Hours ?? marketData.uniqueWallets1Hour ?? 0;
+    // Recent Floor Sales Rule: only the 3-hour native ETH floor-sale count is valid (never fall back to 1h/24h data)
+    const sales3Hours = marketData.sales3Hours ?? 0;
+    const uniqueWallets3Hours = marketData.uniqueWallets3Hours ?? 0;
     const minSales = this.config.liquidity?.minSales3Hours ?? 10;
     const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 5;
 
@@ -546,7 +551,14 @@ export class PricingEngine {
     const minOfferPriceEth = minOfferPriceUsd / ethPriceUsd;
     const checkMinOfferPassed = bidPriceUsd >= minOfferPriceUsd && finalBidEth >= (minOfferPriceEth - 0.000001);
 
-    const checkBProfitPassed = netProfitUsd > 0 && marginPercent >= (minMarginPercent - 0.5) && competitivePassed;
+    // Check B: Net profit (after purchase price, creator fees, marketplace fees and gas) must meet BOTH the
+    // configured minimum net profit (USD) and the minimum profit margin. No tolerance below the configured margin.
+    const checkBProfitPassed =
+      netProfitUsd > 0 &&
+      netProfitEth >= targetProfitEth - 1e-12 &&
+      marginPercent >= minMarginPercent &&
+      royaltyWithinCeiling &&
+      competitivePassed;
 
     // Condition 1: Incomplete Public Mint Protection
     const mintCheck = this.verifyMintCompletion(marketData);
@@ -580,6 +592,10 @@ export class PricingEngine {
       reason = competitiveReason;
     } else if (netProfitUsd <= 0) {
       reason = `Check B Failed: Net profit ($${netProfitUsd.toFixed(2)}) is negative or zero after royalties, fees, and gas`;
+    } else if (!royaltyWithinCeiling) {
+      reason = `Check B Failed: Mandatory creator fee (${marketData.royaltyFeeBps} bps) exceeds maximum acceptable creator fee (${this.config.fees.maxAcceptableRoyaltyBps} bps).`;
+    } else if (netProfitEth < targetProfitEth - 1e-12) {
+      reason = `Check B Failed: Net profit ($${netProfitUsd.toFixed(2)}) is below minimum required net profit ($${minNetProfit.toFixed(2)}) after creator fees, marketplace fees, and gas.`;
     } else if (marginPercent < minMarginPercent) {
       reason = `Check B Failed: Margin (${marginPercent.toFixed(1)}%) is below minimum net profit threshold (${minMarginPercent}%).`;
     }
@@ -668,8 +684,16 @@ export class PricingEngine {
       };
     }
 
-    // Unverified mint status rejection (Rule 4: If status cannot be verified, do not place offer)
-    if (marketData.mintStatusVerified === false) {
+    // Unverified mint status rejection (Rule 4: If status cannot be verified, do not place offer).
+    // Mint-out must be POSITIVELY verified: explicit verified flag AND known supply with totalSupply >= maxSupply.
+    // Missing/unknown supply data is treated as "cannot be verified" -> REJECT.
+    if (
+      marketData.mintStatusVerified !== true ||
+      max === undefined ||
+      max <= 0 ||
+      total === undefined ||
+      total < max
+    ) {
       return {
         passed: false,
         reason: 'Incomplete Public Mint: Mint-out status cannot be verified from reliable marketplace data. Core rule: If status cannot be verified, DO NOT OFFER ❌'
@@ -715,7 +739,8 @@ export class PricingEngine {
     const estimatedGasCostEth = estimatedGasCostUsd / ethPriceUsd;
 
     const openseaFeeRate = (marketData.openseaFeeBps || 50) / 10000;
-    const royaltyFeeRate = (marketData.royaltyFeeBps || 50) / 10000;
+    // Use ?? so a disabled optional creator fee (0 bps) stays 0 instead of being replaced by a default
+    const royaltyFeeRate = (marketData.royaltyFeeBps ?? 50) / 10000;
     const totalFeeRate = openseaFeeRate + royaltyFeeRate;
 
     // Hard rule: List price must NEVER be below acquiredPriceEth (Rule 6)

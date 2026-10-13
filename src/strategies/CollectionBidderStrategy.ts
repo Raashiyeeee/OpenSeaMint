@@ -32,6 +32,41 @@ export class CollectionBidderStrategy {
   }
 
   /**
+   * Offer lifetime: offers must never stay active longer than 20 minutes. The configured
+   * offerExpirationMinutes may shorten this, but can never extend it past 20 minutes.
+   */
+  public getOfferMaxAgeMinutes(): number {
+    const configured = this.config.general.offerExpirationMinutes || 20;
+    return Math.min(configured, 20);
+  }
+
+  /**
+   * 100% Mint-Out Rule — re-verified immediately before EVERY offer submission (initial offers,
+   * automatic re-offers and single-token offers) using FRESHLY fetched marketplace data.
+   * If mint-out is incomplete or cannot be verified (including API failure), the offer is rejected.
+   */
+  public async reverifyMintOutBeforeOffer(
+    collectionSlug: string,
+    contractAddress: string
+  ): Promise<{ passed: boolean; reason: string }> {
+    try {
+      const freshData = await this.apiService.getCollectionMarketData(collectionSlug, contractAddress);
+      const check = this.pricingEngine.verifyMintCompletion(freshData);
+      if (!check.passed) {
+        logger.error(
+          { slug: collectionSlug, reason: check.reason },
+          `FINAL OFFER-EXECUTION BLOCKED 🛑: Fresh mint-out re-verification failed. ${check.reason}`
+        );
+      }
+      return check;
+    } catch (err: any) {
+      const reason = `Mint-out status could not be re-verified before offer (${err.message}). Core rule: If status cannot be verified, DO NOT OFFER ❌`;
+      logger.error({ slug: collectionSlug, err: err.message }, `FINAL OFFER-EXECUTION BLOCKED 🛑: ${reason}`);
+      return { passed: false, reason };
+    }
+  }
+
+  /**
    * Automatic Offer Cancellation & Verification Helper:
    * 1. Marks offer as CANCELLATION_PENDING (capital stays locked!)
    * 2. Requests marketplace cancellation from OpenSea API
@@ -203,7 +238,7 @@ export class CollectionBidderStrategy {
 
     // 0. Automatic Offer Cancellation:
     // a. 20-Minute Expiry Rule: Cancel unaccepted offers after 20 minutes
-    await this.processAutomaticOfferCancellations(this.config.general.offerExpirationMinutes || 20);
+    await this.processAutomaticOfferCancellations(this.getOfferMaxAgeMinutes());
     // b. Cancel When Outbid Rule: Automatically cancel existing offers if outbid by another buyer
     await this.processOutbidOfferCancellations();
 
@@ -323,7 +358,7 @@ export class CollectionBidderStrategy {
 
       if (existingOffer.status === 'ACTIVE') {
         const isOutbid = marketData.topOfferEth > existingOffer.priceEth;
-        const isExpired = Date.now() - existingOffer.createdTimestamp >= (this.config.general.offerExpirationMinutes || 20) * 60 * 1000;
+        const isExpired = Date.now() - existingOffer.createdTimestamp >= this.getOfferMaxAgeMinutes() * 60 * 1000;
 
         if (isOutbid || isExpired) {
           const cancelReason = isOutbid
@@ -363,7 +398,7 @@ export class CollectionBidderStrategy {
     // The bot must place offers only on NFT collections with at least 10 or more completed
     // floor-price sales within the last 3 hours, using native ETH.
     const minFloorSales = this.config.liquidity?.minSales3Hours ?? 10;
-    const sales3h = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    const sales3h = marketData.sales3Hours ?? 0;
     if (sales3h < minFloorSales || marketData.liquidityPassed === false) {
       logger.info(
         {
@@ -546,7 +581,7 @@ export class CollectionBidderStrategy {
 
     // 4) NFT Recent Floor Sales Requirement (>= 10 completed floor-price sales in 3h with native ETH)
     const minFloorSalesRequired = this.config.liquidity?.minSales3Hours ?? 10;
-    const floorSales3h = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    const floorSales3h = marketData.sales3Hours ?? 0;
     if (floorSales3h < minFloorSalesRequired) {
       logger.error(
         {
@@ -561,11 +596,17 @@ export class CollectionBidderStrategy {
       return;
     }
 
+    // 5) Fresh 100% Mint-Out re-verification immediately before signing/posting (covers automatic re-offers)
+    const freshMintCheck = await this.reverifyMintOutBeforeOffer(target.slug, target.contractAddress);
+    if (!freshMintCheck.passed) {
+      return;
+    }
+
     // 8. SIGN SEAPORT COLLECTION OFFER (Off-chain EIP-712 with required fee recipients)
     const { orderComponents, signature } = await this.seaportService.createSignedCollectionOffer(
       target.contractAddress,
       calculation.bidPriceEth,
-      this.config.general.offerExpirationMinutes,
+      this.getOfferMaxAgeMinutes(),
       targetNetwork,
       marketData.fees
     );
@@ -607,11 +648,18 @@ export class CollectionBidderStrategy {
               continue;
             }
 
+            // 100% Mint-Out Rule: re-verify before EVERY single-token offer
+            const tokenMintCheck = await this.reverifyMintOutBeforeOffer(target.slug, target.contractAddress);
+            if (!tokenMintCheck.passed) {
+              logger.info({ tokenId: tok.tokenId, slug: target.slug, reason: tokenMintCheck.reason }, 'NFT OFFER SKIPPED: Mint-out not verified');
+              break;
+            }
+
             const { orderComponents: itemComponents, signature: itemSig } = await this.seaportService.createSignedItemOffer(
               target.contractAddress,
               tok.tokenId,
               calculation.bidPriceEth,
-              this.config.general.offerExpirationMinutes,
+              this.getOfferMaxAgeMinutes(),
               targetNetwork,
               marketData.fees
             );
@@ -633,7 +681,7 @@ export class CollectionBidderStrategy {
               priceEth: calculation.bidPriceEth,
               priceUsd: calculation.bidPriceUsd,
               createdTimestamp: Date.now(),
-              expiresTimestamp: Date.now() + (this.config.general.offerExpirationMinutes || 20) * 60 * 1000,
+              expiresTimestamp: Date.now() + this.getOfferMaxAgeMinutes() * 60 * 1000,
               status: 'ACTIVE',
               orderComponents: itemComponents,
               signature: itemSig
@@ -656,7 +704,7 @@ export class CollectionBidderStrategy {
       priceEth: calculation.bidPriceEth,
       priceUsd: calculation.bidPriceUsd,
       createdTimestamp: Date.now(),
-      expiresTimestamp: Date.now() + (this.config.general.offerExpirationMinutes || 20) * 60 * 1000,
+      expiresTimestamp: Date.now() + this.getOfferMaxAgeMinutes() * 60 * 1000,
       status: 'ACTIVE',
       orderComponents,
       signature
@@ -715,7 +763,7 @@ export class CollectionBidderStrategy {
 
       if (existingItemOffer.status === 'ACTIVE') {
         const isOutbid = marketData.topOfferEth > existingItemOffer.priceEth;
-        const isExpired = Date.now() - existingItemOffer.createdTimestamp >= (this.config.general.offerExpirationMinutes || 20) * 60 * 1000;
+        const isExpired = Date.now() - existingItemOffer.createdTimestamp >= this.getOfferMaxAgeMinutes() * 60 * 1000;
 
         if (isOutbid || isExpired) {
           const cancelReason = isOutbid
@@ -751,7 +799,7 @@ export class CollectionBidderStrategy {
 
     // 3.0. Recent Floor Sales Requirement Check
     const minItemFloorSales = this.config.liquidity?.minSales3Hours ?? 10;
-    const itemSales3h = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    const itemSales3h = marketData.sales3Hours ?? 0;
     if (itemSales3h < minItemFloorSales || marketData.liquidityPassed === false) {
       logger.info(
         { slug: params.collectionSlug, sales3Hours: itemSales3h, minItemFloorSales, reason: marketData.liquidityReason },
@@ -852,7 +900,7 @@ export class CollectionBidderStrategy {
 
     // 4) NFT Recent Floor Sales Requirement (>= 10 completed floor-price sales in 3h with native ETH)
     const minSingleFloorSales = this.config.liquidity?.minSales3Hours ?? 10;
-    const itemFloorSales3h = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    const itemFloorSales3h = marketData.sales3Hours ?? 0;
     if (itemFloorSales3h < minSingleFloorSales) {
       logger.error(
         {
@@ -870,12 +918,18 @@ export class CollectionBidderStrategy {
       };
     }
 
+    // 5) Fresh 100% Mint-Out re-verification immediately before signing/posting (covers automatic re-offers)
+    const freshItemMintCheck = await this.reverifyMintOutBeforeOffer(params.collectionSlug, params.contractAddress);
+    if (!freshItemMintCheck.passed) {
+      return { success: false, reason: freshItemMintCheck.reason };
+    }
+
     // 5. Sign & Post Item Offer
     const { orderComponents, signature } = await this.seaportService.createSignedItemOffer(
       params.contractAddress,
       params.tokenId,
       calculation.bidPriceEth,
-      this.config.general.offerExpirationMinutes,
+      this.getOfferMaxAgeMinutes(),
       targetNetwork,
       marketData.fees
     );
@@ -899,7 +953,7 @@ export class CollectionBidderStrategy {
       priceEth: calculation.bidPriceEth,
       priceUsd: calculation.bidPriceUsd,
       createdTimestamp: Date.now(),
-      expiresTimestamp: Date.now() + (this.config.general.offerExpirationMinutes || 20) * 60 * 1000,
+      expiresTimestamp: Date.now() + this.getOfferMaxAgeMinutes() * 60 * 1000,
       status: 'ACTIVE',
       orderComponents,
       signature
