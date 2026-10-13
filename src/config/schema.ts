@@ -64,7 +64,9 @@ const BotConfigSchema = z.object({
     loopIntervalMs: z.number().int().positive(),
     offerExpirationMinutes: z.number().int().positive(),
     listingExpirationDays: z.number().int().positive(),
-    ignoredCollections: z.array(z.string()).optional()
+    ignoredCollections: z.array(z.string()).optional(),
+    postSaleWethConvertPercent: z.number().positive().max(100).default(90.0),
+    postSaleGasReservePercent: z.number().nonnegative().max(100).default(10.0)
   }),
   capital: CapitalSchema,
   liquidity: LiquiditySchema.default({ minSales3Hours: 10, minUniqueWallets3Hours: 5, minFloorMultiplier: 1.40 }),

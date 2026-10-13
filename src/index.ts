@@ -160,14 +160,15 @@ async function main() {
         `NFT ${identifier} sold successfully! Capital released for next trade.`
       );
 
-      // AUTOMATIC POST-SALE ETH TO WETH SWAP RULE:
-      // Once the NFT is sold at the floor price, the ETH received must be automatically swapped back into WETH immediately.
+      // AUTOMATIC POST-SALE ETH TO WETH CONVERSION RULE:
+      // After an NFT is sold, the bot automatically converts 90% of the ETH received into WETH
+      // for future NFT offers and holds the remaining 10% of the ETH as a gas fee reserve.
       const targetNetwork = result.soldItem?.network || config.general.network || 'robinhood';
       logger.info(
         { identifier, targetNetwork, netProceedsEth: result.netProceedsEth },
-        'NFT SALE CONFIRMED: Automatically swapping received ETH back into WETH immediately...'
+        'NFT SALE CONFIRMED: Automatically converting 90% of received ETH into WETH (10% held for gas reserve)...'
       );
-      await seaportService.swapEthToWeth(result.netProceedsEth, targetNetwork);
+      await seaportService.handlePostSaleEthConversion(result.netProceedsEth, targetNetwork);
     } catch (err: any) {
       logger.error({ err }, 'Error processing nft_sold event');
     }

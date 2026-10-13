@@ -313,14 +313,24 @@ export class OpenSeaApiService {
       const wallets3Hours = new Set<string>();
 
       for (const sale of sales3HoursRaw) {
-        // Rule 1: Paid in native ETH. WETH sales must not count.
-        const symbol = (sale.payment?.symbol || sale.payment_token?.symbol || '').toUpperCase();
-        if (symbol !== 'ETH') {
-          // WETH sales and other non-ETH tokens must not count toward this requirement
+        // Must be an actual completed sale (exclude pending, cancelled, or failed events)
+        const status = (sale.status || '').toLowerCase();
+        if (status === 'pending' || status === 'cancelled' || status === 'failed' || status === 'reverted' || sale.is_completed === false) {
           continue;
         }
 
-        // Rule 2: Offer acceptances must not count toward this requirement
+        // Rule 1: Paid in native ETH. WETH sales and other non-native currencies must not count.
+        const symbol = (sale.payment?.symbol || sale.payment_token?.symbol || '').toUpperCase();
+        const tokenName = (sale.payment?.name || sale.payment_token?.name || '').toUpperCase();
+        const tokenAddr = (sale.payment?.token_address || sale.payment_token?.address || '').toLowerCase();
+        const wethAddresses = ['0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', '0x0bd7d308f8e1639fab988df18a8011f41eacad73'];
+
+        if (symbol !== 'ETH' || tokenName.includes('WRAPPED') || wethAddresses.includes(tokenAddr)) {
+          // WETH sales strictly excluded
+          continue;
+        }
+
+        // Rule 2: Accepted offers and non-completed sales must not count toward floor sales requirement
         const isOfferAcceptance =
           sale.order_type === 'offer' ||
           sale.order_type === 'collection_offer' ||
@@ -345,7 +355,7 @@ export class OpenSeaApiService {
           salePriceEth = parseFloat(sale.total_price) / Math.pow(10, dec);
         }
 
-        // Rule 2: Genuine completed sales must occur at or around the current floor price.
+        // Rule 3: Must be actual completed sales at the floor price.
         // If floorPriceEth <= 0 or salePriceEth <= 0, genuine floor sale cannot be verified
         if (floorPriceEth <= 0 || salePriceEth <= 0) {
           continue;
@@ -370,7 +380,7 @@ export class OpenSeaApiService {
         if (s.seller) wallets1Hour.add(s.seller.toLowerCase());
       }
 
-      // Final Buy Filter: Requires at least 10 completed native ETH floor sales within 3h AND 5+ unique wallets around floor
+      // Recent Floor Sales Requirement: Requires at least 10 completed native ETH floor sales within 3h AND 5+ unique wallets around floor
       const liquidityPassed = sales3Hours >= minSales && uniqueWallets3Hours >= minWallets;
 
       let liquidityReason = `Passed 3-hour native ETH floor liquidity check (${sales3Hours}/${minSales} sales, ${uniqueWallets3Hours}/${minWallets} unique wallets)`;

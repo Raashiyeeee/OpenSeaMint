@@ -329,8 +329,10 @@ export class PricingEngine {
     const minSales = this.config.liquidity?.minSales3Hours ?? 10;
     const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 5;
 
+    // NFT Recent Floor Sales Requirement:
+    // Requires at least 10 completed floor-price sales within last 3 hours using native ETH
     const checkLLiquidityPassed = marketData.liquidityPassed !== false &&
-      (sales3Hours >= minSales && uniqueWallets3Hours >= minWallets);
+      sales3Hours >= minSales && uniqueWallets3Hours >= minWallets;
 
     // Rule 3 & 4: Floor difference calculation compares raw Floor Price to Offer Price directly without creator fees
     const checkFFloorRatioPassed = finalBidEth > 0 && floor >= (finalBidEth * minFloorMultiplier - 0.000001);
@@ -364,7 +366,7 @@ export class PricingEngine {
     } else if (!checkMarketDumpPassed) {
       reason = `Market Dump Protection: Floor declined by ${floorDeclinePercent.toFixed(1)}% (Reference: ${refFloorEth} ETH, Current: ${floor} ETH), reaching or exceeding 40% decline limit. Strict Rejection ❌`;
     } else if (!checkLLiquidityPassed) {
-      reason = marketData.liquidityReason || `Liquidity Check Failed: ${sales3Hours}/${minSales} qualified floor sales in last 3h, ${uniqueWallets3Hours}/${minWallets} unique wallets (offer sales excluded).`;
+      reason = marketData.liquidityReason || `Recent Floor Sales Requirement Failed ❌: Only ${sales3Hours}/${minSales} completed native ETH floor sales in the last 3 hours (minimum ${minSales} required, WETH sales and accepted offers excluded).`;
     } else if (!checkFFloorRatioPassed) {
       reason = `Floor Ratio Check Failed: Current floor ($${floorUsd.toFixed(2)}) is not at least ${((minFloorMultiplier - 1) * 100).toFixed(0)}% above offer ($${bidPriceUsd.toFixed(2)}). Formula Floor Price >= Offer Price * ${minFloorMultiplier.toFixed(2)} required (creator fees excluded).`;
     } else if (bidPriceUsd > maxBuyPriceUsd) {

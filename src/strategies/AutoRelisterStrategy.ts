@@ -134,12 +134,12 @@ export class AutoRelisterStrategy {
       const net = sold.network || this.config.general.network || 'robinhood';
       logger.info(
         { identifier: sold.identifier, network: net, netProceedsEth: sold.netProceedsEth },
-        'NFT SALE CONFIRMED (RECONCILIATION): Automatically swapping received ETH back into WETH immediately...'
+        'NFT SALE CONFIRMED (RECONCILIATION): Automatically converting 90% of received ETH into WETH (10% held for gas reserve)...'
       );
       try {
-        await this.seaportService.swapEthToWeth(sold.netProceedsEth, net);
+        await this.seaportService.handlePostSaleEthConversion(sold.netProceedsEth, net);
       } catch (err: any) {
-        logger.error({ identifier: sold.identifier, err: err.message }, 'Failed to swap received ETH to WETH');
+        logger.error({ identifier: sold.identifier, err: err.message }, 'Failed to convert received ETH to WETH');
       }
     }
 
