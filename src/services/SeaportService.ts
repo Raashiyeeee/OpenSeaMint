@@ -1,6 +1,6 @@
 import { ethers, Wallet } from 'ethers';
 import { BotConfig, FeeRecipient } from '../types';
-import { toWeiString } from '../utils/math';
+import { toWeiString, roundToPrecision } from '../utils/math';
 import { logger } from '../utils/logger';
 
 // Standard Seaport EIP-712 types
@@ -683,6 +683,121 @@ export class SeaportService {
         '❌ AUTOMATIC WETH SWAP FAILED: Could not swap received ETH to WETH'
       );
       return { success: false, error: err.message, amountWrappedEth: 0 };
+    }
+  }
+
+  /**
+   * Automatic Post-Sale ETH to WETH Conversion Rule:
+   * After an NFT is sold, the bot automatically converts 90% of the ETH received
+   * into WETH for future NFT offers and holds the remaining 10% of the ETH as a gas fee reserve.
+   *
+   * @param receivedEth The net ETH proceeds received from the NFT sale
+   * @param networkKey Target network (defaults to configured network or 'robinhood')
+   */
+  public async handlePostSaleEthConversion(
+    receivedEth: number,
+    networkKey?: string
+  ): Promise<{
+    success: boolean;
+    txHash?: string;
+    amountWrappedEth: number;
+    gasReserveRetainedEth: number;
+    error?: string;
+  }> {
+    const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
+    const convertPercent = this.config.general.postSaleWethConvertPercent ?? 90.0;
+    const gasReservePercent = this.config.general.postSaleGasReservePercent ?? 10.0;
+
+    // Convert 90% into WETH, keep 10% as gas fee reserve
+    const amountToWrap = roundToPrecision((receivedEth * convertPercent) / 100, 6);
+    const gasReserveRetained = roundToPrecision((receivedEth * gasReservePercent) / 100, 6);
+
+    logger.info(
+      {
+        network: activeNetworkKey,
+        totalEthReceived: receivedEth,
+        convertPercent: `${convertPercent}%`,
+        amountToWrapEth: amountToWrap,
+        gasReservePercent: `${gasReservePercent}%`,
+        gasReserveRetainedEth: gasReserveRetained
+      },
+      `POST-SALE CONVERSION: Automatically converting ${convertPercent}% (${amountToWrap} ETH) of received ETH into WETH for future NFT offers, and holding ${gasReservePercent}% (${gasReserveRetained} ETH) as gas fee reserve.`
+    );
+
+    if (amountToWrap <= 0.000005) {
+      logger.warn(
+        { amountToWrap, receivedEth },
+        'POST-SALE CONVERSION: Amount to wrap is below dust threshold. Skipping swap.'
+      );
+      return {
+        success: true,
+        amountWrappedEth: 0,
+        gasReserveRetainedEth: gasReserveRetained
+      };
+    }
+
+    const swapRes = await this.swapEthToWeth(amountToWrap, activeNetworkKey);
+    return {
+      success: swapRes.success,
+      txHash: swapRes.txHash,
+      amountWrappedEth: swapRes.amountWrappedEth,
+      gasReserveRetainedEth: gasReserveRetained,
+      error: swapRes.error
+    };
+  }
+
+  /**
+   * Auto-rebalance / wrap available native ETH when WETH balance is insufficient for a bid.
+   * Wraps available ETH into WETH while keeping a 10% gas fee reserve (and at least minBalanceReserveEth).
+   */
+  public async autoWrapAvailableEthIfDeficit(
+    requiredWeth: number,
+    networkKey?: string
+  ): Promise<{ success: boolean; amountWrappedEth: number; txHash?: string }> {
+    const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
+    const networkInfo = this.config.networks?.[activeNetworkKey];
+
+    try {
+      if (process.env.BOT_MODE === 'SIMULATION') {
+        return { success: true, amountWrappedEth: 0 };
+      }
+
+      const provider = this.signer.provider || new ethers.JsonRpcProvider(networkInfo?.rpcUrl);
+      const nativeBalWei = await provider.getBalance(this.signer.address);
+      const nativeBalEth = parseFloat(ethers.formatEther(nativeBalWei));
+
+      const convertPercent = this.config.general.postSaleWethConvertPercent ?? 90.0;
+      const minGasReserve = this.config.general.minBalanceReserveEth ?? 0.0001;
+
+      // 10% gas reserve, at least minGasReserve
+      const tenPercentReserve = (nativeBalEth * (this.config.general.postSaleGasReservePercent ?? 10.0)) / 100;
+      const gasReserve = Math.max(minGasReserve, tenPercentReserve);
+
+      const wrappableEth = Math.max(0, nativeBalEth - gasReserve);
+      if (wrappableEth <= 0.00005) {
+        return { success: true, amountWrappedEth: 0 };
+      }
+
+      const amountToWrap = roundToPrecision(Math.min(wrappableEth, (nativeBalEth * convertPercent) / 100), 6);
+      if (amountToWrap <= 0.00005) {
+        return { success: true, amountWrappedEth: 0 };
+      }
+
+      logger.info(
+        {
+          network: activeNetworkKey,
+          nativeBalEth,
+          gasReserveRetainedEth: gasReserve,
+          amountToWrapEth: amountToWrap,
+          requiredWeth
+        },
+        'AUTO-REBALANCE: Insufficient WETH detected for offer but native ETH is available in wallet. Wrapping 90% into WETH while holding 10% gas reserve...'
+      );
+
+      return await this.swapEthToWeth(amountToWrap, activeNetworkKey);
+    } catch (err: any) {
+      logger.error({ err: err.message, network: activeNetworkKey }, 'Failed to auto-wrap native ETH');
+      return { success: false, amountWrappedEth: 0 };
     }
   }
 }

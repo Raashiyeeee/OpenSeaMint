@@ -41,6 +41,8 @@ export interface BotConfig {
     offerExpirationMinutes: number;
     listingExpirationDays: number;
     ignoredCollections?: string[];
+    postSaleWethConvertPercent?: number;
+    postSaleGasReservePercent?: number;
   };
   capital: CapitalConfig;
   liquidity: LiquidityConfig;

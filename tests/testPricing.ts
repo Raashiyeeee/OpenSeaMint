@@ -515,6 +515,79 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   assert.strictEqual(offerAcceptanceExcluded.liquidityPassed, false, 'Must reject when genuine floor sales < 10');
   console.log('Case 14b PASSED: Offer acceptances excluded. Only 8/10 floor sales -> REJECTED ✅');
 
+  // Case 14b2: Sales Older Than 3 Hours Exclusion
+  // 12 native ETH sales, but 5 are from 4 hours ago (older than 3h) and only 7 are within 3h
+  // Sales older than 3 hours must not count -> Only 7 valid sales -> REJECT!
+  (apiService as any).client = {
+    get: async () => ({
+      data: {
+        asset_events: [
+          // 7 sales within the last 2 hours
+          ...Array.from({ length: 7 }, (_, i) => ({
+            event_timestamp: nowSec - 3600,
+            payment: { symbol: 'ETH', quantity: '1000000000000000', decimals: 18 },
+            order_type: 'listing',
+            buyer: `0xbuyer_recent_${i}`,
+            seller: `0xseller_recent_${i}`
+          })),
+          // 5 sales from 4 hours ago (> 3 hours old)
+          ...Array.from({ length: 5 }, (_, i) => ({
+            event_timestamp: nowSec - (4 * 3600),
+            payment: { symbol: 'ETH', quantity: '1000000000000000', decimals: 18 },
+            order_type: 'listing',
+            buyer: `0xbuyer_old_${i}`,
+            seller: `0xseller_old_${i}`
+          }))
+        ]
+      }
+    })
+  };
+
+  const oldSalesExcluded = await apiService.getCollectionLiquidity('test-old-sales-exclude', 0.001);
+  assert.strictEqual(oldSalesExcluded.sales3Hours, 7, 'Sales older than 3 hours must not count');
+  assert.strictEqual(oldSalesExcluded.liquidityPassed, false, 'Must reject when valid sales in last 3h < 10');
+  console.log('Case 14b2 PASSED: Sales older than 3 hours excluded. Only 7/10 recent sales -> REJECTED ✅');
+
+  // Case 14b3: Non-completed / pending / cancelled sales must not count
+  (apiService as any).client = {
+    get: async () => ({
+      data: {
+        asset_events: [
+          // 8 completed sales
+          ...Array.from({ length: 8 }, (_, i) => ({
+            event_timestamp: nowSec - 1800,
+            payment: { symbol: 'ETH', quantity: '1000000000000000', decimals: 18 },
+            status: 'successful',
+            order_type: 'listing',
+            buyer: `0xbuyer_comp_${i}`,
+            seller: `0xseller_comp_${i}`
+          })),
+          // 2 pending sales (must not count)
+          {
+            event_timestamp: nowSec - 1800,
+            payment: { symbol: 'ETH', quantity: '1000000000000000', decimals: 18 },
+            status: 'pending',
+            buyer: '0xbuyer_pend1',
+            seller: '0xseller_pend1'
+          },
+          // 2 cancelled/failed sales (must not count)
+          {
+            event_timestamp: nowSec - 1800,
+            payment: { symbol: 'ETH', quantity: '1000000000000000', decimals: 18 },
+            status: 'failed',
+            buyer: '0xbuyer_fail1',
+            seller: '0xseller_fail1'
+          }
+        ]
+      }
+    })
+  };
+
+  const incompleteSalesExcluded = await apiService.getCollectionLiquidity('test-incomplete-exclude', 0.001);
+  assert.strictEqual(incompleteSalesExcluded.sales3Hours, 8, 'Incomplete/pending/failed sales must not count');
+  assert.strictEqual(incompleteSalesExcluded.liquidityPassed, false, 'Must reject when completed floor sales < 10');
+  console.log('Case 14b3 PASSED: Incomplete/pending/failed sales excluded. Only 8/10 completed sales -> REJECTED ✅');
+
   // Case 14c: Genuine Floor Sales Around Current Floor Price (Rule 2)
   // Floor is 0.001 ETH. 12 native ETH sales:
   // 10 sales at 0.001 ETH (within 80% - 135% floor range)
@@ -1222,11 +1295,11 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   console.log('Case 17m PASSED: Re-offer placed successfully after confirmed cancellation and all eligibility filters pass again! ✅\n');
 
   // --------------------------------------------------------------------------
-  // TEST 18: Automatic Post-Sale ETH to WETH Swap Rule
-  // Once the NFT is sold at the floor price, the ETH received must be automatically swapped
-  // back into WETH immediately via the WETH deposit() function.
+  // TEST 18: Automatic Post-Sale ETH to WETH Conversion Rule (90% WETH, 10% Gas Reserve)
+  // After an NFT is sold, the bot must automatically convert 90% of the ETH received into WETH
+  // for future NFT offers and hold the remaining 10% of the ETH as a gas fee reserve.
   // --------------------------------------------------------------------------
-  console.log('--- Test 18: Automatic Post-Sale ETH to WETH Swap Rule ---');
+  console.log('--- Test 18: Automatic Post-Sale ETH to WETH Conversion Rule (90% WETH, 10% Gas Reserve) ---');
   const postSaleInvManager = new InventoryManager(config);
   const testSoldContract = '0x9999888877776666555544443333222211110000';
   const testSoldTokenId = '777';
@@ -1258,7 +1331,7 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   assert.strictEqual(saleEventResult.soldItem?.network, 'robinhood', 'Sold item must retain network metadata');
   console.log('Case 18a PASSED: NFT sold at floor price. Net proceeds calculated accurately: ' + saleEventResult.netProceedsEth + ' ETH ✅');
 
-  // Step 3: Execute immediate automatic swap from received ETH to WETH via SeaportService
+  // Step 3: Execute immediate automatic conversion from received ETH: 90% to WETH, 10% held as gas fee reserve
   const testSigner = Wallet.createRandom();
   const testSeaport = new SeaportService(config, testSigner);
 
@@ -1266,13 +1339,14 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   const originalBotMode = process.env.BOT_MODE;
   process.env.BOT_MODE = 'SIMULATION';
 
-  const swapResult = await testSeaport.swapEthToWeth(saleEventResult.netProceedsEth, 'robinhood');
-  assert.strictEqual(swapResult.success, true, 'Immediate ETH to WETH swap must succeed');
-  assert.strictEqual(swapResult.amountWrappedEth, 0.00198, 'Amount wrapped must match net ETH proceeds received from floor sale');
+  const swapResult = await testSeaport.handlePostSaleEthConversion(saleEventResult.netProceedsEth, 'robinhood');
+  assert.strictEqual(swapResult.success, true, 'Immediate post-sale ETH conversion must succeed');
+  assert.strictEqual(swapResult.amountWrappedEth, 0.001782, 'Amount wrapped must be exactly 90% of net ETH proceeds (0.00198 * 0.9 = 0.001782 ETH)');
+  assert.strictEqual(swapResult.gasReserveRetainedEth, 0.000198, 'Gas reserve retained must be exactly 10% of net ETH proceeds (0.00198 * 0.1 = 0.000198 ETH)');
   assert(swapResult.txHash?.startsWith('0xsim_weth_deposit_'), 'Swap transaction hash must be recorded');
-  console.log('Case 18b PASSED: Received ETH (' + swapResult.amountWrappedEth + ' ETH) automatically swapped back into WETH immediately! ✅');
+  console.log('Case 18b PASSED: Received ETH (' + saleEventResult.netProceedsEth + ' ETH) automatically converted: 90% (' + swapResult.amountWrappedEth + ' ETH) -> WETH, 10% (' + swapResult.gasReserveRetainedEth + ' ETH) held as gas fee reserve! ✅');
 
-  // Step 4: Test wallet reconciliation trigger for immediate WETH swap
+  // Step 4: Test wallet reconciliation trigger for 90% WETH conversion and 10% gas fee reserve
   postSaleInvManager.addInventoryItem({
     identifier: `${testSoldContract.toLowerCase()}:888`,
     collectionSlug: 'swap-rule-collection',
@@ -1290,15 +1364,16 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   assert.strictEqual(reconciledSales.length, 1, 'Reconciliation must detect 1 sold NFT');
   assert.strictEqual(reconciledSales[0].netProceedsEth, 0.002475, 'Reconciled sale proceeds must be 0.002475 ETH (0.0025 - 1% fee)');
 
-  const reconcileSwap = await testSeaport.swapEthToWeth(reconciledSales[0].netProceedsEth, reconciledSales[0].network);
-  assert.strictEqual(reconcileSwap.success, true, 'Reconciled sale ETH to WETH swap must succeed');
-  assert.strictEqual(reconcileSwap.amountWrappedEth, 0.002475, 'Reconciled amount wrapped must match proceeds');
-  console.log('Case 18c PASSED: Reconciled sale automatically triggers immediate ETH to WETH swap! ✅\n');
+  const reconcileSwap = await testSeaport.handlePostSaleEthConversion(reconciledSales[0].netProceedsEth, reconciledSales[0].network);
+  assert.strictEqual(reconcileSwap.success, true, 'Reconciled sale ETH to WETH conversion must succeed');
+  assert.strictEqual(reconcileSwap.amountWrappedEth, 0.002228, 'Reconciled amount wrapped must be exactly 90% of proceeds (0.002475 * 0.9 = 0.002228 ETH)');
+  assert.strictEqual(reconcileSwap.gasReserveRetainedEth, 0.000248, 'Reconciled gas reserve retained must be exactly 10% of proceeds (0.002475 * 0.1 = 0.000248 ETH)');
+  console.log('Case 18c PASSED: Reconciled sale automatically triggers 90% WETH conversion (' + reconcileSwap.amountWrappedEth + ' ETH) & 10% gas reserve (' + reconcileSwap.gasReserveRetainedEth + ' ETH)! ✅\n');
 
   process.env.BOT_MODE = originalBotMode;
 
   console.log('================================================================');
-  console.log('All 18 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory, NFT Eligibility, Re-Bidding, Mint & Market Dump, 20-Minute Cancellation, and Post-Sale WETH Swap tests passed successfully!');
+  console.log('All 18 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory, NFT Eligibility, Re-Bidding, Mint & Market Dump, 20-Minute Cancellation, and 90%/10% Post-Sale WETH Conversion tests passed successfully!');
   console.log('================================================================');
 })().catch((err) => {
   console.error('Test Failed:', err);

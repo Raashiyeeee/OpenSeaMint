@@ -224,6 +224,25 @@ export class CollectionBidderStrategy {
     // 3. FETCH LATEST MARKET DATA
     const marketData = await this.apiService.getCollectionMarketData(target.slug, target.contractAddress);
 
+    // 3.5. NFT RECENT FLOOR SALES REQUIREMENT CHECK
+    // The bot must place offers only on NFT collections with at least 10 or more completed
+    // floor-price sales within the last 3 hours, using native ETH.
+    const minFloorSales = this.config.liquidity?.minSales3Hours ?? 10;
+    const sales3h = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    if (sales3h < minFloorSales || marketData.liquidityPassed === false) {
+      logger.info(
+        {
+          slug: target.slug,
+          network: targetNetwork,
+          sales3Hours: sales3h,
+          minRequired: minFloorSales,
+          reason: marketData.liquidityReason
+        },
+        `OFFER REJECTED ❌ [${targetNetwork.toUpperCase()}]: Collection fails Recent Floor Sales Requirement (${sales3h}/${minFloorSales} completed native ETH floor sales in last 3 hours). ${marketData.liquidityReason || 'Strict Rejection.'}`
+      );
+      return;
+    }
+
     // 4. CHECK MARKET DUMP PROTECTION & FLOOR STABILITY WITH CIRCUIT BREAKER
     const dumpCheck = this.circuitBreaker.evaluateMarketDumpProtection(
       target.slug,
@@ -353,7 +372,17 @@ export class CollectionBidderStrategy {
     );
 
     // 7.5. PRE-FLIGHT CHECK: Ensure wallet has sufficient WETH on target network
-    const availableWeth = await this.seaportService.getWethBalance(targetNetwork);
+    let availableWeth = await this.seaportService.getWethBalance(targetNetwork);
+    if (availableWeth < calculation.bidPriceEth) {
+      // Auto-rebalance: wrap 90% of available native ETH into WETH (holding 10% gas reserve)
+      const rebalanceRes = await this.seaportService.autoWrapAvailableEthIfDeficit(
+        calculation.bidPriceEth,
+        targetNetwork
+      );
+      if (rebalanceRes.amountWrappedEth > 0) {
+        availableWeth = await this.seaportService.getWethBalance(targetNetwork);
+      }
+    }
     if (availableWeth < calculation.bidPriceEth) {
       logger.info(
         { targetNetwork, availableWeth, requiredWeth: calculation.bidPriceEth },
@@ -391,6 +420,23 @@ export class CollectionBidderStrategy {
       logger.error(
         { slug: target.slug, currentFloorUsd, requiredMinFloorUsd, bidPriceUsd: calculation.bidPriceUsd },
         `FINAL OFFER-EXECUTION BLOCKED 🛑: Current floor ($${currentFloorUsd.toFixed(2)}) is not at least 40% higher than offer ($${calculation.bidPriceUsd.toFixed(2)}). Required: >= $${requiredMinFloorUsd.toFixed(2)}`
+      );
+      return;
+    }
+
+    // 4) NFT Recent Floor Sales Requirement (>= 10 completed floor-price sales in 3h with native ETH)
+    const minFloorSalesRequired = this.config.liquidity?.minSales3Hours ?? 10;
+    const floorSales3h = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    if (floorSales3h < minFloorSalesRequired) {
+      logger.error(
+        {
+          slug: target.slug,
+          network: targetNetwork,
+          sales3Hours: floorSales3h,
+          minRequired: minFloorSalesRequired,
+          reason: marketData.liquidityReason
+        },
+        `FINAL OFFER-EXECUTION BLOCKED 🛑: Collection does not meet Recent Floor Sales Requirement (${floorSales3h}/${minFloorSalesRequired} completed floor sales in native ETH in last 3 hours). ${marketData.liquidityReason || 'Strict Rejection.'}`
       );
       return;
     }
@@ -532,6 +578,20 @@ export class CollectionBidderStrategy {
     // 3. Market Data & Pre-Checks
     const marketData = await this.apiService.getCollectionMarketData(params.collectionSlug, params.contractAddress);
 
+    // 3.0. Recent Floor Sales Requirement Check
+    const minItemFloorSales = this.config.liquidity?.minSales3Hours ?? 10;
+    const itemSales3h = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    if (itemSales3h < minItemFloorSales || marketData.liquidityPassed === false) {
+      logger.info(
+        { slug: params.collectionSlug, sales3Hours: itemSales3h, minItemFloorSales, reason: marketData.liquidityReason },
+        'Item bid rejected: Collection fails Recent Floor Sales Requirement'
+      );
+      return {
+        success: false,
+        reason: `Collection fails Recent Floor Sales Requirement (${itemSales3h}/${minItemFloorSales} completed floor-price sales in native ETH within last 3 hours).`
+      };
+    }
+
     // 3.1. Market Dump Protection Check
     const dumpCheck = this.circuitBreaker.evaluateMarketDumpProtection(
       params.collectionSlug,
@@ -572,7 +632,16 @@ export class CollectionBidderStrategy {
     }
 
     // 4. Pre-flight WETH check
-    const availableWeth = await this.seaportService.getWethBalance(targetNetwork);
+    let availableWeth = await this.seaportService.getWethBalance(targetNetwork);
+    if (availableWeth < calculation.bidPriceEth) {
+      const rebalanceRes = await this.seaportService.autoWrapAvailableEthIfDeficit(
+        calculation.bidPriceEth,
+        targetNetwork
+      );
+      if (rebalanceRes.amountWrappedEth > 0) {
+        availableWeth = await this.seaportService.getWethBalance(targetNetwork);
+      }
+    }
     if (availableWeth < calculation.bidPriceEth) {
       return { success: false, reason: `Insufficient WETH balance (${availableWeth} available vs ${calculation.bidPriceEth} required)` };
     }
@@ -608,6 +677,26 @@ export class CollectionBidderStrategy {
         `FINAL OFFER-EXECUTION BLOCKED 🛑: Floor ($${itemFloorUsd.toFixed(2)}) is not at least 40% higher than offer ($${calculation.bidPriceUsd.toFixed(2)}).`
       );
       return { success: false, reason: `Floor ($${itemFloorUsd.toFixed(2)}) is not at least 40% higher than offer ($${calculation.bidPriceUsd.toFixed(2)}).` };
+    }
+
+    // 4) NFT Recent Floor Sales Requirement (>= 10 completed floor-price sales in 3h with native ETH)
+    const minSingleFloorSales = this.config.liquidity?.minSales3Hours ?? 10;
+    const itemFloorSales3h = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    if (itemFloorSales3h < minSingleFloorSales) {
+      logger.error(
+        {
+          contractAddress: params.contractAddress,
+          tokenId: params.tokenId,
+          sales3Hours: itemFloorSales3h,
+          minRequired: minSingleFloorSales,
+          reason: marketData.liquidityReason
+        },
+        `FINAL OFFER-EXECUTION BLOCKED 🛑: Collection fails Recent Floor Sales Requirement (${itemFloorSales3h}/${minSingleFloorSales} completed floor sales in native ETH within last 3 hours).`
+      );
+      return {
+        success: false,
+        reason: `Collection fails Recent Floor Sales Requirement (${itemFloorSales3h}/${minSingleFloorSales} completed floor sales in native ETH within last 3 hours).`
+      };
     }
 
     // 5. Sign & Post Item Offer
