@@ -16,7 +16,7 @@ export interface CapitalConfig {
   minNetProfitUsd: number;        // e.g. $0.20
   minOfferPriceUsd?: number;      // Strict floor: minimum $1.00 offer price per NFT
   maxBuyPriceUsd?: number;        // Strict ceiling: maximum $5.00 buy price
-  maxOfferCapitalPercent?: number; // e.g. 60.0 (Use up to 60% of total capital for simultaneous active offers)
+  maxOfferCapitalPercent?: number; // e.g. 70.0 (Max share of total capital committed to offers + purchased NFTs; capped at 70%, 30% reserved)
 }
 
 export interface LiquidityConfig {
@@ -40,6 +40,7 @@ export interface BotConfig {
     loopIntervalMs: number;
     offerExpirationMinutes: number;
     listingExpirationDays: number;
+    relistCooldownMinutes?: number; // min minutes between competitive reprices of one listing (anti-churn)
     ignoredCollections?: string[];
     postSaleWethConvertPercent?: number;
     postSaleGasReservePercent?: number;
@@ -54,7 +55,7 @@ export interface BotConfig {
   };
   profitTargets: {
     defaultMinNetProfitUsd: number;
-    defaultMinMarginPercent: number; // 13% default
+    defaultMinMarginPercent: number; // 40% default and hard minimum (net profit / offer after all fees)
     undercutFloorByPercent: number;
     bidUnderFloorPercent: number;
     bidIncrementUsd?: number;
@@ -168,6 +169,8 @@ export interface ProfitCalculationResult {
   checkMintCompletedPassed?: boolean;
   checkMarketDumpPassed?: boolean;
   floorDeclinePercent?: number;
+  minAcceptableFloorEth?: number;
+  checkMinFloorPassed?: boolean;
   isProfitable: boolean;
   decision: 'ACCEPT' | 'REJECT';
   reason?: string;
@@ -219,7 +222,7 @@ export interface InventoryItem {
   currentListingPriceEth?: number;
   currentListingPriceUsd?: number;
   listingOrderId?: string;
-  status: 'PENDING_LISTING' | 'LISTED' | 'HOLDING' | 'SOLD' | 'ERROR';
+  status: 'PENDING_LISTING' | 'LISTED' | 'HOLDING' | 'SOLD' | 'ERROR' | 'TRANSFERRED';
   ownershipStatus?: NftOwnershipStatus;
   listingStatus?: NftListingStatus;
   saleConfirmation?: NftSaleConfirmation;
@@ -229,6 +232,7 @@ export interface InventoryItem {
   realizedProfitEth?: number;
   realizedProfitUsd?: number;
   isExternalWalletItem?: boolean;
+  lastListingUpdateAt?: number;
 }
 
 export type OfferStatus = 'ACTIVE' | 'EXPIRED' | 'FULFILLED' | 'CANCELLED' | 'CANCELLATION_PENDING' | 'CANCELLATION_FAILED';
@@ -249,6 +253,7 @@ export interface ActiveOffer {
   cancellationError?: string;
   lastCancellationAttempt?: number;
   flaggedForAttention?: boolean;
+  fillableUntil?: number; // offchain-cancelled offer may still be filled until this time (ms)
   orderComponents?: any;
   signature?: string;
 }
@@ -261,3 +266,20 @@ export interface MarkItemSoldResult {
   netProceedsEth: number;
 }
 
+
+export interface OfferCyclePauseState {
+  paused: boolean;
+  pausedAt?: number;
+  purchasedCountAtPause: number;
+  soldSincePause: number;
+}
+
+export interface MintSupplySources {
+  collectionTotalSupply?: number;
+  collectionIsMinting?: boolean;
+  dropTotalSupply?: number;
+  dropMaxSupply?: number;
+  dropIsMinting?: boolean;
+  onChainTotalSupply?: number;
+  onChainMaxSupply?: number;
+}

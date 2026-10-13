@@ -1,4 +1,4 @@
-import { BotConfig, ActiveOffer } from '../types';
+import { BotConfig, ActiveOffer, CollectionMarketData, FeeRecipient } from '../types';
 import { OpenSeaApiService } from '../services/OpenSeaApiService';
 import { PricingEngine } from '../services/PricingEngine';
 import { SeaportService } from '../services/SeaportService';
@@ -32,6 +32,137 @@ export class CollectionBidderStrategy {
   }
 
   /**
+   * Offer lifetime: offers must never stay active longer than 20 minutes. The configured
+   * offerExpirationMinutes may shorten this, but can never extend it past 20 minutes.
+   */
+  public getOfferMaxAgeMinutes(): number {
+    const configured = this.config.general.offerExpirationMinutes || 20;
+    return Math.min(configured, 20);
+  }
+
+  /**
+   * 100% Mint-Out Rule — re-verified immediately before EVERY offer submission (initial offers,
+   * automatic re-offers and single-token offers) using FRESHLY fetched marketplace data.
+   * If mint-out is incomplete or cannot be verified (including API failure), the offer is rejected.
+   */
+  public async reverifyMintOutBeforeOffer(
+    collectionSlug: string,
+    contractAddress: string,
+    networkKey?: string
+  ): Promise<{ passed: boolean; reason: string }> {
+    try {
+      const freshData = await this.apiService.getCollectionMarketData(collectionSlug, contractAddress, networkKey);
+      const check = this.pricingEngine.verifyMintCompletion(freshData);
+      if (!check.passed) {
+        logger.error(
+          { slug: collectionSlug, reason: check.reason },
+          `FINAL OFFER-EXECUTION BLOCKED 🛑: Fresh mint-out re-verification failed. ${check.reason}`
+        );
+      }
+      return check;
+    } catch (err: any) {
+      const reason = `Mint-out status could not be re-verified before offer (${err.message}). Core rule: If status cannot be verified, DO NOT OFFER ❌`;
+      logger.error({ slug: collectionSlug, err: err.message }, `FINAL OFFER-EXECUTION BLOCKED 🛑: ${reason}`);
+      return { passed: false, reason };
+    }
+  }
+
+  /**
+   * FINAL PRE-OFFER VALIDATION (Rule D) — runs immediately before EVERY offer (initial, re-offer, single-token)
+   * on FRESHLY fetched market data, at the exact bid about to be signed:
+   *  1. 100% mint-out verified
+   *  2. Recent native-ETH floor sales requirement
+   *  3. Market dump protection (< 40% floor decline)
+   *  4. Creator fee status: optional fees disabled (0 bps in costs & order), mandatory fee within ceiling and counted
+   *  5. Profitability: floor >= Offer * 1.30 AND floor >= minimum acceptable floor (40% net margin after marketplace
+   *     fee, applicable creator fee and gas) AND net profit >= configured minimum
+   */
+  public async finalPreOfferValidation(params: {
+    collectionSlug: string;
+    contractAddress: string;
+    networkKey: string;
+    bidPriceEth: number;
+    targetConfig?: any;
+  }): Promise<{ passed: boolean; reason: string; freshData?: CollectionMarketData }> {
+    const { collectionSlug, contractAddress, networkKey, bidPriceEth, targetConfig } = params;
+    let fresh: CollectionMarketData;
+    try {
+      fresh = await this.apiService.getCollectionMarketData(collectionSlug, contractAddress, networkKey);
+    } catch (err: any) {
+      return { passed: false, reason: `Final validation could not fetch fresh market data (${err.message}).` };
+    }
+    const block = (reason: string) => {
+      logger.error({ slug: collectionSlug, network: networkKey, bidPriceEth, reason }, `FINAL OFFER-EXECUTION BLOCKED 🛑: ${reason}`);
+      return { passed: false, reason, freshData: fresh };
+    };
+
+    const mint = this.pricingEngine.verifyMintCompletion(fresh);
+    if (!mint.passed) return block(mint.reason);
+
+    const minSales = this.config.liquidity?.minSales3Hours ?? 10;
+    if ((fresh.sales3Hours ?? 0) < minSales || fresh.liquidityPassed === false) {
+      return block(`Recent floor sales requirement failed (${fresh.sales3Hours ?? 0}/${minSales} native ETH floor sales in 3h).`);
+    }
+
+    const refFloor = fresh.referenceFloorEth && fresh.referenceFloorEth > 0 ? fresh.referenceFloorEth : fresh.floorPriceEth;
+    if (refFloor > 0 && ((refFloor - fresh.floorPriceEth) / refFloor) * 100 >= (this.config.riskManagement?.maxAllowedFloorDeclinePercent ?? 40)) {
+      return block('Market dump protection: floor declined by 40% or more.');
+    }
+
+    // Creator fee status: optional fees must be flagged disabled; the applicable fee (royaltyFeeBps) is mandatory only
+    const optionalStillEnabled = (fresh.fees || []).some((f) => f.required === false && f.disabled !== true);
+    if (optionalStillEnabled) return block('Optional creator fee is not disabled.');
+    const creatorFeeBps = fresh.royaltyFeeBps || 0;
+    if (creatorFeeBps > this.config.fees.maxAcceptableRoyaltyBps) {
+      return block(`Mandatory creator fee (${creatorFeeBps} bps) exceeds acceptable maximum (${this.config.fees.maxAcceptableRoyaltyBps} bps).`);
+    }
+
+    if (!(bidPriceEth > 0)) return block('Invalid bid price.');
+    const ethPriceUsd = fresh.ethPriceUsd || 2700;
+    const gasUsd = this.config.networks?.[networkKey]?.estimatedGasCostUsd ?? (networkKey === 'mainnet' ? 3.5 : 0.01);
+    const gasEth = gasUsd / ethPriceUsd;
+    const marginPercent = this.pricingEngine.getMinMarginPercent(targetConfig);
+    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30;
+    if (fresh.floorPriceEth < bidPriceEth * minFloorMultiplier - 1e-12) {
+      return block(`Floor (${fresh.floorPriceEth} ETH) < Offer (${bidPriceEth} ETH) * ${minFloorMultiplier}.`);
+    }
+    const minFloorEth = this.pricingEngine.computeMinAcceptableFloorEth({
+      offerEth: bidPriceEth,
+      openseaFeeBps: fresh.openseaFeeBps,
+      creatorFeeBps,
+      gasEth,
+      marginPercent
+    });
+    if (fresh.floorPriceEth < minFloorEth - 1e-12) {
+      return block(
+        `Floor (${fresh.floorPriceEth} ETH) is below minimum acceptable floor (${roundToPrecision(minFloorEth, 8)} ETH) for a ${marginPercent}% net margin after marketplace fee (${fresh.openseaFeeBps} bps), creator fee (${creatorFeeBps} bps) and gas.`
+      );
+    }
+    const undercut = (this.config.profitTargets?.undercutFloorByPercent ?? 0) / 100;
+    const expectedSaleEth = fresh.floorPriceEth * (1 - undercut);
+    const netProfitEth = expectedSaleEth * (1 - (fresh.openseaFeeBps + creatorFeeBps) / 10000) - bidPriceEth - gasEth;
+    const minNetProfitUsd = targetConfig?.targetNetProfitUsd ?? this.config.capital?.minNetProfitUsd ?? 0.20;
+    if (netProfitEth * ethPriceUsd < minNetProfitUsd - 0.005) {
+      return block(`Expected net profit ($${(netProfitEth * ethPriceUsd).toFixed(2)}) below minimum ($${minNetProfitUsd.toFixed(2)}).`);
+    }
+    return { passed: true, reason: 'Final validation passed', freshData: fresh };
+  }
+
+  /**
+   * Creator Fee Rule (offer side): verify the SIGNED offer order carries no optional creator fee before posting.
+   */
+  public verifySignedOfferCreatorFees(orderComponents: any, fees?: FeeRecipient[]): { verified: boolean; reason?: string } {
+    try {
+      const consideration = orderComponents?.consideration || [];
+      this.seaportService.verifyOrderFees(consideration, fees);
+      const res = this.seaportService.verifyCreatorFeeDisabledBeforeSale(consideration, fees);
+      return { verified: res.verified, reason: res.reason };
+    } catch (err: any) {
+      return { verified: false, reason: err.message };
+    }
+  }
+
+  /**
    * Automatic Offer Cancellation & Verification Helper:
    * 1. Marks offer as CANCELLATION_PENDING (capital stays locked!)
    * 2. Requests marketplace cancellation from OpenSea API
@@ -46,20 +177,51 @@ export class CollectionBidderStrategy {
     const network = offer.network || 'robinhood';
 
     // 1. Mark status CANCELLATION_PENDING (capital stays locked!)
+    const alreadyRequested = offer.status === 'CANCELLATION_PENDING' && offer.fillableUntil !== undefined;
     this.inventoryManager.initiateOfferCancellation(orderHash);
 
     try {
-      // 2. Request marketplace cancellation
-      const cancelRes = await this.apiService.cancelOffer(orderHash, network);
-      if (!cancelRes.success) {
-        logger.warn(
-          { orderHash, network, error: cancelRes.error, reason },
-          'Marketplace cancel request failed or queued. Will perform verification check.'
-        );
+      // 2. Request marketplace (offchain) cancellation — once
+      if (!alreadyRequested) {
+        const cancelRes = await this.apiService.cancelOffer(orderHash, network);
+        if (!cancelRes.success) {
+          logger.warn(
+            { orderHash, network, error: cancelRes.error, reason },
+            'Marketplace cancel request failed or queued. Will perform verification check.'
+          );
+        }
+        if (cancelRes.fillableUntil) {
+          this.inventoryManager.setOfferFillableUntil(orderHash, cancelRes.fillableUntil);
+        }
       }
 
       // 3. Verify offer is inactive before releasing capital
-      const verification = await this.apiService.verifyOfferInactive(orderHash, network);
+      let verification = await this.apiService.verifyOfferInactive(orderHash, network);
+
+      // 3a. Offer was accepted while we were cancelling: it is a FILL, not a cancellation
+      if (verification.status === 'FULFILLED') {
+        this.inventoryManager.markOfferFulfilled(orderHash);
+        logger.info({ orderHash, collection: offer.collectionSlug }, 'Offer was accepted before cancellation completed (FULFILLED). Tracking purchase.');
+        return { success: false, error: 'Offer was fulfilled (accepted) before cancellation' };
+      }
+
+      // 3b. API could not confirm: fall back to on-chain Seaport getOrderStatus (isCancelled)
+      if (!verification.isInactive && verification.status !== 'ACTIVE' && verification.status !== 'INACTIVE') {
+        const cancelledOnChain = await this.seaportService.isOrderCancelledOnChain(orderHash, network);
+        if (cancelledOnChain) {
+          verification = { isInactive: true, status: 'CANCELLED_ONCHAIN' };
+        }
+      }
+
+      // 3c. Offchain cancel: a previously issued fulfillment signature may still fill the order until it expires
+      const fillableUntil = this.inventoryManager.getActiveOffer(orderHash)?.fillableUntil ?? offer.fillableUntil;
+      if (verification.isInactive && verification.status === 'CANCELLED' && fillableUntil && Date.now() < fillableUntil) {
+        logger.info(
+          { orderHash, fillableUntil: new Date(fillableUntil).toISOString() },
+          'Offer cancelled offchain but an issued fulfillment signature is still valid. Capital stays locked until it expires.'
+        );
+        return { success: false, error: 'Awaiting expiry of last issued fulfillment signature' };
+      }
 
       if (verification.isInactive) {
         // Verification confirmed: release capital
@@ -157,7 +319,16 @@ export class CollectionBidderStrategy {
 
     for (const offer of activeOffers) {
       try {
-        const marketData = await this.apiService.getCollectionMarketData(offer.collectionSlug, offer.contractAddress);
+        const marketData = await this.apiService.getCollectionMarketData(offer.collectionSlug, offer.contractAddress, offer.network);
+        // Single-NFT offers compete with offers on that specific NFT AND with collection offers
+        let competingTopEth = marketData.topOfferEth || 0;
+        if (offer.tokenId) {
+          const bestNft = await this.apiService.getBestNftOffer(offer.collectionSlug, offer.tokenId);
+          if (bestNft && bestNft.orderHash !== offer.orderHash && bestNft.priceEth > competingTopEth) {
+            competingTopEth = bestNft.priceEth;
+          }
+        }
+        marketData.topOfferEth = competingTopEth;
         if (marketData.topOfferEth && marketData.topOfferEth > offer.priceEth) {
           logger.info(
             {
@@ -203,14 +374,22 @@ export class CollectionBidderStrategy {
 
     // 0. Automatic Offer Cancellation:
     // a. 20-Minute Expiry Rule: Cancel unaccepted offers after 20 minutes
-    await this.processAutomaticOfferCancellations(this.config.general.offerExpirationMinutes || 20);
+    await this.processAutomaticOfferCancellations(this.getOfferMaxAgeMinutes());
     // b. Cancel When Outbid Rule: Automatically cancel existing offers if outbid by another buyer
     await this.processOutbidOfferCancellations();
+
+    // Capital Reallocation Rule: pause new offer cycles while the 70% allocation is fully committed to
+    // purchased NFTs, until at least 40% of them have sold (cancellation sweeps above still run).
+    const pauseCheck = this.inventoryManager.evaluateOfferCyclePause();
+    if (pauseCheck.paused) {
+      logger.warn({ pauseState: this.inventoryManager.getOfferCyclePauseState() }, `OFFER CYCLE PAUSED ⏸: ${pauseCheck.reason}`);
+      return;
+    }
 
     const activeNetworks = this.config.general.activeNetworks || ['robinhood', 'mainnet'];
     const totalCapitalUsd = this.inventoryManager.getTotalCapitalUsd();
     const activeOffersCapitalUsd = this.inventoryManager.getActiveOffersCapitalUsd();
-    const offerLimitPercent = this.config.capital?.maxOfferCapitalPercent ?? 60.0;
+    const offerLimitPercent = this.inventoryManager.getOfferAllocationPercent();
     const maxOfferCapitalUsd = (totalCapitalUsd * offerLimitPercent) / 100;
 
     logger.info(
@@ -304,7 +483,7 @@ export class CollectionBidderStrategy {
     }
 
     // 3. FETCH LATEST MARKET DATA
-    const marketData = await this.apiService.getCollectionMarketData(target.slug, target.contractAddress);
+    const marketData = await this.apiService.getCollectionMarketData(target.slug, target.contractAddress, targetNetwork);
 
     // 3.1. AUTOMATIC OFFER CANCELLATION & RE-ENTRY CHECK (Outbid & 20-Minute Expiry Rules)
     const existingOffer = this.inventoryManager.getActiveOffer(target.slug);
@@ -323,7 +502,7 @@ export class CollectionBidderStrategy {
 
       if (existingOffer.status === 'ACTIVE') {
         const isOutbid = marketData.topOfferEth > existingOffer.priceEth;
-        const isExpired = Date.now() - existingOffer.createdTimestamp >= (this.config.general.offerExpirationMinutes || 20) * 60 * 1000;
+        const isExpired = Date.now() - existingOffer.createdTimestamp >= this.getOfferMaxAgeMinutes() * 60 * 1000;
 
         if (isOutbid || isExpired) {
           const cancelReason = isOutbid
@@ -363,7 +542,7 @@ export class CollectionBidderStrategy {
     // The bot must place offers only on NFT collections with at least 10 or more completed
     // floor-price sales within the last 3 hours, using native ETH.
     const minFloorSales = this.config.liquidity?.minSales3Hours ?? 10;
-    const sales3h = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    const sales3h = marketData.sales3Hours ?? 0;
     if (sales3h < minFloorSales || marketData.liquidityPassed === false) {
       logger.info(
         {
@@ -451,7 +630,7 @@ export class CollectionBidderStrategy {
       calculation.bidPriceUsd = roundToPrecision(calculation.bidPriceEth * (marketData.ethPriceUsd || 2700), 2);
     }
 
-    // Final capital allocation check: Active offers allocation limit (e.g. 60% of total capital)
+    // Final capital allocation check: offers + purchased NFTs within 70% of total capital (30% reserved)
     const capitalLockCheck = this.inventoryManager.canAllocateCapitalForOffer(calculation.bidPriceUsd, marketData.ethPriceUsd);
     if (!capitalLockCheck.allowed) {
       logger.info(
@@ -546,7 +725,7 @@ export class CollectionBidderStrategy {
 
     // 4) NFT Recent Floor Sales Requirement (>= 10 completed floor-price sales in 3h with native ETH)
     const minFloorSalesRequired = this.config.liquidity?.minSales3Hours ?? 10;
-    const floorSales3h = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    const floorSales3h = marketData.sales3Hours ?? 0;
     if (floorSales3h < minFloorSalesRequired) {
       logger.error(
         {
@@ -561,14 +740,32 @@ export class CollectionBidderStrategy {
       return;
     }
 
-    // 8. SIGN SEAPORT COLLECTION OFFER (Off-chain EIP-712 with required fee recipients)
+    // 5) FINAL PRE-OFFER VALIDATION on fresh data (mint-out, sales, dump, creator fee, 40% margin / min floor)
+    const finalCheck = await this.finalPreOfferValidation({
+      collectionSlug: target.slug,
+      contractAddress: target.contractAddress,
+      networkKey: targetNetwork,
+      bidPriceEth: calculation.bidPriceEth,
+      targetConfig: target
+    });
+    if (!finalCheck.passed) {
+      return;
+    }
+    const offerFees = finalCheck.freshData?.fees ?? marketData.fees;
+
+    // 8. SIGN SEAPORT COLLECTION OFFER (Off-chain EIP-712 with required fee recipients; optional creator fees excluded)
     const { orderComponents, signature } = await this.seaportService.createSignedCollectionOffer(
       target.contractAddress,
       calculation.bidPriceEth,
-      this.config.general.offerExpirationMinutes,
+      this.getOfferMaxAgeMinutes(),
       targetNetwork,
-      marketData.fees
+      offerFees
     );
+    const offerFeeCheck = this.verifySignedOfferCreatorFees(orderComponents, offerFees);
+    if (!offerFeeCheck.verified) {
+      logger.error({ slug: target.slug, reason: offerFeeCheck.reason }, 'FINAL OFFER-EXECUTION BLOCKED 🛑: optional creator fee not disabled in signed offer');
+      return;
+    }
 
     // 9. POST OFFER TO OPENSEA (OpenSea v2 /offers format)
     const postPayload = {
@@ -607,14 +804,31 @@ export class CollectionBidderStrategy {
               continue;
             }
 
+            // 100% Mint-Out Rule: re-verify before EVERY single-token offer
+            const tokenFinalCheck = await this.finalPreOfferValidation({
+              collectionSlug: target.slug,
+              contractAddress: target.contractAddress,
+              networkKey: targetNetwork,
+              bidPriceEth: calculation.bidPriceEth,
+              targetConfig: target
+            });
+            if (!tokenFinalCheck.passed) {
+              logger.info({ tokenId: tok.tokenId, slug: target.slug, reason: tokenFinalCheck.reason }, 'NFT OFFER SKIPPED: final validation failed');
+              break;
+            }
+
             const { orderComponents: itemComponents, signature: itemSig } = await this.seaportService.createSignedItemOffer(
               target.contractAddress,
               tok.tokenId,
               calculation.bidPriceEth,
-              this.config.general.offerExpirationMinutes,
+              this.getOfferMaxAgeMinutes(),
               targetNetwork,
-              marketData.fees
+              tokenFinalCheck.freshData?.fees ?? marketData.fees
             );
+            if (!this.verifySignedOfferCreatorFees(itemComponents, tokenFinalCheck.freshData?.fees ?? marketData.fees).verified) {
+              logger.error({ tokenId: tok.tokenId }, 'NFT OFFER BLOCKED: optional creator fee present in signed offer');
+              continue;
+            }
             const singlePayload = {
               parameters: itemComponents,
               signature: itemSig,
@@ -633,7 +847,7 @@ export class CollectionBidderStrategy {
               priceEth: calculation.bidPriceEth,
               priceUsd: calculation.bidPriceUsd,
               createdTimestamp: Date.now(),
-              expiresTimestamp: Date.now() + (this.config.general.offerExpirationMinutes || 20) * 60 * 1000,
+              expiresTimestamp: Date.now() + this.getOfferMaxAgeMinutes() * 60 * 1000,
               status: 'ACTIVE',
               orderComponents: itemComponents,
               signature: itemSig
@@ -656,7 +870,7 @@ export class CollectionBidderStrategy {
       priceEth: calculation.bidPriceEth,
       priceUsd: calculation.bidPriceUsd,
       createdTimestamp: Date.now(),
-      expiresTimestamp: Date.now() + (this.config.general.offerExpirationMinutes || 20) * 60 * 1000,
+      expiresTimestamp: Date.now() + this.getOfferMaxAgeMinutes() * 60 * 1000,
       status: 'ACTIVE',
       orderComponents,
       signature
@@ -696,7 +910,7 @@ export class CollectionBidderStrategy {
     }
 
     // 3. Market Data & Pre-Checks
-    const marketData = await this.apiService.getCollectionMarketData(params.collectionSlug, params.contractAddress);
+    const marketData = await this.apiService.getCollectionMarketData(params.collectionSlug, params.contractAddress, targetNetwork);
 
     // 3.0. Automatic Offer Cancellation & Re-entry Check for Item (Outbid & 20-Minute Expiry)
     const itemKey = `${params.contractAddress.toLowerCase()}:${params.tokenId}`;
@@ -714,8 +928,15 @@ export class CollectionBidderStrategy {
       }
 
       if (existingItemOffer.status === 'ACTIVE') {
+        // Compare against the best offer on THIS NFT as well as collection offers
+        const bestNftOffer = await this.apiService.getBestNftOffer(params.collectionSlug, params.tokenId);
+        const competingBestEth = Math.max(
+          marketData.topOfferEth || 0,
+          bestNftOffer && bestNftOffer.orderHash !== existingItemOffer.orderHash ? bestNftOffer.priceEth : 0
+        );
+        marketData.topOfferEth = competingBestEth;
         const isOutbid = marketData.topOfferEth > existingItemOffer.priceEth;
-        const isExpired = Date.now() - existingItemOffer.createdTimestamp >= (this.config.general.offerExpirationMinutes || 20) * 60 * 1000;
+        const isExpired = Date.now() - existingItemOffer.createdTimestamp >= this.getOfferMaxAgeMinutes() * 60 * 1000;
 
         if (isOutbid || isExpired) {
           const cancelReason = isOutbid
@@ -751,7 +972,7 @@ export class CollectionBidderStrategy {
 
     // 3.0. Recent Floor Sales Requirement Check
     const minItemFloorSales = this.config.liquidity?.minSales3Hours ?? 10;
-    const itemSales3h = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    const itemSales3h = marketData.sales3Hours ?? 0;
     if (itemSales3h < minItemFloorSales || marketData.liquidityPassed === false) {
       logger.info(
         { slug: params.collectionSlug, sales3Hours: itemSales3h, minItemFloorSales, reason: marketData.liquidityReason },
@@ -796,7 +1017,7 @@ export class CollectionBidderStrategy {
       calculation.bidPriceUsd = roundToPrecision(calculation.bidPriceEth * (marketData.ethPriceUsd || 2700), 2);
     }
 
-    // 3. Comply with configured 60% capital allocation limit
+    // 3. Comply with the 70% capital allocation limit (30% reserved) and offer-cycle pause
     const capitalCheck = this.inventoryManager.canAllocateCapitalForOffer(calculation.bidPriceUsd, marketData.ethPriceUsd);
     if (!capitalCheck.allowed) {
       return { success: false, reason: capitalCheck.reason };
@@ -852,7 +1073,7 @@ export class CollectionBidderStrategy {
 
     // 4) NFT Recent Floor Sales Requirement (>= 10 completed floor-price sales in 3h with native ETH)
     const minSingleFloorSales = this.config.liquidity?.minSales3Hours ?? 10;
-    const itemFloorSales3h = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
+    const itemFloorSales3h = marketData.sales3Hours ?? 0;
     if (itemFloorSales3h < minSingleFloorSales) {
       logger.error(
         {
@@ -870,15 +1091,32 @@ export class CollectionBidderStrategy {
       };
     }
 
+    // 5) Fresh 100% Mint-Out re-verification immediately before signing/posting (covers automatic re-offers)
+    const itemFinalCheck = await this.finalPreOfferValidation({
+      collectionSlug: params.collectionSlug,
+      contractAddress: params.contractAddress,
+      networkKey: targetNetwork,
+      bidPriceEth: calculation.bidPriceEth
+    });
+    if (!itemFinalCheck.passed) {
+      return { success: false, reason: itemFinalCheck.reason };
+    }
+    const itemFees = itemFinalCheck.freshData?.fees ?? marketData.fees;
+
     // 5. Sign & Post Item Offer
     const { orderComponents, signature } = await this.seaportService.createSignedItemOffer(
       params.contractAddress,
       params.tokenId,
       calculation.bidPriceEth,
-      this.config.general.offerExpirationMinutes,
+      this.getOfferMaxAgeMinutes(),
       targetNetwork,
-      marketData.fees
+      itemFees
     );
+
+    const itemFeeCheck = this.verifySignedOfferCreatorFees(orderComponents, itemFees);
+    if (!itemFeeCheck.verified) {
+      return { success: false, reason: `Optional creator fee not disabled in signed offer: ${itemFeeCheck.reason}` };
+    }
 
     const singlePayload = {
       parameters: orderComponents,
@@ -899,7 +1137,7 @@ export class CollectionBidderStrategy {
       priceEth: calculation.bidPriceEth,
       priceUsd: calculation.bidPriceUsd,
       createdTimestamp: Date.now(),
-      expiresTimestamp: Date.now() + (this.config.general.offerExpirationMinutes || 20) * 60 * 1000,
+      expiresTimestamp: Date.now() + this.getOfferMaxAgeMinutes() * 60 * 1000,
       status: 'ACTIVE',
       orderComponents,
       signature

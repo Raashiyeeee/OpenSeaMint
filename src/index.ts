@@ -1,3 +1,4 @@
+import path from 'path';
 import http from 'http';
 import { ethers } from 'ethers';
 import { loadConfig } from './config/schema';
@@ -85,7 +86,9 @@ async function main() {
   const streamService = new OpenSeaStreamService(config, tradingWallet.address);
   const seaportService = new SeaportService(config, tradingWallet);
   const pricingEngine = new PricingEngine(config);
-  const inventoryManager = new InventoryManager(config);
+  // Re-Offer Rule: owned/unsold NFT state and capital pause state persist across restarts
+  const inventoryStatePath = process.env.INVENTORY_STATE_PATH || path.resolve(process.cwd(), 'data/inventory-state.json');
+  const inventoryManager = new InventoryManager(config, inventoryStatePath);
 
   // 6. Initialize strategies
   const bidderStrategy = new CollectionBidderStrategy(
@@ -112,23 +115,29 @@ async function main() {
       const slug = eventData.collection?.slug || '';
       const contract = eventData.item?.nft_id?.split('/')?.[1] || '';
       const tokenId = eventData.item?.nft_id?.split('/')?.[2] || '';
-      let priceEth = parseFloat(eventData.payment_token?.eth_price || '0');
-      if (!priceEth || priceEth <= 0 || priceEth >= 0.003) {
-        const activeOffer = inventoryManager.getActiveOffer(slug);
-        if (activeOffer && activeOffer.priceEth > 0) {
-          priceEth = activeOffer.priceEth;
-        } else {
-          try {
-            const marketData = await apiService.getCollectionMarketData(slug, contract);
-            priceEth = marketData.topOfferEth > 0 ? marketData.topOfferEth : (marketData.floorPriceEth * 0.85);
-          } catch {
-            priceEth = 0.0004;
-          }
+      const chainPart = eventData.item?.nft_id?.split('/')?.[0] || '';
+      const network = chainPart === 'ethereum' ? 'mainnet' : chainPart || undefined;
+      // Cost basis = the price of OUR offer that was accepted. Only if unknown, fall back conservatively to the
+      // higher of floor / top offer (overstating cost keeps the 40%-margin listing price on the safe side).
+      let priceEth = 0;
+      const activeOffer = inventoryManager.getActiveOffer(slug);
+      if (activeOffer && activeOffer.priceEth > 0) {
+        priceEth = activeOffer.priceEth;
+      } else {
+        try {
+          const marketData = await apiService.getCollectionMarketData(slug, contract, network);
+          priceEth = Math.max(marketData.topOfferEth || 0, marketData.floorPriceEth || 0);
+        } catch {
+          priceEth = 0;
         }
+      }
+      if (!(priceEth > 0)) {
+        logger.error({ slug, tokenId }, 'Cost basis of received NFT unknown; not auto-listing (wallet scan will retry).');
+        return;
       }
 
       logger.info({ slug, tokenId, priceEth }, 'Incoming transfer received! Triggering automatic relist.');
-      await relisterStrategy.handleItemAcquired(slug, contract, tokenId, priceEth);
+      await relisterStrategy.handleItemAcquired(slug, contract, tokenId, priceEth, network);
     } catch (err: any) {
       logger.error({ err }, 'Error processing nft_received event');
     }
@@ -139,7 +148,14 @@ async function main() {
       const tokenId = eventData.item?.nft_id?.split('/')?.[2] || '';
       const contract = eventData.item?.nft_id?.split('/')?.[1] || '';
       const identifier = `${contract.toLowerCase()}:${tokenId}`;
-      const salePriceEth = parseFloat(eventData.payment_token?.eth_price || '0');
+      // Stream item_sold: sale_price is the total in the payment token's base units; convert to ETH via
+      // payment_token.decimals and payment_token.eth_price (1 for ETH).
+      const decimals = Number(eventData.payment_token?.decimals ?? 18);
+      const tokenEthPrice = parseFloat(eventData.payment_token?.eth_price || '1') || 1;
+      const salePriceEth = eventData.sale_price
+        ? (parseFloat(eventData.sale_price) / Math.pow(10, decimals)) * tokenEthPrice
+        : 0;
+      const txHash: string | undefined = eventData.transaction?.hash;
       const ethPriceUsd = await apiService.getEthPriceUsd();
       const gasUsd = config.networks['robinhood']?.estimatedGasCostUsd || 0.01;
 
@@ -148,7 +164,8 @@ async function main() {
         salePriceEth > 0 ? salePriceEth : undefined,
         ethPriceUsd,
         100,
-        gasUsd
+        gasUsd,
+        txHash
       );
       logger.info(
         {
@@ -168,7 +185,13 @@ async function main() {
         { identifier, targetNetwork, netProceedsEth: result.netProceedsEth },
         'NFT SALE CONFIRMED: Automatically converting 90% of received ETH into WETH (10% held for gas reserve)...'
       );
-      await seaportService.handlePostSaleEthConversion(result.netProceedsEth, targetNetwork);
+      const conversion = await seaportService.handlePostSaleEthConversion(result.netProceedsEth, targetNetwork);
+      if (!conversion.success || !conversion.verified) {
+        logger.error(
+          { identifier, targetNetwork, conversion },
+          'POST-SALE CONVERSION NOT VERIFIED ❌: WETH wrap did not succeed or could not be verified on-chain. Manual review required.'
+        );
+      }
     } catch (err: any) {
       logger.error({ err }, 'Error processing nft_sold event');
     }
