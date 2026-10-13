@@ -31,6 +31,14 @@ export interface LiquidityConfig {
 }
 
 export interface BotConfig {
+  opensea?: {
+    requestsPerSecond?: number;
+    maxConcurrent?: number;
+    maxRetries?: number;
+    baseRetryDelayMs?: number;
+    maxRetryDelayMs?: number;
+    cacheTtlMs?: { collection?: number; stats?: number; offers?: number; salesEvents?: number; mintComplete?: number; mintIncomplete?: number };
+  };
   general: {
     network?: 'robinhood' | 'mainnet' | 'base' | 'polygon' | 'sepolia';
     activeNetworks: string[];
@@ -130,6 +138,11 @@ export interface CollectionMarketData {
   maxSupply?: number;
   mintDemandPassed?: boolean;
   mintDemandReason?: string;
+  /** Data could not be fetched (rate limit / API error after retries): skip this cycle, never offer. */
+  dataUnavailable?: boolean;
+  dataUnavailableReason?: string;
+  /** Rejected by a cheap check (mint-out / creator fee) before expensive fetches; sales were not fetched. */
+  earlyRejectReason?: string;
   referenceFloorEth?: number;
   referenceFloorUsd?: number;
   floorDeclinePercent?: number;
