@@ -1,10 +1,21 @@
-import axios, { AxiosInstance } from 'axios';
+import axios, { AxiosInstance, AxiosRequestConfig, AxiosResponse } from 'axios';
+import { getGlobalOpenSeaLimiter, OpenSeaRateLimiter, RetryOptions, scheduleWithRetry, TtlCache } from '../utils/OpenSeaRateLimiter';
 import { ethers } from 'ethers';
 import { BotConfig, CollectionMarketData, FeeRecipient, MintSupplySources } from '../types';
 import { logger } from '../utils/logger';
 
 export class OpenSeaApiService {
-  private client: AxiosInstance;
+  /** Raw axios instance. Never call directly: use `client`, which is rate limited, retried and keyed. */
+  private http: AxiosInstance;
+  /** Every OpenSea call goes through this: global limiter + 429/5xx retry (Retry-After) + x-api-key header. */
+  public client: { get: (url: string, cfg?: AxiosRequestConfig) => Promise<AxiosResponse<any>>; post: (url: string, data?: any, cfg?: AxiosRequestConfig) => Promise<AxiosResponse<any>> };
+  private limiter: OpenSeaRateLimiter;
+  private retryOptions: RetryOptions;
+  private collectionCache = new TtlCache<any>();
+  private statsCache = new TtlCache<any>();
+  private offersCache = new TtlCache<any>();
+  private salesEventsCache = new TtlCache<any[]>();
+  private mintCache = new TtlCache<{ drop: { totalSupply?: number; maxSupply?: number; isMinting?: boolean; unavailable?: boolean }; onChain: { totalSupply?: number; maxSupply?: number } }>();
   private config: BotConfig;
   private ethPriceCache: { price: number; timestamp: number } | null = null;
   private mockOrderStates: Map<string, { isCancelled: boolean; cancellationFails?: boolean; verificationFails?: boolean }> = new Map();
@@ -14,7 +25,7 @@ export class OpenSeaApiService {
     this.config = config;
     const apiKey = process.env.OPENSEA_API_KEY || '';
 
-    this.client = axios.create({
+    this.http = axios.create({
       baseURL: 'https://api.opensea.io/api/v2',
       timeout: 10000,
       headers: {
@@ -24,9 +35,58 @@ export class OpenSeaApiService {
       }
     });
 
+    const os = this.config.opensea || ({} as any);
+    this.limiter = getGlobalOpenSeaLimiter({
+      requestsPerSecond: os.requestsPerSecond ?? 3,
+      maxConcurrent: os.maxConcurrent ?? 2
+    });
+    this.retryOptions = {
+      maxRetries: os.maxRetries ?? 4,
+      baseDelayMs: os.baseRetryDelayMs ?? 1000,
+      maxDelayMs: os.maxRetryDelayMs ?? 30000
+    };
+    this.client = {
+      get: (url, cfg) => this.request(() => this.http.get(url, this.withApiKey(cfg)), `GET ${url}`),
+      post: (url, data, cfg) => this.request(() => this.http.post(url, data, this.withApiKey(cfg)), `POST ${url}`)
+    };
+
     if (!apiKey) {
       logger.warn('OPENSEA_API_KEY not found in environment. Using public endpoints / simulated fallback data where required.');
     }
+  }
+
+  /** Adds the x-api-key header to every request (read at call time, so a key set after startup is also used). */
+  public withApiKey(cfg?: AxiosRequestConfig): AxiosRequestConfig {
+    const key = process.env.OPENSEA_API_KEY || '';
+    return { ...(cfg || {}), headers: { ...((cfg?.headers as any) || {}), ...(key ? { 'x-api-key': key } : {}) } };
+  }
+
+  private request<T>(fn: () => Promise<T>, label: string): Promise<T> {
+    return scheduleWithRetry(this.limiter, fn, this.retryOptions, label);
+  }
+
+  private ttl(name: string, fallbackMs: number): number {
+    return (this.config.opensea?.cacheTtlMs as any)?.[name] ?? fallbackMs;
+  }
+
+  /** Cache successful results only (errors propagate and are never cached). */
+  private async cached<V>(cache: TtlCache<V>, key: string, ttlMs: number, fetcher: () => Promise<V>): Promise<V> {
+    const hit = cache.get(key);
+    if (hit !== undefined) return hit;
+    const value = await fetcher();
+    cache.set(key, value, ttlMs);
+    return value;
+  }
+
+  /** Clears every per-collection cache. */
+  public clearCaches(): void {
+    for (const c of [this.collectionCache, this.statsCache, this.offersCache, this.salesEventsCache, this.mintCache]) (c as TtlCache<any>).clear();
+  }
+
+  /** Drops cached per-collection data (e.g. right after we post/cancel an offer on it). */
+  public invalidateCollectionCache(collectionSlug: string): void {
+    this.offersCache.delete(collectionSlug);
+    this.statsCache.delete(collectionSlug);
   }
 
   /**
@@ -127,7 +187,7 @@ export class OpenSeaApiService {
    * OpenSea Drops API (/api/v2/drops/{slug}): max_supply, total_supply, is_minting for drops minted on OpenSea.
    * Returns {} when the collection is not an OpenSea drop or the call fails.
    */
-  public async getDropSupply(collectionSlug: string): Promise<{ totalSupply?: number; maxSupply?: number; isMinting?: boolean }> {
+  public async getDropSupply(collectionSlug: string): Promise<{ totalSupply?: number; maxSupply?: number; isMinting?: boolean; unavailable?: boolean }> {
     try {
       const res = await this.client.get(`/drops/${collectionSlug}`);
       const d = res.data || {};
@@ -137,8 +197,11 @@ export class OpenSeaApiService {
         maxSupply: num(d.max_supply),
         isMinting: typeof d.is_minting === 'boolean' ? d.is_minting : undefined
       };
-    } catch {
-      return {};
+    } catch (err: any) {
+      // 404/400 = not an OpenSea drop (normal). Anything else (429 after retries, 5xx, network) = unknown.
+      const status = err?.response?.status;
+      if (status === 404 || status === 400) return {};
+      return { unavailable: true };
     }
   }
 
@@ -168,220 +231,248 @@ export class OpenSeaApiService {
    */
   public async getCollectionMarketData(collectionSlug: string, contractAddress: string, networkKey?: string): Promise<CollectionMarketData> {
     const ethPriceUsd = await this.getEthPriceUsd();
+    const net = networkKey || this.config.general.network || 'robinhood';
+    const base = (): CollectionMarketData => ({
+      slug: collectionSlug,
+      contractAddress,
+      floorPriceEth: 0,
+      topOfferEth: 0,
+      numListings: 0,
+      openseaFeeBps: this.config.fees.openseaFeeBps,
+      royaltyFeeBps: this.config.fees.defaultRoyaltyBps,
+      ethPriceUsd,
+      timestamp: Date.now(),
+      sales1Hour: 0,
+      uniqueWallets1Hour: 0,
+      sales3Hours: 0,
+      uniqueWallets3Hours: 0,
+      liquidityPassed: false,
+      isMinting: false,
+      mintCompleted: false,
+      mintStatusVerified: false,
+      mintDemandPassed: false
+    });
+    // Data could not be fetched (rate limited / API down even after retries): SKIP, never offer, retry next cycle
+    const unavailable = (stage: string, err?: any, partial: Partial<CollectionMarketData> = {}): CollectionMarketData => {
+      const reason = `SKIPPED (data unavailable, will retry): ${stage}${err ? ` (${err?.response?.status ?? ''} ${err?.message ?? err})` : ''}`;
+      logger.warn({ slug: collectionSlug, network: net, stage }, reason);
+      return { ...base(), ...partial, dataUnavailable: true, dataUnavailableReason: reason, liquidityReason: reason, mintDemandReason: reason };
+    };
 
+    // STAGE 1 (cheap, cached): collection metadata & fees
+    let collectionData: any;
     try {
-      // 1. Fetch collection metadata & fees with fresh, un-cached data
-      const collectionRes = await this.client.get(`/collections/${collectionSlug}`, {
-        headers: {
-          'Cache-Control': 'no-cache, no-store, must-revalidate',
-          'Pragma': 'no-cache'
-        }
-      });
-      const collectionData = collectionRes.data;
+      collectionData = await this.cached(this.collectionCache, collectionSlug, this.ttl('collection', 10 * 60_000), async () => (await this.client.get(`/collections/${collectionSlug}`)).data);
+    } catch (err: any) {
+      return unavailable('collection metadata/fees', err);
+    }
 
-      // Fees in basis points and full fee recipients array
-      let openseaFeeBps = this.config.fees.openseaFeeBps;
-      let mandatoryRoyaltyFeeBps = 0;
-      let optionalRoyaltyFeeBps = 0;
-      let creatorFeeDisabled = false;
-      const rawFees: FeeRecipient[] = [];
+    // Fees in basis points and full fee recipients array
+    let openseaFeeBps = this.config.fees.openseaFeeBps;
+    let mandatoryRoyaltyFeeBps = 0;
+    let optionalRoyaltyFeeBps = 0;
+    let creatorFeeDisabled = false;
+    const rawFees: FeeRecipient[] = [];
 
-      if (collectionData?.fees && Array.isArray(collectionData.fees) && collectionData.fees.length > 0) {
-        for (const f of collectionData.fees) {
-          const bps = Math.round((f.fee || 0) * 100);
-          const isOpensea = f.recipient?.toLowerCase().includes('opensea') ||
-            f.recipient?.toLowerCase() === '0x0000a26b00c1f0df003000390027140000faa719';
+    if (collectionData?.fees && Array.isArray(collectionData.fees) && collectionData.fees.length > 0) {
+      for (const f of collectionData.fees) {
+        const bps = Math.round((f.fee || 0) * 100);
+        const isOpensea = f.recipient?.toLowerCase().includes('opensea') ||
+          f.recipient?.toLowerCase() === '0x0000a26b00c1f0df003000390027140000faa719';
 
-          if (isOpensea) {
-            openseaFeeBps = bps;
+        if (isOpensea) {
+          openseaFeeBps = bps;
+          rawFees.push({
+            fee: f.fee,
+            recipient: f.recipient,
+            required: true,
+            disabled: false
+          });
+        } else {
+          // Mandatory vs Optional Creator Fee Rule:
+          // - Optional: If creator fee can be disabled (f.required === false), disable it before proceeding.
+          // - Mandatory: If creator fee cannot be disabled (f.required === true), include in profitability calculations.
+          // - Unverified: If status cannot be verified (required === undefined), never assume zero!
+          if (f.required === false) {
+            optionalRoyaltyFeeBps += bps;
+            creatorFeeDisabled = true;
+            rawFees.push({
+              fee: f.fee,
+              recipient: f.recipient,
+              required: false,
+              disabled: true
+            });
+            logger.info(
+              { collectionSlug, recipient: f.recipient, feeBps: bps },
+              `[Creator Fee Rule] Optional creator fee detected (${bps} bps). Automatically DISABLED (set to 0% in Seaport consideration & profit calculations).`
+            );
+          } else {
+            mandatoryRoyaltyFeeBps += bps;
             rawFees.push({
               fee: f.fee,
               recipient: f.recipient,
               required: true,
               disabled: false
             });
-          } else {
-            // Mandatory vs Optional Creator Fee Rule:
-            // - Optional: If creator fee can be disabled (f.required === false), disable it before proceeding.
-            // - Mandatory: If creator fee cannot be disabled (f.required === true), include in profitability calculations.
-            // - Unverified: If status cannot be verified (required === undefined), never assume zero!
-            if (f.required === false) {
-              optionalRoyaltyFeeBps += bps;
-              creatorFeeDisabled = true;
-              rawFees.push({
-                fee: f.fee,
-                recipient: f.recipient,
-                required: false,
-                disabled: true
-              });
-              logger.info(
-                { collectionSlug, recipient: f.recipient, feeBps: bps },
-                `[Creator Fee Rule] Optional creator fee detected (${bps} bps). Automatically DISABLED (set to 0% in Seaport consideration & profit calculations).`
-              );
-            } else {
-              mandatoryRoyaltyFeeBps += bps;
-              rawFees.push({
-                fee: f.fee,
-                recipient: f.recipient,
-                required: true,
-                disabled: false
-              });
-              logger.info(
-                { collectionSlug, recipient: f.recipient, feeBps: bps, required: f.required },
-                `[Creator Fee Rule] Mandatory creator fee detected (${bps} bps). Included in all profitability calculations and order considerations.`
-              );
-            }
+            logger.info(
+              { collectionSlug, recipient: f.recipient, feeBps: bps, required: f.required },
+              `[Creator Fee Rule] Mandatory creator fee detected (${bps} bps). Included in all profitability calculations and order considerations.`
+            );
           }
         }
-      } else {
-        // If fee metadata cannot be verified from marketplace API, DO NOT assume zero!
-        // Core rule: Never assume a fee is zero without verification.
-        mandatoryRoyaltyFeeBps = this.config.fees.defaultRoyaltyBps;
-        logger.warn(
-          { collectionSlug, defaultRoyaltyBps: this.config.fees.defaultRoyaltyBps },
-          `[Creator Fee Rule] Fee metadata could not be verified from marketplace API. Applying default creator fee (${this.config.fees.defaultRoyaltyBps} bps) in calculations.`
-        );
       }
+    } else {
+      // If fee metadata cannot be verified from marketplace API, DO NOT assume zero!
+      // Core rule: Never assume a fee is zero without verification.
+      mandatoryRoyaltyFeeBps = this.config.fees.defaultRoyaltyBps;
+      logger.warn(
+        { collectionSlug, defaultRoyaltyBps: this.config.fees.defaultRoyaltyBps },
+        `[Creator Fee Rule] Fee metadata could not be verified from marketplace API. Applying default creator fee (${this.config.fees.defaultRoyaltyBps} bps) in calculations.`
+      );
+    }
 
-      // The applicable creator fee in all profitability calculations:
-      // Includes only mandatory royalties (optional fees were disabled to 0)
-      const royaltyFeeBps = mandatoryRoyaltyFeeBps;
+    // The applicable creator fee in all profitability calculations:
+    // Includes only mandatory royalties (optional fees were disabled to 0)
+    const royaltyFeeBps = mandatoryRoyaltyFeeBps;
 
-      // 2. Fetch best listings & floor from stats
-      let floorPriceEth = 0.05; // Fallback
-      let sales24Hours = 0;
-      try {
+
+    const feeFields = { openseaFeeBps, royaltyFeeBps, mandatoryRoyaltyFeeBps, optionalRoyaltyFeeBps, creatorFeeDisabled, fees: rawFees };
+
+    // STAGE 2 (cheap, cached; long TTL once fully minted): 100% mint-out
+    const collectionTotalSupply = typeof collectionData?.total_supply === 'number' ? collectionData.total_supply : undefined;
+    const mintKey = `${net}:${collectionSlug}:${(contractAddress || '').toLowerCase()}`;
+    let mintSrc = this.mintCache.get(mintKey);
+    if (!mintSrc) {
+      const [drop, onChain] = await Promise.all([
+        this.getDropSupply(collectionSlug),
+        this.readOnChainSupply(contractAddress, networkKey).catch(() => ({} as { totalSupply?: number; maxSupply?: number }))
+      ]);
+      mintSrc = { drop, onChain };
+    }
+    const mint = OpenSeaApiService.evaluateMintSupply({
+      collectionTotalSupply,
+      collectionIsMinting: collectionData?.is_minting === true ? true : undefined,
+      dropTotalSupply: mintSrc.drop.totalSupply,
+      dropMaxSupply: mintSrc.drop.maxSupply,
+      dropIsMinting: mintSrc.drop.isMinting,
+      onChainTotalSupply: mintSrc.onChain.totalSupply,
+      onChainMaxSupply: mintSrc.onChain.maxSupply
+    });
+    const mintCompleted = mint.verified && mint.completed;
+    if (!mintSrc.drop.unavailable) {
+      this.mintCache.set(mintKey, mintSrc, mintCompleted ? this.ttl('mintComplete', 6 * 3600_000) : this.ttl('mintIncomplete', 2 * 60_000));
+    }
+    const mintFields = {
+      isMinting: mint.isMinting,
+      totalSupply: mint.totalSupply,
+      maxSupply: mint.maxSupply,
+      mintCompleted,
+      mintStatusVerified: mint.verified
+    };
+    if (!mintCompleted) {
+      if (mintSrc.drop.unavailable && !(mint.verified && !mint.completed)) {
+        return unavailable('mint-out supply (OpenSea drops API)', undefined, { ...feeFields, ...mintFields });
+      }
+      const reason = `${mint.reason} (sources: ${mint.source}). Core rule: If mint-out is not 100% complete or cannot be verified, DO NOT OFFER ❌`;
+      return {
+        ...base(), ...feeFields, ...mintFields,
+        earlyRejectReason: reason,
+        mintDemandReason: reason,
+        liquidityReason: 'Not evaluated: rejected at mint-out stage (sales not fetched)'
+      };
+    }
+
+    // STAGE 3 (no request): mandatory creator fee above ceiling -> reject before any expensive fetch
+    if (royaltyFeeBps > this.config.fees.maxAcceptableRoyaltyBps) {
+      const reason = `Mandatory creator fee (${royaltyFeeBps} bps) exceeds acceptable maximum (${this.config.fees.maxAcceptableRoyaltyBps} bps).`;
+      return {
+        ...base(), ...feeFields, ...mintFields, mintDemandPassed: true,
+        earlyRejectReason: reason,
+        liquidityReason: 'Not evaluated: rejected at creator-fee stage (sales not fetched)'
+      };
+    }
+
+    // STAGE 4 (cached ~60s): floor price & 24h stats
+    let floorPriceEth = 0;
+    let sales24Hours = 0;
+    try {
+      const stats = await this.cached(this.statsCache, collectionSlug, this.ttl('stats', 60_000), async () => {
         const statsRes = await this.client.get(`/collections/${collectionSlug}/stats`);
         const statsFloor = statsRes.data?.total?.floor_price;
         const symbol = statsRes.data?.total?.floor_price_symbol || 'ETH';
         const intervalSales = statsRes.data?.intervals?.find((i: any) => i.interval === 'one_day')?.sales;
-        if (intervalSales !== undefined) {
-          sales24Hours = intervalSales;
-        }
+        let floor = 0;
         if (statsFloor !== undefined && statsFloor !== null && (symbol === 'ETH' || symbol === 'WETH')) {
-          floorPriceEth = parseFloat(statsFloor);
+          floor = parseFloat(statsFloor);
         } else {
           const listingsRes = await this.client.get(`/listings/collection/${collectionSlug}/all?limit=5`);
           const listings = listingsRes.data?.listings || [];
           if (listings.length > 0) {
             const rawPrice = listings[0]?.price?.current?.value;
             const decimals = listings[0]?.price?.current?.decimals || 18;
-            floorPriceEth = parseFloat(rawPrice) / Math.pow(10, decimals);
+            floor = parseFloat(rawPrice) / Math.pow(10, decimals);
           }
         }
-      } catch (err: any) {
-        logger.debug(`Could not fetch active listings via API for ${collectionSlug}: ${err.message}`);
-      }
-
-      // 3. Fetch best offers
-      let topOfferEth = 0; // Default 0 (never default to dummy 0.04 ETH)
-      try {
-        const offersRes = await this.client.get(`/offers/collection/${collectionSlug}/all?limit=100`);
-        const offers = offersRes.data?.offers || [];
-        for (const off of offers) {
-          const offerEth = OpenSeaApiService.perUnitOfferPriceEth(off);
-          // Only compete with valid collection offers that are strictly below floor price
-          if (offerEth > 0 && offerEth < floorPriceEth && offerEth > topOfferEth) {
-            topOfferEth = offerEth;
-          }
-        }
-      } catch (err: any) {
-        logger.debug(`Could not fetch active offers via API for ${collectionSlug}: ${err.message}`);
-      }
-
-      // 4. Fetch Liquidity Metrics with floor reference
-      const liquidity = await this.getCollectionLiquidity(collectionSlug, floorPriceEth, sales24Hours);
-
-      // 5. Incomplete Public Mint & 100% Mint-Out Metrics — combine on-chain supply, OpenSea Drops API and
-      //    OpenSea collection data. Reject unless 100% mint-out is positively verified.
-      const collectionTotalSupply = typeof collectionData?.total_supply === 'number' ? collectionData.total_supply : undefined;
-      const [drop, onChain] = await Promise.all([
-        this.getDropSupply(collectionSlug),
-        this.readOnChainSupply(contractAddress, networkKey).catch(() => ({} as { totalSupply?: number; maxSupply?: number }))
-      ]);
-      const mint = OpenSeaApiService.evaluateMintSupply({
-        collectionTotalSupply,
-        collectionIsMinting: collectionData?.is_minting === true ? true : undefined,
-        dropTotalSupply: drop.totalSupply,
-        dropMaxSupply: drop.maxSupply,
-        dropIsMinting: drop.isMinting,
-        onChainTotalSupply: onChain.totalSupply,
-        onChainMaxSupply: onChain.maxSupply
+        return { floor, sales24Hours: intervalSales ?? 0 };
       });
-      const isMinting = mint.isMinting;
-      const totalSupply = mint.totalSupply;
-      const maxSupply = mint.maxSupply;
-      const mintCompleted = mint.verified && mint.completed;
-      const mintStatusVerified = mint.verified;
-      let mintDemandPassed = mintCompleted;
-      let mintDemandReason: string | undefined = mintCompleted
-        ? undefined
-        : `${mint.reason} (sources: ${mint.source}). Core rule: If mint-out is not 100% complete or cannot be verified, DO NOT OFFER ❌`;
+      floorPriceEth = stats.floor;
+      sales24Hours = stats.sales24Hours;
+    } catch (err: any) {
+      return unavailable('floor price / stats', err, { ...feeFields, ...mintFields });
+    }
+    if (!(floorPriceEth > 0)) {
+      return unavailable('floor price (no ETH floor reported)', undefined, { ...feeFields, ...mintFields });
+    }
 
-      if (!liquidity.liquidityPassed) {
-        mintDemandPassed = false;
-        if (!mintDemandReason) {
-          mintDemandReason = `Collection lacks reliable secondary-market liquidity (${liquidity.liquidityReason || 'low sales/wallets'}).`;
+    // STAGE 5 (cached ~20s): best collection offers (competitiveness / outbid detection)
+    let topOfferEth = 0; // Default 0 (never default to dummy 0.04 ETH)
+    try {
+      const offers: any[] = await this.cached(this.offersCache, collectionSlug, this.ttl('offers', 20_000), async () => (await this.client.get(`/offers/collection/${collectionSlug}/all?limit=100`)).data?.offers || []);
+      for (const off of offers) {
+        const offerEth = OpenSeaApiService.perUnitOfferPriceEth(off);
+        // Only compete with valid collection offers that are strictly below floor price
+        if (offerEth > 0 && offerEth < floorPriceEth && offerEth > topOfferEth) {
+          topOfferEth = offerEth;
         }
       }
-
-      return {
-        slug: collectionSlug,
-        contractAddress,
-        floorPriceEth,
-        topOfferEth,
-        numListings: 10,
-        openseaFeeBps,
-        royaltyFeeBps,
-        mandatoryRoyaltyFeeBps,
-        optionalRoyaltyFeeBps,
-        creatorFeeDisabled,
-        ethPriceUsd,
-        timestamp: Date.now(),
-        fees: rawFees,
-        sales1Hour: liquidity.sales1Hour,
-        uniqueWallets1Hour: liquidity.uniqueWallets1Hour,
-        sales3Hours: liquidity.sales3Hours,
-        uniqueWallets3Hours: liquidity.uniqueWallets3Hours,
-        sales24Hours,
-        floorSalesCount: liquidity.sales3Hours,
-        liquidityPassed: liquidity.liquidityPassed,
-        liquidityReason: liquidity.liquidityReason,
-        isMinting,
-        mintCompleted,
-        mintStatusVerified,
-        totalSupply,
-        maxSupply,
-        mintDemandPassed,
-        mintDemandReason
-      };
     } catch (err: any) {
-      logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch OpenSea market data via API, generating conservative market estimate');
-      
-      // Conservative fallback
-      return {
-        slug: collectionSlug,
-        contractAddress,
-        floorPriceEth: 0.045,
-        topOfferEth: 0.038,
-        numListings: 20,
-        openseaFeeBps: this.config.fees.openseaFeeBps,
-        royaltyFeeBps: this.config.fees.defaultRoyaltyBps,
-        ethPriceUsd,
-        timestamp: Date.now(),
-        sales1Hour: 0,
-        uniqueWallets1Hour: 0,
-        sales3Hours: 0,
-        uniqueWallets3Hours: 0,
-        liquidityPassed: false,
-        liquidityReason: 'Conservative fallback on error',
-        isMinting: false,
-        mintCompleted: false,
-        mintStatusVerified: false,
-        mintDemandPassed: false,
-        mintDemandReason: 'Conservative fallback on error'
-      };
+      return unavailable('collection offers', err, { ...feeFields, ...mintFields, floorPriceEth });
     }
+
+    // STAGE 6 (most expensive, paginated; cached ~2 min): native-ETH floor sales in last 3 hours
+    const liquidity = await this.getCollectionLiquidity(collectionSlug, floorPriceEth, sales24Hours);
+    if (liquidity.dataUnavailable) {
+      return unavailable('recent sales events', liquidity.liquidityReason, { ...feeFields, ...mintFields, floorPriceEth, topOfferEth });
+    }
+
+    let mintDemandPassed = true;
+    let mintDemandReason: string | undefined;
+    if (!liquidity.liquidityPassed) {
+      mintDemandPassed = false;
+      mintDemandReason = `Collection lacks reliable secondary-market liquidity (${liquidity.liquidityReason || 'low sales/wallets'}).`;
+    }
+
+    return {
+      slug: collectionSlug,
+      contractAddress,
+      floorPriceEth,
+      topOfferEth,
+      numListings: 10,
+      ...feeFields,
+      ethPriceUsd,
+      timestamp: Date.now(),
+      sales1Hour: liquidity.sales1Hour,
+      uniqueWallets1Hour: liquidity.uniqueWallets1Hour,
+      sales3Hours: liquidity.sales3Hours,
+      uniqueWallets3Hours: liquidity.uniqueWallets3Hours,
+      sales24Hours,
+      floorSalesCount: liquidity.sales3Hours,
+      liquidityPassed: liquidity.liquidityPassed,
+      liquidityReason: liquidity.liquidityReason,
+      ...mintFields,
+      mintDemandPassed,
+      mintDemandReason
+    };
   }
 
   /**
@@ -402,6 +493,7 @@ export class OpenSeaApiService {
     uniqueWallets1Hour: number;
     liquidityPassed: boolean;
     liquidityReason?: string;
+    dataUnavailable?: boolean;
   }> {
     const minSales = this.config.liquidity?.minSales3Hours ?? 10;
     const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 5;
@@ -416,15 +508,20 @@ export class OpenSeaApiService {
     try {
       // Fetch ALL sale events from the last 3 hours (paginated, bounded) so busy collections are not undercounted
       const nowSec = Math.floor(Date.now() / 1000);
-      const events: any[] = [];
-      let next: string | undefined;
-      for (let page = 0; page < 10; page++) {
-        const url = `/events/collection/${collectionSlug}?event_type=sale&after=${threeHoursAgo}&limit=200` + (next ? `&next=${encodeURIComponent(next)}` : '');
-        const res = await this.client.get(url);
-        events.push(...(res.data?.asset_events || []));
-        next = res.data?.next;
-        if (!next) break;
-      }
+      // Cached ~2 min: a 15s cycle reuses the same pages instead of refetching up to 10 pages every time.
+      // Only complete pagination results are cached; a failure on any page throws and nothing is cached.
+      const events: any[] = await this.cached(this.salesEventsCache, collectionSlug, this.ttl('salesEvents', 120_000), async () => {
+        const all: any[] = [];
+        let next: string | undefined;
+        for (let page = 0; page < 10; page++) {
+          const url = `/events/collection/${collectionSlug}?event_type=sale&after=${threeHoursAgo}&limit=200` + (next ? `&next=${encodeURIComponent(next)}` : '');
+          const res = await this.client.get(url);
+          all.push(...(res.data?.asset_events || []));
+          next = res.data?.next;
+          if (!next) break;
+        }
+        return all;
+      });
 
       // Filter events to strictly last 3 hours (anything older, or without a valid timestamp, never counts)
       const sales3HoursRaw = events.filter((e: any) => {
@@ -539,14 +636,16 @@ export class OpenSeaApiService {
         liquidityReason
       };
     } catch (err: any) {
-      logger.warn({ slug: collectionSlug, error: err.message }, 'Failed to fetch liquidity events from OpenSea');
+      logger.warn({ slug: collectionSlug, status: err?.response?.status, error: err.message }, 'Failed to fetch liquidity events from OpenSea (after retries)');
+      // NOT a 0/10 rejection: the count is unknown. liquidityPassed stays false so no offer can be placed.
       return {
         sales3Hours: 0,
         uniqueWallets3Hours: 0,
         sales1Hour: 0,
         uniqueWallets1Hour: 0,
         liquidityPassed: false,
-        liquidityReason: `API error fetching liquidity: ${err.message}`
+        dataUnavailable: true,
+        liquidityReason: `SKIPPED (data unavailable, will retry): sales events ${err?.response?.status ?? ''} ${err.message}`
       };
     }
   }
