@@ -381,7 +381,10 @@ export class SeaportService {
 
     // Verify optional creator fees are truly disabled in listing order considerations before proceeding
     this.verifyOrderFees(feeConsiderations, fees);
-    this.verifyCreatorFeeDisabledBeforeSale(feeConsiderations, fees);
+    const preSaleCheck = this.verifyCreatorFeeDisabledBeforeSale(feeConsiderations, fees);
+    if (!preSaleCheck.verified) {
+      throw new Error(`NFT sale execution aborted: ${preSaleCheck.reason}`);
+    }
 
     const sellerWei = totalWei - totalFeesWei;
 

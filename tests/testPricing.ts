@@ -208,6 +208,11 @@ const lowVolumeData: CollectionMarketData = {
   timestamp: Date.now(),
   sales1Hour: 5,
   uniqueWallets1Hour: 2,
+  sales3Hours: 5,
+  uniqueWallets3Hours: 2,
+  mintStatusVerified: true,
+  totalSupply: 1000,
+  maxSupply: 1000,
   liquidityPassed: false
 };
 const lowVolCalc = pricingEngine.calculateMaxBid(lowVolumeData, 2.0, 10.0, 'robinhood');
@@ -227,7 +232,12 @@ const washTradingData: CollectionMarketData = {
   ethPriceUsd: 2700,
   timestamp: Date.now(),
   sales1Hour: 16,
-  uniqueWallets1Hour: 1, // Only 1 wallet!
+  uniqueWallets1Hour: 1,
+  sales3Hours: 16,
+  uniqueWallets3Hours: 1,
+  mintStatusVerified: true,
+  totalSupply: 1000,
+  maxSupply: 1000, // Only 1 wallet!
   liquidityPassed: false
 };
 const washCalc = pricingEngine.calculateMaxBid(washTradingData, 2.0, 10.0, 'robinhood');
@@ -248,6 +258,11 @@ const liquidData: CollectionMarketData = {
   timestamp: Date.now(),
   sales1Hour: 25,
   uniqueWallets1Hour: 12,
+  sales3Hours: 25,
+  uniqueWallets3Hours: 12,
+  mintStatusVerified: true,
+  totalSupply: 1000,
+  maxSupply: 1000,
   liquidityPassed: true
 };
 const liquidCalc = pricingEngine.calculateMaxBid(liquidData, 2.0, 10.0, 'robinhood');
@@ -271,6 +286,11 @@ const highMarginData: CollectionMarketData = {
   timestamp: Date.now(),
   sales1Hour: 20,
   uniqueWallets1Hour: 6,
+  sales3Hours: 20,
+  uniqueWallets3Hours: 6,
+  mintStatusVerified: true,
+  totalSupply: 1000,
+  maxSupply: 1000,
   liquidityPassed: true
 };
 const highMarginCalc = pricingEngine.calculateMaxBid(highMarginData, 0.20, 10.0, 'robinhood');
@@ -296,6 +316,11 @@ const expensiveData: CollectionMarketData = {
   timestamp: Date.now(),
   sales1Hour: 25,
   uniqueWallets1Hour: 8,
+  sales3Hours: 25,
+  uniqueWallets3Hours: 8,
+  mintStatusVerified: true,
+  totalSupply: 1000,
+  maxSupply: 1000,
   liquidityPassed: true
 };
 const expensiveCalc = pricingEngine.calculateMaxBid(expensiveData, 0.20, 10.0, 'robinhood');
@@ -365,6 +390,11 @@ const optionalFeeData: CollectionMarketData = {
   timestamp: Date.now(),
   sales1Hour: 25,
   uniqueWallets1Hour: 8,
+  sales3Hours: 25,
+  uniqueWallets3Hours: 8,
+  mintStatusVerified: true,
+  totalSupply: 1000,
+  maxSupply: 1000,
   liquidityPassed: true,
   fees: [
     { fee: 0.5, recipient: '0x0000a26b00c1f0df003000390027140000faa719', required: true }, // OpenSea
@@ -1251,7 +1281,10 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     uniqueWallets3Hours: 6,
     liquidityPassed: false,
     liquidityReason: 'Only 6 native ETH floor sales in last 3h (< 10 required)',
-    mintCompleted: true
+    mintCompleted: true,
+    mintStatusVerified: true,
+    totalSupply: 1000,
+    maxSupply: 1000
   };
   const calcFailedSales = pricingEngine.calculateMaxBid(baseEligibleData, 0.20, 10.0, 'robinhood');
   assert.strictEqual(calcFailedSales.checkLLiquidityPassed, false, 'Liquidity check must fail on sales volume');
@@ -1341,6 +1374,9 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     uniqueWallets3Hours: 9, // PASSED: >= 5
     liquidityPassed: true,
     mintCompleted: true,
+    mintStatusVerified: true,
+    totalSupply: 1000,
+    maxSupply: 1000,
     referenceFloorEth: 0.00165,
     floorDeclinePercent: 3.0 // PASSED: < 40%
   };
@@ -1502,8 +1538,9 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     sales1Hour: 5,
     uniqueWallets3Hours: 6,
     liquidityPassed: true,
-    isMintCompleted: true,
-    totalMinted: 10000,
+    mintCompleted: true,
+    mintStatusVerified: true,
+    totalSupply: 10000,
     maxSupply: 10000,
     referenceFloorEth: 0.0020
   });
@@ -1549,8 +1586,9 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     sales1Hour: 5,
     uniqueWallets3Hours: 6,
     liquidityPassed: true,
-    isMintCompleted: true,
-    totalMinted: 10000,
+    mintCompleted: true,
+    mintStatusVerified: true,
+    totalSupply: 10000,
     maxSupply: 10000,
     referenceFloorEth: 0.0020
   });
@@ -1594,8 +1632,9 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     sales1Hour: 5,
     uniqueWallets3Hours: 8,
     liquidityPassed: true,
-    isMintCompleted: true,
-    totalMinted: 10000,
+    mintCompleted: true,
+    mintStatusVerified: true,
+    totalSupply: 10000,
     maxSupply: 10000,
     referenceFloorEth: 0.0025
   });

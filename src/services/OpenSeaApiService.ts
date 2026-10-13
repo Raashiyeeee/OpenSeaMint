@@ -186,8 +186,10 @@ export class OpenSeaApiService {
         : (typeof collectionData?.stats?.total_supply === 'number' ? collectionData.stats.total_supply : undefined);
       const maxSupply = typeof collectionData?.max_supply === 'number' ? collectionData.max_supply : undefined;
 
-      let mintCompleted = true;
-      let mintStatusVerified = true;
+      // 100% Mint-Out Rule: mint-out must be POSITIVELY verified. Default to unverified/incomplete and only
+      // mark complete when both total and max supply are known and total >= max and no public mint is active.
+      let mintCompleted = false;
+      let mintStatusVerified = false;
       let mintDemandPassed = true;
       let mintDemandReason: string | undefined;
 
@@ -201,11 +203,12 @@ export class OpenSeaApiService {
         mintCompleted = false;
         mintDemandPassed = false;
         mintDemandReason = `Public mint is currently active (is_minting: true). Collection is not 100% minted out. Core rule: If mint-out is not 100% complete, DO NOT OFFER ❌`;
-      } else if (totalSupply === undefined && maxSupply === undefined && collectionData === undefined) {
-        mintStatusVerified = false;
-        mintCompleted = false;
+      } else if (maxSupply !== undefined && maxSupply > 0 && totalSupply !== undefined && totalSupply >= maxSupply) {
+        mintStatusVerified = true;
+        mintCompleted = true;
+      } else {
         mintDemandPassed = false;
-        mintDemandReason = 'Mint-out status could not be verified from reliable marketplace data. Core rule: If status cannot be verified, DO NOT OFFER ❌';
+        mintDemandReason = `Mint-out status could not be verified from reliable marketplace data (total_supply: ${totalSupply ?? 'unknown'}, max_supply: ${maxSupply ?? 'unknown'}). Core rule: If status cannot be verified, DO NOT OFFER ❌`;
       }
 
       if (!liquidity.liquidityPassed) {
@@ -267,6 +270,7 @@ export class OpenSeaApiService {
         liquidityReason: 'Conservative fallback on error',
         isMinting: false,
         mintCompleted: false,
+        mintStatusVerified: false,
         mintDemandPassed: false,
         mintDemandReason: 'Conservative fallback on error'
       };
@@ -303,17 +307,32 @@ export class OpenSeaApiService {
     const maxFloorAllowed = floorPriceEth > 0 ? floorPriceEth * floorMaxPercent : Infinity;
 
     try {
-      const res = await this.client.get(`/events/collection/${collectionSlug}?event_type=sale&limit=50`);
-      const events = res.data?.asset_events || [];
+      // Fetch ALL sale events from the last 3 hours (paginated, bounded) so busy collections are not undercounted
+      const nowSec = Math.floor(Date.now() / 1000);
+      const events: any[] = [];
+      let next: string | undefined;
+      for (let page = 0; page < 10; page++) {
+        const url = `/events/collection/${collectionSlug}?event_type=sale&after=${threeHoursAgo}&limit=50` + (next ? `&next=${encodeURIComponent(next)}` : '');
+        const res = await this.client.get(url);
+        events.push(...(res.data?.asset_events || []));
+        next = res.data?.next;
+        if (!next) break;
+      }
 
-      // Filter events to strictly last 3 hours
-      const sales3HoursRaw = events.filter((e: any) => (e.event_timestamp || 0) >= threeHoursAgo);
+      // Filter events to strictly last 3 hours (anything older, or without a valid timestamp, never counts)
+      const sales3HoursRaw = events.filter((e: any) => {
+        const ts = Number(e.event_timestamp);
+        return Number.isFinite(ts) && ts >= threeHoursAgo && ts <= nowSec + 60;
+      });
 
       const qualifiedSales: any[] = [];
       const wallets3Hours = new Set<string>();
 
       for (const sale of sales3HoursRaw) {
         // Must be an actual completed sale (exclude pending, cancelled, or failed events)
+        if (sale.event_type && sale.event_type.toLowerCase() !== 'sale') {
+          continue;
+        }
         const status = (sale.status || '').toLowerCase();
         if (status === 'pending' || status === 'cancelled' || status === 'failed' || status === 'reverted' || sale.is_completed === false) {
           continue;
@@ -325,7 +344,9 @@ export class OpenSeaApiService {
         const tokenAddr = (sale.payment?.token_address || sale.payment_token?.address || '').toLowerCase();
         const wethAddresses = ['0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', '0x0bd7d308f8e1639fab988df18a8011f41eacad73'];
 
-        if (symbol !== 'ETH' || tokenName.includes('WRAPPED') || wethAddresses.includes(tokenAddr)) {
+        // Native ETH is reported with the zero address as payment token; any other token address is not native ETH
+        const isNativeTokenAddr = tokenAddr === '' || tokenAddr === '0x0000000000000000000000000000000000000000';
+        if (symbol !== 'ETH' || tokenName.includes('WRAPPED') || wethAddresses.includes(tokenAddr) || !isNativeTokenAddr) {
           // WETH sales strictly excluded
           continue;
         }
@@ -373,7 +394,7 @@ export class OpenSeaApiService {
 
       const sales3Hours = qualifiedSales.length;
       const uniqueWallets3Hours = wallets3Hours.size;
-      const sales1HourList = qualifiedSales.filter((e: any) => (e.event_timestamp || 0) >= oneHourAgo);
+      const sales1HourList = qualifiedSales.filter((e: any) => Number(e.event_timestamp) >= oneHourAgo);
       const wallets1Hour = new Set<string>();
       for (const s of sales1HourList) {
         if (s.buyer) wallets1Hour.add(s.buyer.toLowerCase());
@@ -493,9 +514,8 @@ export class OpenSeaApiService {
     // 3. Live OpenSea v2 API cancellation
     try {
       const chainSlug = chain === 'mainnet' ? 'ethereum' : chain;
-      const res = await this.client.post(`/orders/${chainSlug}/seaport/offers/cancel`, {
-        order_hash: orderHash
-      });
+      const seaportAddress = this.config.seaport.contractAddress;
+      const res = await this.client.post(`/orders/chain/${chainSlug}/protocol/${seaportAddress}/${orderHash}/cancel`, {});
       logger.info({ orderHash, chain: chainSlug, data: res.data }, 'OpenSea accepted offer cancellation request');
       return { success: true };
     } catch (err: any) {
