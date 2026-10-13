@@ -16,7 +16,7 @@ export interface CapitalConfig {
   minNetProfitUsd: number;        // e.g. $0.20
   minOfferPriceUsd?: number;      // Strict floor: minimum $1.00 offer price per NFT
   maxBuyPriceUsd?: number;        // Strict ceiling: maximum $5.00 buy price
-  maxOfferCapitalPercent?: number; // e.g. 60.0 (Use up to 60% of total capital for simultaneous active offers)
+  maxOfferCapitalPercent?: number; // e.g. 70.0 (Max share of total capital committed to offers + purchased NFTs; capped at 70%, 30% reserved)
 }
 
 export interface LiquidityConfig {
@@ -261,3 +261,10 @@ export interface MarkItemSoldResult {
   netProceedsEth: number;
 }
 
+
+export interface OfferCyclePauseState {
+  paused: boolean;
+  pausedAt?: number;
+  purchasedCountAtPause: number;
+  soldSincePause: number;
+}

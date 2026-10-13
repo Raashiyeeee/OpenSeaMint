@@ -242,10 +242,18 @@ export class CollectionBidderStrategy {
     // b. Cancel When Outbid Rule: Automatically cancel existing offers if outbid by another buyer
     await this.processOutbidOfferCancellations();
 
+    // Capital Reallocation Rule: pause new offer cycles while the 70% allocation is fully committed to
+    // purchased NFTs, until at least 40% of them have sold (cancellation sweeps above still run).
+    const pauseCheck = this.inventoryManager.evaluateOfferCyclePause();
+    if (pauseCheck.paused) {
+      logger.warn({ pauseState: this.inventoryManager.getOfferCyclePauseState() }, `OFFER CYCLE PAUSED ⏸: ${pauseCheck.reason}`);
+      return;
+    }
+
     const activeNetworks = this.config.general.activeNetworks || ['robinhood', 'mainnet'];
     const totalCapitalUsd = this.inventoryManager.getTotalCapitalUsd();
     const activeOffersCapitalUsd = this.inventoryManager.getActiveOffersCapitalUsd();
-    const offerLimitPercent = this.config.capital?.maxOfferCapitalPercent ?? 60.0;
+    const offerLimitPercent = this.inventoryManager.getOfferAllocationPercent();
     const maxOfferCapitalUsd = (totalCapitalUsd * offerLimitPercent) / 100;
 
     logger.info(
@@ -486,7 +494,7 @@ export class CollectionBidderStrategy {
       calculation.bidPriceUsd = roundToPrecision(calculation.bidPriceEth * (marketData.ethPriceUsd || 2700), 2);
     }
 
-    // Final capital allocation check: Active offers allocation limit (e.g. 60% of total capital)
+    // Final capital allocation check: offers + purchased NFTs within 70% of total capital (30% reserved)
     const capitalLockCheck = this.inventoryManager.canAllocateCapitalForOffer(calculation.bidPriceUsd, marketData.ethPriceUsd);
     if (!capitalLockCheck.allowed) {
       logger.info(
@@ -844,7 +852,7 @@ export class CollectionBidderStrategy {
       calculation.bidPriceUsd = roundToPrecision(calculation.bidPriceEth * (marketData.ethPriceUsd || 2700), 2);
     }
 
-    // 3. Comply with configured 60% capital allocation limit
+    // 3. Comply with the 70% capital allocation limit (30% reserved) and offer-cycle pause
     const capitalCheck = this.inventoryManager.canAllocateCapitalForOffer(calculation.bidPriceUsd, marketData.ethPriceUsd);
     if (!capitalCheck.allowed) {
       return { success: false, reason: capitalCheck.reason };

@@ -1,5 +1,8 @@
 import assert from 'assert';
-import { Wallet } from 'ethers';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { Wallet, parseEther } from 'ethers';
 import { PricingEngine } from '../src/services/PricingEngine';
 import { InventoryManager } from '../src/services/InventoryManager';
 import { OpenSeaApiService } from '../src/services/OpenSeaApiService';
@@ -16,6 +19,9 @@ import { CollectionMarketData } from '../src/types';
  * Rule 3: Optional creator fee disabled (0 bps) before sale
  * Rule 4: Profitability (floor >= offer * 1.30, net profit >= configured minimum)
  * Rule 5: Recent floor sales (>= 10 completed native ETH floor sales in last 3 hours)
+ * Rule 6: Post-sale 90% ETH -> WETH wrap (10% kept as gas), verified on-chain
+ * Rule 7: No re-offer on a bought NFT until it is sold (persisted across restarts)
+ * Rule 8: 70% capital allocation / 30% reserve, pause until 40% of purchased NFTs sell
  *
  * All network access is stubbed. No live markets are touched and no orders are posted.
  */
@@ -291,6 +297,136 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   const calc5 = pricingEngine.calculateMaxBid(noThreeHour, 0.20, 10.0, 'robinhood');
   assert.strictEqual(calc5.checkLLiquidityPassed, false, 'Missing 3h count must not fall back to 1h data');
   console.log('Case R5b PASSED: Missing 3-hour sales data rejects (no 1-hour fallback) ✅\n');
+
+  // ------------------------------------------------------------------------
+  // RULE 6: Post-sale ETH -> WETH conversion, verified
+  // ------------------------------------------------------------------------
+  console.log('--- Rule 6: Post-Sale 90% WETH Wrap (Verified) ---');
+  let wethBal = parseEther('0.01');
+  let depositedWei = 0n;
+  const fakeProvider: any = { getBalance: async () => parseEther('1') };
+  const wrapSigner = new Wallet(Wallet.createRandom().privateKey, fakeProvider);
+  const seaport6 = new SeaportService(config, wrapSigner);
+  let creditWeth = true;
+  (seaport6 as any).getWethContract = () => ({
+    balanceOf: async () => wethBal,
+    deposit: async ({ value }: { value: bigint }) => {
+      depositedWei = value;
+      return { hash: '0xwrap', wait: async () => { if (creditWeth) wethBal += value; return { status: 1, hash: '0xwrap' }; } };
+    }
+  });
+  const conv = await seaport6.handlePostSaleEthConversion(0.01, 'robinhood');
+  assert.strictEqual(conv.success, true, 'Wrap must succeed');
+  assert.strictEqual(conv.verified, true, 'Wrap must be verified via WETH balance delta');
+  assert.strictEqual(conv.amountWrappedEth, 0.009, 'Exactly 90% must be wrapped');
+  assert.strictEqual(conv.gasReserveRetainedEth, 0.001, 'Remaining 10% kept as ETH gas reserve');
+  assert.strictEqual(depositedWei, parseEther('0.009'), 'deposit() value must equal 90% of proceeds');
+  // 6b. WETH balance did not increase -> not verified
+  creditWeth = false;
+  const convBad = await seaport6.handlePostSaleEthConversion(0.01, 'robinhood');
+  assert.strictEqual(convBad.verified, false, 'Wrap without WETH balance increase must fail verification');
+  assert.strictEqual(convBad.success, false);
+  // 6c. Partial wrap (e.g. balance capped) is a failure, not a silent success
+  const seaport6c = new SeaportService(config, Wallet.createRandom());
+  (seaport6c as any).swapEthToWeth = async () => ({ success: true, verified: true, amountWrappedEth: 0.004 });
+  const convPartial = await seaport6c.handlePostSaleEthConversion(0.01, 'robinhood');
+  assert.strictEqual(convPartial.verified, false, 'Partial wrap must not count as verified');
+  console.log('Case R6a-c PASSED: 90% wrapped / 10% kept as gas; wrap verified by receipt + WETH balance delta ✅\n');
+
+  // ------------------------------------------------------------------------
+  // RULE 7: No re-offer on bought NFT until sold (persisted)
+  // ------------------------------------------------------------------------
+  console.log('--- Rule 7: Re-Offer Rule (Persisted) ---');
+  const stateFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'osm-state-')), 'inventory-state.json');
+  const nftContract = '0xabcdefabcdefabcdefabcdefabcdefabcdef0001';
+  const inv7 = new InventoryManager(config, stateFile);
+  inv7.addInventoryItem({
+    identifier: `${nftContract}:7`, collectionSlug: 'rule7', contractAddress: nftContract, tokenId: '7',
+    acquiredPriceEth: 0.0008, acquiredPriceUsd: 2.16, acquiredAtTimestamp: Date.now(), status: 'PENDING_LISTING'
+  });
+  assert.strictEqual(inv7.canPlaceOfferOnNft(nftContract, '7').allowed, false, 'Bought NFT must be blocked');
+  // Simulated restart: new manager loaded from disk must still block
+  const inv7Restarted = new InventoryManager(config, stateFile);
+  assert.strictEqual(inv7Restarted.canPlaceOfferOnNft(nftContract, '7').allowed, false, 'Block must survive restart');
+  inv7Restarted.updateListingStatus(`${nftContract}:7`, 0.0012, 'list_1');
+  const inv7Restarted2 = new InventoryManager(config, stateFile);
+  assert.strictEqual(inv7Restarted2.canPlaceOfferOnNft(nftContract, '7').allowed, false, 'Listed-but-unsold NFT stays blocked after restart');
+  inv7Restarted2.markItemSold(`${nftContract}:7`, 0.0012, 2700);
+  const inv7AfterSale = new InventoryManager(config, stateFile);
+  assert.strictEqual(inv7AfterSale.isNftSaleConfirmed(nftContract, '7'), true, 'Sale confirmation must persist');
+  assert.strictEqual(inv7AfterSale.canPlaceOfferOnNft(nftContract, '7', 1.5).allowed, true, 'After confirmed sale, NFT may be offered on again (subject to criteria)');
+  // Item-bid path enforces the block before anything else
+  const api7 = new OpenSeaApiService(config);
+  let api7Calls = 0;
+  (api7 as any).getCollectionMarketData = async () => { api7Calls++; return baseMarketData(); };
+  const inv7b = new InventoryManager(config);
+  inv7b.addInventoryItem({
+    identifier: `${nftContract}:8`, collectionSlug: 'rule7', contractAddress: nftContract, tokenId: '8',
+    acquiredPriceEth: 0.0008, acquiredAtTimestamp: Date.now(), status: 'LISTED'
+  });
+  const { bidder: bidder7 } = makeBidder(api7, inv7b);
+  const itemBid7 = await bidder7.placeItemBid({ contractAddress: nftContract, tokenId: '8', collectionSlug: 'rule7' });
+  assert.strictEqual(itemBid7.success, false, 'Item bid on owned NFT must be rejected');
+  assert.strictEqual(api7Calls, 0, 'Rejected before any market evaluation');
+  console.log('Case R7a-c PASSED: Owned NFT blocked across restarts; re-offer allowed only after confirmed sale ✅\n');
+
+  // ------------------------------------------------------------------------
+  // RULE 8: 70% allocation / 30% reserve, pause & resume
+  // ------------------------------------------------------------------------
+  console.log('--- Rule 8: Capital Reallocation ---');
+  const inv8 = new InventoryManager(config);
+  assert.strictEqual(inv8.getOfferAllocationLimitUsd(), 7.0, '70% of $10 = $7.00');
+  const cfgHigh = { ...config, capital: { ...config.capital, maxOfferCapitalPercent: 95 } };
+  assert.strictEqual(new InventoryManager(cfgHigh as any).getOfferAllocationPercent(), 70, 'Allocation can never exceed 70%');
+  assert.strictEqual(inv8.canAllocateCapitalForOffer(7.0).allowed, true, 'Up to $7.00 allowed');
+  assert.strictEqual(inv8.canAllocateCapitalForOffer(7.01).allowed, false, 'Above $7.00 blocked (30% reserve)');
+  // Purchased NFTs count against the 70%
+  for (let i = 0; i < 5; i++) {
+    inv8.addInventoryItem({
+      identifier: `${nftContract}:${100 + i}`, collectionSlug: 'rule8', contractAddress: nftContract, tokenId: `${100 + i}`,
+      acquiredPriceEth: 0.0005, acquiredPriceUsd: 1.40, acquiredAtTimestamp: Date.now(), status: 'LISTED'
+    });
+  }
+  // $7.00 committed to 5 purchased NFTs -> fully committed -> pause
+  assert.strictEqual(inv8.canAllocateCapitalForOffer(1.0).allowed, false, 'No room left inside the 70% allocation');
+  const p1 = inv8.evaluateOfferCyclePause();
+  assert.strictEqual(p1.paused, true, 'Must pause when 70% is fully committed to purchased NFTs');
+  assert.strictEqual(inv8.getOfferCyclePauseState().purchasedCountAtPause, 5);
+  inv8.markItemSold(`${nftContract}:100`, 0.0008, 2700);
+  assert.strictEqual(inv8.evaluateOfferCyclePause().paused, true, '1/5 sold (20%) -> still paused');
+  assert.strictEqual(inv8.canAllocateCapitalForOffer(1.0).allowed, false, 'No offers while paused, even with freed capital');
+  inv8.markItemSold(`${nftContract}:101`, 0.0008, 2700);
+  const p3 = inv8.evaluateOfferCyclePause();
+  assert.strictEqual(p3.paused, false, '2/5 sold (40%) -> resume');
+  const newLimit = inv8.getOfferAllocationLimitUsd();
+  assert.strictEqual(newLimit, Math.round(inv8.getTotalCapitalUsd() * 0.7 * 100) / 100, 'Resumes with 70% of then-available capital');
+  assert(inv8.getTotalCapitalUsd() > 10.0, 'Realized profit grows available capital');
+  // Strategy: paused cycle places no offers / does no discovery
+  const api8 = new OpenSeaApiService(config);
+  let discoveries = 0;
+  (api8 as any).discoverCollectionsByChain = async () => { discoveries++; return []; };
+  const inv8b = new InventoryManager(config);
+  for (let i = 0; i < 5; i++) {
+    inv8b.addInventoryItem({
+      identifier: `${nftContract}:${200 + i}`, collectionSlug: 'rule8', contractAddress: nftContract, tokenId: `${200 + i}`,
+      acquiredPriceEth: 0.0005, acquiredPriceUsd: 1.40, acquiredAtTimestamp: Date.now(), status: 'LISTED'
+    });
+  }
+  const { bidder: bidder8 } = makeBidder(api8, inv8b);
+  await bidder8.evaluateAndPlaceBids();
+  assert.strictEqual(discoveries, 0, 'Paused offer cycle must not scan or place offers');
+  // Pause state persists across restarts
+  const stateFile8 = path.join(path.dirname(stateFile), 'pause-state.json');
+  const inv8c = new InventoryManager(config, stateFile8);
+  for (let i = 0; i < 5; i++) {
+    inv8c.addInventoryItem({
+      identifier: `${nftContract}:${300 + i}`, collectionSlug: 'rule8', contractAddress: nftContract, tokenId: `${300 + i}`,
+      acquiredPriceEth: 0.0005, acquiredPriceUsd: 1.40, acquiredAtTimestamp: Date.now(), status: 'LISTED'
+    });
+  }
+  inv8c.evaluateOfferCyclePause();
+  assert.strictEqual(new InventoryManager(config, stateFile8).getOfferCyclePauseState().paused, true, 'Pause must persist across restarts');
+  console.log('Case R8a-e PASSED: 70%/30% split, purchased NFTs counted, pause until 40% sold, resume at 70% of new capital ✅\n');
 
   process.env.BOT_MODE = originalBotMode;
   console.log('================================================================');

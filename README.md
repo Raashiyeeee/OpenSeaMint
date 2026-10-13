@@ -51,7 +51,7 @@ The bot discounts the floor price (undercut percentage) to account for liquidity
 
 ### Rule 5: Dual Check (Check A & Check B)
 Before every offer, both checks must pass:
-1. **Check A (Capital)**: Is sufficient capital available within the $10 limit and complying with the configured 60% capital allocation limit?
+1. **Check A (Capital)**: Is sufficient capital available within the $10 limit and complying with the 70% capital allocation limit (active offers + purchased NFTs; 30% always reserved)?
 2. **Check B (Profitability)**: Is expected net profit $\ge \$0.20$ after royalties, marketplace fees, and network gas?
 
 Only when **BOTH** pass is an offer placed.
@@ -59,7 +59,7 @@ Only when **BOTH** pass is an offer placed.
 ### Rule 6: NFT Re-Bidding & Simultaneous Offers Rule
 1. **Same NFT Re-Bidding Restriction**: Once an offer is accepted and the bot acquires an NFT, the bot must not place another offer on that same NFT while it is owned or while the previous trade remains unresolved.
 2. **No Re-Bidding Before Sale**: The bot must never place another offer on the same NFT before the previously acquired NFT has been sold and the sale has been confirmed.
-3. **Simultaneous Offers on Different NFTs**: The bot may place offers on multiple different NFT items simultaneously, even while an earlier NFT purchase is awaiting resale. Every new offer must independently pass all required criteria and comply with the configured 60% capital allocation limit.
+3. **Simultaneous Offers on Different NFTs**: The bot may place offers on multiple different NFT items simultaneously, even while an earlier NFT purchase is awaiting resale. Every new offer must independently pass all required criteria and comply with the 70% capital allocation limit (30% reserved).
 4. **Independent NFT Tracking**: The bot tracks each NFT separately, including its token ID, collection, active offers, ownership status, listing status, and sale confirmation.
 * **Core Rule**: Never place another offer on the same NFT before its previous position is sold. After confirmed sale, re-bidding is allowed only if all criteria pass again. Offers on different eligible NFTs may run simultaneously within the capital limit.
 
