@@ -8,3 +8,4 @@ dist/
 coverage/
 .agents/
 opensea-nft-trading-bot/
+data/

@@ -17,7 +17,7 @@
     "minOfferPriceUsd": 1.0,
     "maxBuyPriceUsd": 5.0,
     "minNetProfitUsd": 0.20,
-    "maxOfferCapitalPercent": 60.0
+    "maxOfferCapitalPercent": 70.0
   },
   "liquidity": {
     "minSales3Hours": 10,

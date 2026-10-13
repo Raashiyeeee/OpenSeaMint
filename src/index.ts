@@ -1,3 +1,4 @@
+import path from 'path';
 import http from 'http';
 import { ethers } from 'ethers';
 import { loadConfig } from './config/schema';
@@ -85,7 +86,9 @@ async function main() {
   const streamService = new OpenSeaStreamService(config, tradingWallet.address);
   const seaportService = new SeaportService(config, tradingWallet);
   const pricingEngine = new PricingEngine(config);
-  const inventoryManager = new InventoryManager(config);
+  // Re-Offer Rule: owned/unsold NFT state and capital pause state persist across restarts
+  const inventoryStatePath = process.env.INVENTORY_STATE_PATH || path.resolve(process.cwd(), 'data/inventory-state.json');
+  const inventoryManager = new InventoryManager(config, inventoryStatePath);
 
   // 6. Initialize strategies
   const bidderStrategy = new CollectionBidderStrategy(
@@ -168,7 +171,13 @@ async function main() {
         { identifier, targetNetwork, netProceedsEth: result.netProceedsEth },
         'NFT SALE CONFIRMED: Automatically converting 90% of received ETH into WETH (10% held for gas reserve)...'
       );
-      await seaportService.handlePostSaleEthConversion(result.netProceedsEth, targetNetwork);
+      const conversion = await seaportService.handlePostSaleEthConversion(result.netProceedsEth, targetNetwork);
+      if (!conversion.success || !conversion.verified) {
+        logger.error(
+          { identifier, targetNetwork, conversion },
+          'POST-SALE CONVERSION NOT VERIFIED ❌: WETH wrap did not succeed or could not be verified on-chain. Manual review required.'
+        );
+      }
     } catch (err: any) {
       logger.error({ err }, 'Error processing nft_sold event');
     }

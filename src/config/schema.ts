@@ -28,7 +28,7 @@ const CapitalSchema = z.object({
   minNetProfitUsd: z.number().nonnegative().default(0.20),
   minOfferPriceUsd: z.number().positive().default(1.00),
   maxBuyPriceUsd: z.number().positive().default(5.0),
-  maxOfferCapitalPercent: z.number().positive().max(100).default(60.0)
+  maxOfferCapitalPercent: z.number().positive().max(70).default(70.0)
 });
 
 const LiquiditySchema = z.object({
