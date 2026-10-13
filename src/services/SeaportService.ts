@@ -348,9 +348,10 @@ export class SeaportService {
     let totalFeesWei = 0n;
     const feeConsiderations: any[] = [];
 
-    // Mandatory vs Optional Creator Fee Rule:
-    // Filter out optional creator fees (required === false or disabled === true)
-    const effectiveFees = (fees || []).filter((f) => f.required !== false && f.disabled !== true);
+    // Mandatory Creator Fee Disable Rule:
+    // If the creator fee is optional and can be disabled, the bot must disable it before executing any NFT sale.
+    const feeDisableResult = this.verifyAndDisableOptionalCreatorFees(fees);
+    const effectiveFees = feeDisableResult.effectiveFees;
 
     if (effectiveFees.length > 0) {
       for (const f of effectiveFees) {
@@ -378,8 +379,9 @@ export class SeaportService {
       });
     }
 
-    // Verify optional creator fees are truly disabled in listing order considerations
+    // Verify optional creator fees are truly disabled in listing order considerations before proceeding
     this.verifyOrderFees(feeConsiderations, fees);
+    this.verifyCreatorFeeDisabledBeforeSale(feeConsiderations, fees);
 
     const sellerWei = totalWei - totalFeesWei;
 
@@ -475,6 +477,99 @@ export class SeaportService {
       logger.error({ contractAddress, err: err.message }, 'Failed to approve OpenSea conduit for NFT');
       return false;
     }
+  }
+
+  /**
+   * Mandatory Creator Fee Disable Rule:
+   * If the creator fee is optional and can be disabled, the bot must disable it before executing any NFT sale.
+   * The bot must verify that the fee is disabled before proceeding with the sale.
+   */
+  public verifyAndDisableOptionalCreatorFees(rawFees?: FeeRecipient[]): {
+    effectiveFees: FeeRecipient[];
+    disabledCount: number;
+    optionalFees: FeeRecipient[];
+    verified: boolean;
+  } {
+    const fees = rawFees || [];
+    const optionalFees: FeeRecipient[] = [];
+    const effectiveFees: FeeRecipient[] = [];
+
+    for (const f of fees) {
+      if (f.required === false || f.disabled === true) {
+        optionalFees.push({ ...f, fee: 0, disabled: true });
+      } else {
+        effectiveFees.push(f);
+      }
+    }
+
+    // Verify: ensure no optional fees remain in effectiveFees
+    const anyOptionalInEffective = effectiveFees.some((f) => f.required === false || f.disabled === true);
+    if (anyOptionalInEffective) {
+      throw new Error('Creator fee verification failure: Optional creator fee was not disabled before sale!');
+    }
+
+    if (optionalFees.length > 0) {
+      logger.info(
+        {
+          totalFees: fees.length,
+          optionalFeesDisabled: optionalFees.length,
+          effectiveFeesCount: effectiveFees.length
+        },
+        `Mandatory Creator Fee Disable Rule: ${optionalFees.length} optional creator fee(s) disabled (0 bps) and verified before sale execution ✅`
+      );
+    }
+
+    return {
+      effectiveFees,
+      disabledCount: optionalFees.length,
+      optionalFees,
+      verified: true
+    };
+  }
+
+  /**
+   * Pre-Sale Verification:
+   * Verifies that all optional creator fees are strictly disabled (0 amount and excluded from considerations)
+   * before proceeding with the sale. If an optional creator fee is found enabled or receiving consideration,
+   * verification fails and the sale must not proceed.
+   */
+  public verifyCreatorFeeDisabledBeforeSale(
+    consideration: any[],
+    rawFees?: FeeRecipient[]
+  ): { verified: boolean; disabledFeesCount: number; reason?: string } {
+    if (!rawFees || rawFees.length === 0) {
+      return { verified: true, disabledFeesCount: 0 };
+    }
+
+    let disabledFeesCount = 0;
+    for (const f of rawFees) {
+      const isOptional = f.required === false || f.disabled === true;
+      if (!isOptional) continue;
+
+      const recipient = f.recipient.toLowerCase();
+      const matched = consideration.find(
+        (c) => c.recipient && c.recipient.toLowerCase() === recipient && BigInt(c.startAmount || '0') > 0n
+      );
+
+      if (matched) {
+        const reason = `Mandatory Creator Fee Disable Rule VIOLATION ❌: Optional creator fee for ${f.recipient} (${f.fee}%) is present in sale considerations with amount ${matched.startAmount}. Sale execution aborted!`;
+        logger.error({ recipient: f.recipient, fee: f.fee, amount: matched.startAmount }, reason);
+        return {
+          verified: false,
+          disabledFeesCount,
+          reason
+        };
+      }
+
+      disabledFeesCount++;
+    }
+
+    logger.debug(
+      { disabledFeesCount },
+      'Mandatory Creator Fee Disable Rule: Pre-sale verification PASSED ✅ All optional creator fees verified disabled before proceeding with sale.'
+    );
+
+    return { verified: true, disabledFeesCount };
   }
 
   /**

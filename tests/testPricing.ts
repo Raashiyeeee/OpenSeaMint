@@ -1447,10 +1447,250 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   assert.strictEqual(reconcileSwap.gasReserveRetainedEth, 0.000248, 'Reconciled gas reserve retained must be exactly 10% of proceeds (0.002475 * 0.1 = 0.000248 ETH)');
   console.log('Case 18c PASSED: Reconciled sale automatically triggers 90% WETH conversion (' + reconcileSwap.amountWrappedEth + ' ETH) & 10% gas reserve (' + reconcileSwap.gasReserveRetainedEth + ' ETH)! ✅\n');
 
+  // --------------------------------------------------------------------------
+  // TEST 19: Automatic Offer Cancellation & Re-entry Rules
+  // 1. Cancel When Outbid: If another buyer places a higher offer, automatically cancel existing offer.
+  // 2. Recheck Eligibility: After cancellation, continue monitoring and place new offer ONLY if all criteria met.
+  // 3. 20-Minute Expiry: If not accepted within 20 minutes, automatically cancel.
+  // 4. Re-entry After Expiry: Recheck all trading criteria and place new offer only if qualifying.
+  // 5. No Stale Offers: Never leave outdated offers active after being outbid or after 20-minute expiry.
+  // --------------------------------------------------------------------------
+  console.log('--- Test 19: Automatic Offer Cancellation & Re-entry Rules ---');
+  const test19InvManager = new InventoryManager(config);
+  const test19Signer = Wallet.createRandom();
+  const test19Api = new OpenSeaApiService(config);
+  const test19Seaport = new SeaportService(config, test19Signer);
+  const test19Breaker = new CircuitBreaker(config);
+  const test19Bidder = new CollectionBidderStrategy(
+    config,
+    test19Api,
+    pricingEngine,
+    test19Seaport,
+    test19InvManager,
+    test19Breaker
+  );
+
+  // Case 19a: Outbid Scenario -> Cancel When Outbid -> Recheck Criteria -> Re-offer when eligible
+  const test19Slug = 'outbid-reentry-collection';
+  const test19Contract = '0x1111222233334444555566667777888899990001';
+
+  // Register existing bot offer at 0.001 ETH
+  test19InvManager.registerActiveOffer({
+    orderHash: 'offer_outbid_initial',
+    collectionSlug: test19Slug,
+    contractAddress: test19Contract,
+    network: 'robinhood',
+    priceEth: 0.001,
+    priceUsd: 2.70,
+    createdTimestamp: Date.now() - 5 * 60 * 1000, // 5 minutes old (not expired yet)
+    expiresTimestamp: Date.now() + 15 * 60 * 1000,
+    status: 'ACTIVE'
+  });
+
+  // Mock OpenSea market data: another buyer placed higher offer of 0.0011 ETH!
+  // Floor is 0.0020 ETH, 12 sales in 3h native ETH, 100% minted
+  (test19Api as any).getCollectionMarketData = async () => ({
+    collectionSlug: test19Slug,
+    contractAddress: test19Contract,
+    floorPriceEth: 0.0020,
+    topOfferEth: 0.0011, // Outbid!
+    openseaFeeBps: 50,
+    royaltyFeeBps: 0,
+    creatorFeeDisabled: true,
+    ethPriceUsd: 2700,
+    sales3Hours: 12,
+    sales1Hour: 5,
+    uniqueWallets3Hours: 6,
+    liquidityPassed: true,
+    isMintCompleted: true,
+    totalMinted: 10000,
+    maxSupply: 10000,
+    referenceFloorEth: 0.0020
+  });
+
+  (test19Api as any).cancelOffer = async () => ({ success: true });
+  (test19Api as any).verifyOfferInactive = async () => ({ isInactive: true });
+  (test19Api as any).postCollectionOffer = async () => ({ order_hash: 'offer_outbid_reentered' });
+  (test19Seaport as any).getWethBalance = async () => 1.0;
+
+  // Run outbid cancellation scan
+  const outbidScanResult = await test19Bidder.processOutbidOfferCancellations();
+  assert.strictEqual(outbidScanResult.cancelled, 1, 'Process outbid cancellations must cancel 1 outbid offer');
+  assert.strictEqual(test19InvManager.getActiveOffer('offer_outbid_initial'), undefined, 'Outbid offer must no longer be active in inventory');
+  console.log('Case 19a-1 PASSED: Outbid offer automatically detected, cancelled, and verified ✅ Stale offer removed!');
+
+  // Now evaluate collection: bot rechecks all criteria and places new higher competitive offer because it is eligible
+  await (test19Bidder as any).processCollectionBid({
+    name: 'Outbid Re-entry Collection',
+    slug: test19Slug,
+    contractAddress: test19Contract,
+    network: 'robinhood',
+    targetNetProfitUsd: 0.20
+  }, 'robinhood');
+
+  const newReenteredOffer = test19InvManager.getActiveOffer(test19Slug);
+  assert(newReenteredOffer !== undefined, 'Bot must re-offer on collection after cancellation when criteria qualify');
+  assert.strictEqual(newReenteredOffer.orderHash, 'offer_outbid_reentered', 'New offer must be registered');
+  assert(newReenteredOffer.priceEth > 0.001, 'New offer price must be higher than previous outbid offer');
+  console.log('Case 19a-2 PASSED: Recheck Eligibility confirmed criteria satisfied -> New offer placed at ' + newReenteredOffer.priceEth + ' ETH! ✅\n');
+
+  // Case 19b: Outbid Scenario where outbid price makes re-offer INELIGIBLE (Floor ratio fails or profit negative)
+  // Another buyer bids 0.0018 ETH on floor of 0.0020 ETH (Floor is NOT 30% higher: 0.0020 < 0.0018 * 1.30 = 0.00234)
+  (test19Api as any).getCollectionMarketData = async () => ({
+    collectionSlug: test19Slug,
+    contractAddress: test19Contract,
+    floorPriceEth: 0.0020,
+    topOfferEth: 0.0018, // High outbid! Floor ratio and net profit cannot be satisfied
+    openseaFeeBps: 50,
+    royaltyFeeBps: 0,
+    creatorFeeDisabled: true,
+    ethPriceUsd: 2700,
+    sales3Hours: 12,
+    sales1Hour: 5,
+    uniqueWallets3Hours: 6,
+    liquidityPassed: true,
+    isMintCompleted: true,
+    totalMinted: 10000,
+    maxSupply: 10000,
+    referenceFloorEth: 0.0020
+  });
+
+  // Execute processCollectionBid: should detect outbid -> cancel existing offer -> recheck criteria -> REJECT re-entry!
+  await (test19Bidder as any).processCollectionBid({
+    name: 'Outbid Re-entry Collection',
+    slug: test19Slug,
+    contractAddress: test19Contract,
+    network: 'robinhood',
+    targetNetProfitUsd: 0.20
+  }, 'robinhood');
+
+  const afterHighOutbidOffer = test19InvManager.getActiveOffer(test19Slug);
+  assert.strictEqual(afterHighOutbidOffer, undefined, 'When outbid price causes criteria failure, re-entry must be rejected (0 active offers)');
+  console.log('Case 19b PASSED: Outbid offer cancelled -> Recheck criteria failed (Floor < Offer * 1.30) -> Re-entry strictly rejected! No stale offer left active ✅\n');
+
+  // Case 19c: 20-Minute Expiry -> Cancel -> Recheck Criteria -> Re-offer if eligible
+  test19InvManager.registerActiveOffer({
+    orderHash: 'offer_expired_20m',
+    collectionSlug: 'expired-20m-collection',
+    contractAddress: '0x2222333344445555666677778888999900001111',
+    network: 'robinhood',
+    priceEth: 0.001,
+    priceUsd: 2.70,
+    createdTimestamp: Date.now() - 21 * 60 * 1000, // 21 minutes old (> 20 min cutoff)
+    expiresTimestamp: Date.now() + 10 * 60 * 1000,
+    status: 'ACTIVE'
+  });
+
+  (test19Api as any).getCollectionMarketData = async () => ({
+    collectionSlug: 'expired-20m-collection',
+    contractAddress: '0x2222333344445555666677778888999900001111',
+    floorPriceEth: 0.0025,
+    topOfferEth: 0.0009,
+    openseaFeeBps: 50,
+    royaltyFeeBps: 0,
+    creatorFeeDisabled: true,
+    ethPriceUsd: 2700,
+    sales3Hours: 15,
+    sales1Hour: 5,
+    uniqueWallets3Hours: 8,
+    liquidityPassed: true,
+    isMintCompleted: true,
+    totalMinted: 10000,
+    maxSupply: 10000,
+    referenceFloorEth: 0.0025
+  });
+  (test19Api as any).postCollectionOffer = async () => ({ order_hash: 'offer_expired_reentered' });
+
+  // Process automatic 20-minute cancellations
+  const expireResult = await test19Bidder.processAutomaticOfferCancellations(20);
+  assert.strictEqual(expireResult.cancelled, 1, 'Expired offer must be cancelled');
+  assert.strictEqual(test19InvManager.getActiveOffer('offer_expired_20m'), undefined, 'Expired offer must be removed');
+
+  // Re-evaluation: Criteria still qualify, so re-offer placed
+  await (test19Bidder as any).processCollectionBid({
+    name: 'Expired 20m Collection',
+    slug: 'expired-20m-collection',
+    contractAddress: '0x2222333344445555666677778888999900001111',
+    network: 'robinhood',
+    targetNetProfitUsd: 0.20
+  }, 'robinhood');
+
+  const reentered20mOffer = test19InvManager.getActiveOffer('expired-20m-collection');
+  assert(reentered20mOffer !== undefined, 'Bot must re-offer after 20-minute expiry when criteria still qualify');
+  assert.strictEqual(reentered20mOffer.orderHash, 'offer_expired_reentered', 'Re-entered offer must be active');
+  console.log('Case 19c PASSED: 20-Minute Expiry -> Cancelled & Verified -> Criteria Rechecked -> Re-offered successfully ✅\n');
+
+  // --------------------------------------------------------------------------
+  // TEST 20: Mandatory Creator Fee Disable Rule
+  // If creator fee is optional and can be disabled, bot must disable it before executing any NFT sale.
+  // The bot must verify that the fee is disabled before proceeding with the sale.
+  // --------------------------------------------------------------------------
+  console.log('--- Test 20: Mandatory Creator Fee Disable Rule ---');
+  const test20Signer = Wallet.createRandom();
+  const test20Seaport = new SeaportService(config, test20Signer);
+
+  // Case 20a: Optional Creator Fee is disabled to 0% and verified before sale
+  const rawFeesWithOptional = [
+    { recipient: '0x0000a26b00c1F0DF003000390027140000fAa719', fee: 0.5, required: true },
+    { recipient: '0x9999999999999999999999999999999999999999', fee: 5.0, required: false } // OPTIONAL creator fee
+  ];
+
+  const disableResult = test20Seaport.verifyAndDisableOptionalCreatorFees(rawFeesWithOptional);
+  assert.strictEqual(disableResult.verified, true, 'Verification must pass');
+  assert.strictEqual(disableResult.disabledCount, 1, 'Must detect 1 optional creator fee');
+  assert.strictEqual(disableResult.effectiveFees.length, 1, 'Only required OpenSea fee must remain in effectiveFees');
+  assert.strictEqual(disableResult.effectiveFees[0].recipient, '0x0000a26b00c1F0DF003000390027140000fAa719');
+
+  // Create signed listing
+  const signedListing = await test20Seaport.createSignedListing(
+    '0x3333444455556666777788889999000011112222',
+    '42',
+    0.01,
+    50,
+    30,
+    'robinhood',
+    rawFeesWithOptional
+  );
+
+  // Pre-sale verification check
+  const preSaleCheck = test20Seaport.verifyCreatorFeeDisabledBeforeSale(
+    signedListing.orderComponents.consideration,
+    rawFeesWithOptional
+  );
+  assert.strictEqual(preSaleCheck.verified, true, 'Pre-sale verification must confirm optional fee is disabled');
+  assert.strictEqual(preSaleCheck.disabledFeesCount, 1, '1 optional creator fee verified disabled');
+
+  // Verify that optional recipient received 0 ETH (is NOT in considerations)
+  const optionalRecipientInConsideration = signedListing.orderComponents.consideration.find(
+    (c: any) => c.recipient?.toLowerCase() === '0x9999999999999999999999999999999999999999'
+  );
+  assert.strictEqual(optionalRecipientInConsideration, undefined, 'Optional creator fee recipient must NOT receive consideration');
+  console.log('Case 20a PASSED: Optional creator fee (5%) successfully disabled (0 bps) and verified before sale execution ✅');
+
+  // Case 20b: Violation Detection - Sale strictly aborted if optional creator fee was not disabled
+  const violationConsideration = [
+    {
+      itemType: 0,
+      token: '0x0000000000000000000000000000000000000000',
+      identifierOrCriteria: '0',
+      startAmount: '10000000000000000',
+      endAmount: '10000000000000000',
+      recipient: '0x9999999999999999999999999999999999999999' // Optional creator fee recipient included with payment!
+    }
+  ];
+
+  const violationCheck = test20Seaport.verifyCreatorFeeDisabledBeforeSale(
+    violationConsideration,
+    rawFeesWithOptional
+  );
+  assert.strictEqual(violationCheck.verified, false, 'Pre-sale verification must FAIL if optional creator fee is present');
+  assert(violationCheck.reason?.includes('VIOLATION'), 'Reason must indicate mandatory creator fee disable rule violation');
+  console.log('Case 20b PASSED: Pre-sale verification strictly aborts sale if optional creator fee is not disabled: ' + violationCheck.reason + ' ✅\n');
+
   process.env.BOT_MODE = originalBotMode;
 
   console.log('================================================================');
-  console.log('All 18 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory, NFT Eligibility, Re-Bidding, Mint & Market Dump, 20-Minute Cancellation, and 90%/10% Post-Sale WETH Conversion tests passed successfully!');
+  console.log('All 20 Capital Allocation, Liquidity, Floor Protection, Creator Fee, Inventory, NFT Eligibility, Re-Bidding, Mint & Market Dump, 20-Minute Cancellation, Post-Sale WETH Conversion, Outbid Cancellation & Re-entry, and Mandatory Creator Fee Disable tests passed successfully!');
   console.log('================================================================');
 })().catch((err) => {
   console.error('Test Failed:', err);
