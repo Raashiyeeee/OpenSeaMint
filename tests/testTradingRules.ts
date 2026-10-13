@@ -108,23 +108,23 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   let chainStub: any = {};
   (mintApi as any).getDropSupply = async () => dropStub;
   (mintApi as any).readOnChainSupply = async () => chainStub;
-  const noMax = await mintApi.getCollectionMarketData('rules-collection', ZERO, 'robinhood');
+  const noMax = await (mintApi.clearCaches(), mintApi).getCollectionMarketData('rules-collection', ZERO, 'robinhood');
   assert.strictEqual(noMax.mintStatusVerified, false, 'Only total_supply known -> unverifiable');
   assert.strictEqual(noMax.mintCompleted, false, 'Unverifiable must not be treated as minted out');
   dropStub = { totalSupply: 500, maxSupply: 500, isMinting: false };
-  const viaDrop = await mintApi.getCollectionMarketData('rules-collection', ZERO, 'robinhood');
+  const viaDrop = await (mintApi.clearCaches(), mintApi).getCollectionMarketData('rules-collection', ZERO, 'robinhood');
   assert.strictEqual(viaDrop.mintStatusVerified, true, 'Drops API total == max must verify');
   assert.strictEqual(viaDrop.mintCompleted, true);
   dropStub = {};
   chainStub = { totalSupply: 500, maxSupply: 500 };
-  const viaChain = await mintApi.getCollectionMarketData('rules-collection', ZERO, 'robinhood');
+  const viaChain = await (mintApi.clearCaches(), mintApi).getCollectionMarketData('rules-collection', ZERO, 'robinhood');
   assert.strictEqual(viaChain.mintCompleted, true, 'On-chain totalSupply == maxSupply must verify');
   chainStub = { totalSupply: 480, maxSupply: 500 };
-  const chainIncomplete = await mintApi.getCollectionMarketData('rules-collection', ZERO, 'robinhood');
+  const chainIncomplete = await (mintApi.clearCaches(), mintApi).getCollectionMarketData('rules-collection', ZERO, 'robinhood');
   assert.strictEqual(chainIncomplete.mintCompleted, false, 'On-chain 480/500 must reject even if API total says 500');
   dropStub = { totalSupply: 500, maxSupply: 500, isMinting: true };
   chainStub = {};
-  assert.strictEqual((await mintApi.getCollectionMarketData('rules-collection', ZERO, 'robinhood')).mintCompleted, false, 'Active drop mint must reject');
+  assert.strictEqual((await (mintApi.clearCaches(), mintApi).getCollectionMarketData('rules-collection', ZERO, 'robinhood')).mintCompleted, false, 'Active drop mint must reject');
   // Pure decision rules
   assert.strictEqual(OpenSeaApiService.evaluateMintSupply({ dropMaxSupply: 0, dropTotalSupply: 100 }).verified, false, 'max_supply 0 (open edition/unknown) is unverifiable');
   assert.strictEqual(OpenSeaApiService.evaluateMintSupply({ onChainMaxSupply: 1000, onChainTotalSupply: 1000, collectionTotalSupply: 990 }).completed, false, 'Any source below max -> reject');
@@ -315,6 +315,7 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   assert(orderLookups >= 1, 'Sale order must be looked up to detect accepted offers');
   events.push(mk(9));
   page = 0;
+  salesApi.clearCaches(); // sales events are cached ~2 min; force a refetch for the new event set
   const liq10 = await salesApi.getCollectionLiquidity('rules-collection', 0.002);
   assert.strictEqual(liq10.sales3Hours, 10);
   assert.strictEqual(liq10.liquidityPassed, true, '10 qualifying sales must pass');

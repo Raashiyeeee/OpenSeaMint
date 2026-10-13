@@ -77,6 +77,26 @@ export class CollectionBidderStrategy {
    *  5. Profitability: floor >= Offer * 1.30 AND floor >= minimum acceptable floor (40% net margin after marketplace
    *     fee, applicable creator fee and gas) AND net profit >= configured minimum
    */
+  /**
+   * Returns true (and logs) when the collection must not be evaluated further this cycle:
+   *  - data unavailable after retries -> "SKIPPED (data unavailable, will retry)" (NOT a 0/10 rejection; never offers)
+   *  - rejected by a cheap check (mint-out / creator fee) before sales were fetched
+   */
+  public skipOrEarlyReject(marketData: CollectionMarketData, slug: string, network: string): boolean {
+    if (marketData.dataUnavailable) {
+      logger.warn(
+        { slug, network, reason: marketData.dataUnavailableReason },
+        `SKIPPED (data unavailable, will retry) [${network.toUpperCase()}]: ${slug}. No offer placed this cycle.`
+      );
+      return true;
+    }
+    if (marketData.earlyRejectReason) {
+      logger.info({ slug, network, reason: marketData.earlyRejectReason }, `OFFER REJECTED ❌ [${network.toUpperCase()}]: ${marketData.earlyRejectReason}`);
+      return true;
+    }
+    return false;
+  }
+
   public async finalPreOfferValidation(params: {
     collectionSlug: string;
     contractAddress: string;
@@ -90,6 +110,9 @@ export class CollectionBidderStrategy {
       fresh = await this.apiService.getCollectionMarketData(collectionSlug, contractAddress, networkKey);
     } catch (err: any) {
       return { passed: false, reason: `Final validation could not fetch fresh market data (${err.message}).` };
+    }
+    if (fresh.dataUnavailable) {
+      return { passed: false, reason: fresh.dataUnavailableReason || 'SKIPPED (data unavailable, will retry)', freshData: fresh };
     }
     const block = (reason: string) => {
       logger.error({ slug: collectionSlug, network: networkKey, bidPriceEth, reason }, `FINAL OFFER-EXECUTION BLOCKED 🛑: ${reason}`);
@@ -484,6 +507,9 @@ export class CollectionBidderStrategy {
 
     // 3. FETCH LATEST MARKET DATA
     const marketData = await this.apiService.getCollectionMarketData(target.slug, target.contractAddress, targetNetwork);
+    if (this.skipOrEarlyReject(marketData, target.slug, targetNetwork)) {
+      return; // stale offers are still cancelled by the global 20-minute expiry pass
+    }
 
     // 3.1. AUTOMATIC OFFER CANCELLATION & RE-ENTRY CHECK (Outbid & 20-Minute Expiry Rules)
     const existingOffer = this.inventoryManager.getActiveOffer(target.slug);
@@ -911,6 +937,9 @@ export class CollectionBidderStrategy {
 
     // 3. Market Data & Pre-Checks
     const marketData = await this.apiService.getCollectionMarketData(params.collectionSlug, params.contractAddress, targetNetwork);
+    if (this.skipOrEarlyReject(marketData, params.collectionSlug, targetNetwork)) {
+      return { success: false, reason: marketData.dataUnavailableReason || marketData.earlyRejectReason || 'Rejected' };
+    }
 
     // 3.0. Automatic Offer Cancellation & Re-entry Check for Item (Outbid & 20-Minute Expiry)
     const itemKey = `${params.contractAddress.toLowerCase()}:${params.tokenId}`;

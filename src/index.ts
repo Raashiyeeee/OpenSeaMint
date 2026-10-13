@@ -203,7 +203,14 @@ async function main() {
   // 8. Start Bidding Loop
   logger.info(`Entering main strategy loop (Interval: ${config.general.loopIntervalMs / 1000}s)`);
 
+  // Never overlap cycles: a slow (rate-limited) cycle must not stack a second one on top of it
+  let loopRunning = false;
   const runLoop = async () => {
+    if (loopRunning) {
+      logger.debug('Previous strategy cycle still running; skipping this tick');
+      return;
+    }
+    loopRunning = true;
     try {
       // 1. Reconcile on-chain wallet inventory (clear sold NFTs, list new ones)
       await relisterStrategy.scanAndRelistUnlistedInventory(tradingWallet.address);
@@ -211,6 +218,8 @@ async function main() {
       await bidderStrategy.evaluateAndPlaceBids();
     } catch (err: any) {
       logger.error({ err }, 'Unhandled error in strategy loop iteration');
+    } finally {
+      loopRunning = false;
     }
   };
 
