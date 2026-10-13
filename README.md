@@ -177,3 +177,11 @@ Simulates full end-to-end lifecycle: scan $\rightarrow$ offer $\rightarrow$ capi
 ```bash
 npm run start
 ```
+
+## Profitability & Auto-Listing Rules (A-E)
+
+- **40% net margin**: every offer must yield net profit >= 40% of the offer price at the expected floor sale, after marketplace fee, the applicable (non-disableable) creator fee and gas. `profitTargets.defaultMinMarginPercent` / per-target `minMarginPercent` can only make this stricter (values below 40 are raised to 40).
+- **Minimum acceptable floor**: `minFloor = (offer * 1.40 + gas) / ((1 - undercut) * (1 - marketplaceFee - creatorFee))`; offers require `floor >= minFloor` **and** `floor >= offer * 1.30` (the 1.30x rule is kept; the 40% rule is always stricter, so they never conflict).
+- **Creator fee**: optional creator fees are excluded from signed offers and listings and verified absent before posting; mandatory creator fees are counted in net profit.
+- **Final validation**: right before every offer (incl. re-offers and single-token offers) fresh market data is re-fetched and mint-out, recent sales, dump protection, creator-fee status and profitability are re-checked at the exact bid.
+- **Auto-listing**: bought NFTs are listed at the lowest competitive price that still keeps the 40% margin; listed NFTs are monitored each cycle and repriced just under a cheaper competing listing when still profitable (previous listing cancelled off-chain). If matching is unprofitable the existing listing is kept (never below the 40%-margin price). Reprices are rate-limited by `general.relistCooldownMinutes` (default 10) and a 0.2% minimum price change.

@@ -40,6 +40,7 @@ export interface BotConfig {
     loopIntervalMs: number;
     offerExpirationMinutes: number;
     listingExpirationDays: number;
+    relistCooldownMinutes?: number; // min minutes between competitive reprices of one listing (anti-churn)
     ignoredCollections?: string[];
     postSaleWethConvertPercent?: number;
     postSaleGasReservePercent?: number;
@@ -54,7 +55,7 @@ export interface BotConfig {
   };
   profitTargets: {
     defaultMinNetProfitUsd: number;
-    defaultMinMarginPercent: number; // 13% default
+    defaultMinMarginPercent: number; // 40% default and hard minimum (net profit / offer after all fees)
     undercutFloorByPercent: number;
     bidUnderFloorPercent: number;
     bidIncrementUsd?: number;
@@ -168,6 +169,8 @@ export interface ProfitCalculationResult {
   checkMintCompletedPassed?: boolean;
   checkMarketDumpPassed?: boolean;
   floorDeclinePercent?: number;
+  minAcceptableFloorEth?: number;
+  checkMinFloorPassed?: boolean;
   isProfitable: boolean;
   decision: 'ACCEPT' | 'REJECT';
   reason?: string;
@@ -229,6 +232,7 @@ export interface InventoryItem {
   realizedProfitEth?: number;
   realizedProfitUsd?: number;
   isExternalWalletItem?: boolean;
+  lastListingUpdateAt?: number;
 }
 
 export type OfferStatus = 'ACTIVE' | 'EXPIRED' | 'FULFILLED' | 'CANCELLED' | 'CANCELLATION_PENDING' | 'CANCELLATION_FAILED';

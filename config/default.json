@@ -57,7 +57,7 @@
   },
   "profitTargets": {
     "defaultMinNetProfitUsd": 0.15,
-    "defaultMinMarginPercent": 15.0,
+    "defaultMinMarginPercent": 40.0,
     "undercutFloorByPercent": 1.0,
     "bidUnderFloorPercent": 15.0,
     "bidIncrementUsd": 0.05
@@ -81,7 +81,7 @@
       "maxBidEth": 0.0015,
       "targetNetProfitUsd": 0.20,
       "maxInventory": 1,
-      "minMarginPercent": 15.0,
+      "minMarginPercent": 40.0,
       "minSales24Hours": 10
     },
     {
@@ -94,7 +94,7 @@
       "targetNetProfitUsd": 0.15,
       "maxInventory": 1,
       "floorPriceMultiple": 0.85,
-      "minMarginPercent": 12.0,
+      "minMarginPercent": 40.0,
       "minSales24Hours": 10,
       "singleTokenBids": true
     }

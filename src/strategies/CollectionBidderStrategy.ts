@@ -1,4 +1,4 @@
-import { BotConfig, ActiveOffer } from '../types';
+import { BotConfig, ActiveOffer, CollectionMarketData, FeeRecipient } from '../types';
 import { OpenSeaApiService } from '../services/OpenSeaApiService';
 import { PricingEngine } from '../services/PricingEngine';
 import { SeaportService } from '../services/SeaportService';
@@ -64,6 +64,101 @@ export class CollectionBidderStrategy {
       const reason = `Mint-out status could not be re-verified before offer (${err.message}). Core rule: If status cannot be verified, DO NOT OFFER ❌`;
       logger.error({ slug: collectionSlug, err: err.message }, `FINAL OFFER-EXECUTION BLOCKED 🛑: ${reason}`);
       return { passed: false, reason };
+    }
+  }
+
+  /**
+   * FINAL PRE-OFFER VALIDATION (Rule D) — runs immediately before EVERY offer (initial, re-offer, single-token)
+   * on FRESHLY fetched market data, at the exact bid about to be signed:
+   *  1. 100% mint-out verified
+   *  2. Recent native-ETH floor sales requirement
+   *  3. Market dump protection (< 40% floor decline)
+   *  4. Creator fee status: optional fees disabled (0 bps in costs & order), mandatory fee within ceiling and counted
+   *  5. Profitability: floor >= Offer * 1.30 AND floor >= minimum acceptable floor (40% net margin after marketplace
+   *     fee, applicable creator fee and gas) AND net profit >= configured minimum
+   */
+  public async finalPreOfferValidation(params: {
+    collectionSlug: string;
+    contractAddress: string;
+    networkKey: string;
+    bidPriceEth: number;
+    targetConfig?: any;
+  }): Promise<{ passed: boolean; reason: string; freshData?: CollectionMarketData }> {
+    const { collectionSlug, contractAddress, networkKey, bidPriceEth, targetConfig } = params;
+    let fresh: CollectionMarketData;
+    try {
+      fresh = await this.apiService.getCollectionMarketData(collectionSlug, contractAddress, networkKey);
+    } catch (err: any) {
+      return { passed: false, reason: `Final validation could not fetch fresh market data (${err.message}).` };
+    }
+    const block = (reason: string) => {
+      logger.error({ slug: collectionSlug, network: networkKey, bidPriceEth, reason }, `FINAL OFFER-EXECUTION BLOCKED 🛑: ${reason}`);
+      return { passed: false, reason, freshData: fresh };
+    };
+
+    const mint = this.pricingEngine.verifyMintCompletion(fresh);
+    if (!mint.passed) return block(mint.reason);
+
+    const minSales = this.config.liquidity?.minSales3Hours ?? 10;
+    if ((fresh.sales3Hours ?? 0) < minSales || fresh.liquidityPassed === false) {
+      return block(`Recent floor sales requirement failed (${fresh.sales3Hours ?? 0}/${minSales} native ETH floor sales in 3h).`);
+    }
+
+    const refFloor = fresh.referenceFloorEth && fresh.referenceFloorEth > 0 ? fresh.referenceFloorEth : fresh.floorPriceEth;
+    if (refFloor > 0 && ((refFloor - fresh.floorPriceEth) / refFloor) * 100 >= (this.config.riskManagement?.maxAllowedFloorDeclinePercent ?? 40)) {
+      return block('Market dump protection: floor declined by 40% or more.');
+    }
+
+    // Creator fee status: optional fees must be flagged disabled; the applicable fee (royaltyFeeBps) is mandatory only
+    const optionalStillEnabled = (fresh.fees || []).some((f) => f.required === false && f.disabled !== true);
+    if (optionalStillEnabled) return block('Optional creator fee is not disabled.');
+    const creatorFeeBps = fresh.royaltyFeeBps || 0;
+    if (creatorFeeBps > this.config.fees.maxAcceptableRoyaltyBps) {
+      return block(`Mandatory creator fee (${creatorFeeBps} bps) exceeds acceptable maximum (${this.config.fees.maxAcceptableRoyaltyBps} bps).`);
+    }
+
+    if (!(bidPriceEth > 0)) return block('Invalid bid price.');
+    const ethPriceUsd = fresh.ethPriceUsd || 2700;
+    const gasUsd = this.config.networks?.[networkKey]?.estimatedGasCostUsd ?? (networkKey === 'mainnet' ? 3.5 : 0.01);
+    const gasEth = gasUsd / ethPriceUsd;
+    const marginPercent = this.pricingEngine.getMinMarginPercent(targetConfig);
+    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30;
+    if (fresh.floorPriceEth < bidPriceEth * minFloorMultiplier - 1e-12) {
+      return block(`Floor (${fresh.floorPriceEth} ETH) < Offer (${bidPriceEth} ETH) * ${minFloorMultiplier}.`);
+    }
+    const minFloorEth = this.pricingEngine.computeMinAcceptableFloorEth({
+      offerEth: bidPriceEth,
+      openseaFeeBps: fresh.openseaFeeBps,
+      creatorFeeBps,
+      gasEth,
+      marginPercent
+    });
+    if (fresh.floorPriceEth < minFloorEth - 1e-12) {
+      return block(
+        `Floor (${fresh.floorPriceEth} ETH) is below minimum acceptable floor (${roundToPrecision(minFloorEth, 8)} ETH) for a ${marginPercent}% net margin after marketplace fee (${fresh.openseaFeeBps} bps), creator fee (${creatorFeeBps} bps) and gas.`
+      );
+    }
+    const undercut = (this.config.profitTargets?.undercutFloorByPercent ?? 0) / 100;
+    const expectedSaleEth = fresh.floorPriceEth * (1 - undercut);
+    const netProfitEth = expectedSaleEth * (1 - (fresh.openseaFeeBps + creatorFeeBps) / 10000) - bidPriceEth - gasEth;
+    const minNetProfitUsd = targetConfig?.targetNetProfitUsd ?? this.config.capital?.minNetProfitUsd ?? 0.20;
+    if (netProfitEth * ethPriceUsd < minNetProfitUsd - 0.005) {
+      return block(`Expected net profit ($${(netProfitEth * ethPriceUsd).toFixed(2)}) below minimum ($${minNetProfitUsd.toFixed(2)}).`);
+    }
+    return { passed: true, reason: 'Final validation passed', freshData: fresh };
+  }
+
+  /**
+   * Creator Fee Rule (offer side): verify the SIGNED offer order carries no optional creator fee before posting.
+   */
+  public verifySignedOfferCreatorFees(orderComponents: any, fees?: FeeRecipient[]): { verified: boolean; reason?: string } {
+    try {
+      const consideration = orderComponents?.consideration || [];
+      this.seaportService.verifyOrderFees(consideration, fees);
+      const res = this.seaportService.verifyCreatorFeeDisabledBeforeSale(consideration, fees);
+      return { verified: res.verified, reason: res.reason };
+    } catch (err: any) {
+      return { verified: false, reason: err.message };
     }
   }
 
@@ -645,20 +740,32 @@ export class CollectionBidderStrategy {
       return;
     }
 
-    // 5) Fresh 100% Mint-Out re-verification immediately before signing/posting (covers automatic re-offers)
-    const freshMintCheck = await this.reverifyMintOutBeforeOffer(target.slug, target.contractAddress, targetNetwork);
-    if (!freshMintCheck.passed) {
+    // 5) FINAL PRE-OFFER VALIDATION on fresh data (mint-out, sales, dump, creator fee, 40% margin / min floor)
+    const finalCheck = await this.finalPreOfferValidation({
+      collectionSlug: target.slug,
+      contractAddress: target.contractAddress,
+      networkKey: targetNetwork,
+      bidPriceEth: calculation.bidPriceEth,
+      targetConfig: target
+    });
+    if (!finalCheck.passed) {
       return;
     }
+    const offerFees = finalCheck.freshData?.fees ?? marketData.fees;
 
-    // 8. SIGN SEAPORT COLLECTION OFFER (Off-chain EIP-712 with required fee recipients)
+    // 8. SIGN SEAPORT COLLECTION OFFER (Off-chain EIP-712 with required fee recipients; optional creator fees excluded)
     const { orderComponents, signature } = await this.seaportService.createSignedCollectionOffer(
       target.contractAddress,
       calculation.bidPriceEth,
       this.getOfferMaxAgeMinutes(),
       targetNetwork,
-      marketData.fees
+      offerFees
     );
+    const offerFeeCheck = this.verifySignedOfferCreatorFees(orderComponents, offerFees);
+    if (!offerFeeCheck.verified) {
+      logger.error({ slug: target.slug, reason: offerFeeCheck.reason }, 'FINAL OFFER-EXECUTION BLOCKED 🛑: optional creator fee not disabled in signed offer');
+      return;
+    }
 
     // 9. POST OFFER TO OPENSEA (OpenSea v2 /offers format)
     const postPayload = {
@@ -698,9 +805,15 @@ export class CollectionBidderStrategy {
             }
 
             // 100% Mint-Out Rule: re-verify before EVERY single-token offer
-            const tokenMintCheck = await this.reverifyMintOutBeforeOffer(target.slug, target.contractAddress, targetNetwork);
-            if (!tokenMintCheck.passed) {
-              logger.info({ tokenId: tok.tokenId, slug: target.slug, reason: tokenMintCheck.reason }, 'NFT OFFER SKIPPED: Mint-out not verified');
+            const tokenFinalCheck = await this.finalPreOfferValidation({
+              collectionSlug: target.slug,
+              contractAddress: target.contractAddress,
+              networkKey: targetNetwork,
+              bidPriceEth: calculation.bidPriceEth,
+              targetConfig: target
+            });
+            if (!tokenFinalCheck.passed) {
+              logger.info({ tokenId: tok.tokenId, slug: target.slug, reason: tokenFinalCheck.reason }, 'NFT OFFER SKIPPED: final validation failed');
               break;
             }
 
@@ -710,8 +823,12 @@ export class CollectionBidderStrategy {
               calculation.bidPriceEth,
               this.getOfferMaxAgeMinutes(),
               targetNetwork,
-              marketData.fees
+              tokenFinalCheck.freshData?.fees ?? marketData.fees
             );
+            if (!this.verifySignedOfferCreatorFees(itemComponents, tokenFinalCheck.freshData?.fees ?? marketData.fees).verified) {
+              logger.error({ tokenId: tok.tokenId }, 'NFT OFFER BLOCKED: optional creator fee present in signed offer');
+              continue;
+            }
             const singlePayload = {
               parameters: itemComponents,
               signature: itemSig,
@@ -975,10 +1092,16 @@ export class CollectionBidderStrategy {
     }
 
     // 5) Fresh 100% Mint-Out re-verification immediately before signing/posting (covers automatic re-offers)
-    const freshItemMintCheck = await this.reverifyMintOutBeforeOffer(params.collectionSlug, params.contractAddress, targetNetwork);
-    if (!freshItemMintCheck.passed) {
-      return { success: false, reason: freshItemMintCheck.reason };
+    const itemFinalCheck = await this.finalPreOfferValidation({
+      collectionSlug: params.collectionSlug,
+      contractAddress: params.contractAddress,
+      networkKey: targetNetwork,
+      bidPriceEth: calculation.bidPriceEth
+    });
+    if (!itemFinalCheck.passed) {
+      return { success: false, reason: itemFinalCheck.reason };
     }
+    const itemFees = itemFinalCheck.freshData?.fees ?? marketData.fees;
 
     // 5. Sign & Post Item Offer
     const { orderComponents, signature } = await this.seaportService.createSignedItemOffer(
@@ -987,8 +1110,13 @@ export class CollectionBidderStrategy {
       calculation.bidPriceEth,
       this.getOfferMaxAgeMinutes(),
       targetNetwork,
-      marketData.fees
+      itemFees
     );
+
+    const itemFeeCheck = this.verifySignedOfferCreatorFees(orderComponents, itemFees);
+    if (!itemFeeCheck.verified) {
+      return { success: false, reason: `Optional creator fee not disabled in signed offer: ${itemFeeCheck.reason}` };
+    }
 
     const singlePayload = {
       parameters: orderComponents,
