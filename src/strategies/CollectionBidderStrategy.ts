@@ -1,4 +1,4 @@
-import { BotConfig } from '../types';
+import { BotConfig, ActiveOffer } from '../types';
 import { OpenSeaApiService } from '../services/OpenSeaApiService';
 import { PricingEngine } from '../services/PricingEngine';
 import { SeaportService } from '../services/SeaportService';
@@ -32,10 +32,70 @@ export class CollectionBidderStrategy {
   }
 
   /**
+   * Automatic Offer Cancellation & Verification Helper:
+   * 1. Marks offer as CANCELLATION_PENDING (capital stays locked!)
+   * 2. Requests marketplace cancellation from OpenSea API
+   * 3. Verifies offer is inactive before releasing capital
+   * 4. Confirms cancellation and releases capital only upon verified inactivity.
+   */
+  public async cancelAndVerifyOffer(
+    offer: ActiveOffer,
+    reason: string = 'Automatic Cancellation'
+  ): Promise<{ success: boolean; error?: string }> {
+    const orderHash = offer.orderHash;
+    const network = offer.network || 'robinhood';
+
+    // 1. Mark status CANCELLATION_PENDING (capital stays locked!)
+    this.inventoryManager.initiateOfferCancellation(orderHash);
+
+    try {
+      // 2. Request marketplace cancellation
+      const cancelRes = await this.apiService.cancelOffer(orderHash, network);
+      if (!cancelRes.success) {
+        logger.warn(
+          { orderHash, network, error: cancelRes.error, reason },
+          'Marketplace cancel request failed or queued. Will perform verification check.'
+        );
+      }
+
+      // 3. Verify offer is inactive before releasing capital
+      const verification = await this.apiService.verifyOfferInactive(orderHash, network);
+
+      if (verification.isInactive) {
+        // Verification confirmed: release capital
+        this.inventoryManager.confirmOfferCancellation(orderHash);
+        logger.info(
+          { orderHash, collection: offer.collectionSlug, network, reason },
+          'Automatic Offer Cancellation: Cancellation verified and confirmed ✅ Capital released.'
+        );
+        return { success: true };
+      } else {
+        // Verification failed: DO NOT assume capital has been released!
+        this.inventoryManager.failOfferCancellation(
+          orderHash,
+          verification.error || 'Offer still active after cancellation request'
+        );
+        logger.warn(
+          { orderHash, collection: offer.collectionSlug, reason },
+          'Cancellation verification failed ❌ Capital remains locked.'
+        );
+        return {
+          success: false,
+          error: verification.error || 'Offer still active after cancellation request'
+        };
+      }
+    } catch (err: any) {
+      logger.error({ orderHash, err: err.message, reason }, 'Unexpected error during offer cancellation process');
+      this.inventoryManager.failOfferCancellation(orderHash, err.message);
+      return { success: false, error: err.message };
+    }
+  }
+
+  /**
    * Automatic Offer Cancellation — 20-Minute Rule:
    * 1. Offer Expiry: Every NFT offer placed by the bot must be automatically cancelled if it has not been accepted within 20 minutes of creation.
    * 2. Automatic Cancellation: The bot must track each offer's creation time and initiate cancellation when the 20-minute limit expires.
-   * 3. Cancellation Verification: The bot must verify that the offer is no longer active before treating it as cancelled. If cancellation fails, it must retry or flag the offer for immediate attention and must not assume the capital has been released.
+   * 3. Cancellation Verification: The bot must verify that the offer is no longer active before treating it as cancelled.
    */
   public async processAutomaticOfferCancellations(maxAgeMinutes: number = 20): Promise<{
     cancelled: number;
@@ -59,53 +119,73 @@ export class CollectionBidderStrategy {
     let pending = 0;
 
     for (const offer of expiredOffers) {
-      const orderHash = offer.orderHash;
-      const network = offer.network || 'robinhood';
-
-      // 1. Mark status CANCELLATION_PENDING (capital stays locked!)
-      this.inventoryManager.initiateOfferCancellation(orderHash);
-
-      try {
-        // 2. Request marketplace cancellation
-        const cancelRes = await this.apiService.cancelOffer(orderHash, network);
-        if (!cancelRes.success) {
-          logger.warn(
-            { orderHash, network, error: cancelRes.error },
-            'Marketplace cancel request failed or queued. Will perform verification check.'
-          );
-        }
-
-        // 3. Verify offer is inactive before releasing capital
-        const verification = await this.apiService.verifyOfferInactive(orderHash, network);
-
-        if (verification.isInactive) {
-          // Verification confirmed: release capital
-          this.inventoryManager.confirmOfferCancellation(orderHash);
-          cancelled++;
-          logger.info(
-            { orderHash, collection: offer.collectionSlug, network },
-            'Automatic Offer Cancellation: Cancellation verified and confirmed ✅ Capital released.'
-          );
-        } else {
-          // Verification failed: DO NOT assume capital has been released!
-          const failRes = this.inventoryManager.failOfferCancellation(
-            orderHash,
-            verification.error || 'Offer still active after cancellation request'
-          );
-          if (failRes.flagged) {
-            failed++;
-          } else {
-            pending++;
-          }
-        }
-      } catch (err: any) {
-        logger.error({ orderHash, err: err.message }, 'Unexpected error during offer cancellation process');
-        const failRes = this.inventoryManager.failOfferCancellation(orderHash, err.message);
-        if (failRes.flagged) {
+      const res = await this.cancelAndVerifyOffer(offer, '20-Minute Expiry Rule');
+      if (res.success) {
+        cancelled++;
+      } else {
+        const currentOffer = this.inventoryManager.getActiveOffer(offer.orderHash);
+        if (currentOffer?.flaggedForAttention || currentOffer?.status === 'CANCELLATION_FAILED') {
           failed++;
         } else {
           pending++;
         }
+      }
+    }
+
+    return { cancelled, failed, pending };
+  }
+
+  /**
+   * Automatic Offer Cancellation — Outbid Rule:
+   * 1. Cancel When Outbid: If another buyer places a higher offer on an NFT,
+   *    the bot must automatically cancel its existing offer.
+   * 2. No Stale Offers: The bot must not leave outdated offers active after being outbid.
+   */
+  public async processOutbidOfferCancellations(): Promise<{
+    cancelled: number;
+    failed: number;
+    pending: number;
+  }> {
+    const activeOffers = this.inventoryManager.getAllActiveOffers().filter((o) => o.status === 'ACTIVE');
+    if (activeOffers.length === 0) {
+      return { cancelled: 0, failed: 0, pending: 0 };
+    }
+
+    let cancelled = 0;
+    let failed = 0;
+    let pending = 0;
+
+    for (const offer of activeOffers) {
+      try {
+        const marketData = await this.apiService.getCollectionMarketData(offer.collectionSlug, offer.contractAddress);
+        if (marketData.topOfferEth && marketData.topOfferEth > offer.priceEth) {
+          logger.info(
+            {
+              orderHash: offer.orderHash,
+              collection: offer.collectionSlug,
+              ourPriceEth: offer.priceEth,
+              topOfferEth: marketData.topOfferEth
+            },
+            `Cancel When Outbid Rule: Another buyer placed a higher offer (${marketData.topOfferEth} ETH > ${offer.priceEth} ETH). Automatically cancelling existing offer...`
+          );
+
+          const res = await this.cancelAndVerifyOffer(
+            offer,
+            `Outbid by higher offer (${marketData.topOfferEth} ETH > ${offer.priceEth} ETH)`
+          );
+          if (res.success) {
+            cancelled++;
+          } else {
+            const currentOffer = this.inventoryManager.getActiveOffer(offer.orderHash);
+            if (currentOffer?.flaggedForAttention || currentOffer?.status === 'CANCELLATION_FAILED') {
+              failed++;
+            } else {
+              pending++;
+            }
+          }
+        }
+      } catch (err: any) {
+        logger.debug({ orderHash: offer.orderHash, error: err.message }, 'Note checking market data for outbid offer');
       }
     }
 
@@ -121,9 +201,11 @@ export class CollectionBidderStrategy {
       return;
     }
 
-    // 0. Automatic Offer Cancellation — 20-Minute Rule:
-    // Every NFT offer placed by the bot must be automatically cancelled if unaccepted within 20 minutes.
+    // 0. Automatic Offer Cancellation:
+    // a. 20-Minute Expiry Rule: Cancel unaccepted offers after 20 minutes
     await this.processAutomaticOfferCancellations(this.config.general.offerExpirationMinutes || 20);
+    // b. Cancel When Outbid Rule: Automatically cancel existing offers if outbid by another buyer
+    await this.processOutbidOfferCancellations();
 
     const activeNetworks = this.config.general.activeNetworks || ['robinhood', 'mainnet'];
     const totalCapitalUsd = this.inventoryManager.getTotalCapitalUsd();
@@ -223,6 +305,59 @@ export class CollectionBidderStrategy {
 
     // 3. FETCH LATEST MARKET DATA
     const marketData = await this.apiService.getCollectionMarketData(target.slug, target.contractAddress);
+
+    // 3.1. AUTOMATIC OFFER CANCELLATION & RE-ENTRY CHECK (Outbid & 20-Minute Expiry Rules)
+    const existingOffer = this.inventoryManager.getActiveOffer(target.slug);
+    if (existingOffer) {
+      if (
+        existingOffer.status === 'CANCELLATION_PENDING' ||
+        existingOffer.status === 'CANCELLATION_FAILED' ||
+        (existingOffer.status === 'CANCELLED' && !existingOffer.cancellationVerified)
+      ) {
+        logger.warn(
+          { slug: target.slug, orderHash: existingOffer.orderHash, status: existingOffer.status },
+          'Cannot place new offer: Previous offer cancellation is not yet confirmed/verified. Capital remains locked.'
+        );
+        return;
+      }
+
+      if (existingOffer.status === 'ACTIVE') {
+        const isOutbid = marketData.topOfferEth > existingOffer.priceEth;
+        const isExpired = Date.now() - existingOffer.createdTimestamp >= (this.config.general.offerExpirationMinutes || 20) * 60 * 1000;
+
+        if (isOutbid || isExpired) {
+          const cancelReason = isOutbid
+            ? `Outbid by higher offer (${marketData.topOfferEth} ETH > ${existingOffer.priceEth} ETH)`
+            : '20-Minute Expiry (Unaccepted within 20 minutes)';
+
+          logger.info(
+            { slug: target.slug, orderHash: existingOffer.orderHash, ourPrice: existingOffer.priceEth, topOfferEth: marketData.topOfferEth, cancelReason },
+            `Automatic Offer Cancellation Rule: Cancelling outdated offer (${cancelReason})...`
+          );
+
+          const cancelRes = await this.cancelAndVerifyOffer(existingOffer, cancelReason);
+          if (!cancelRes.success) {
+            logger.warn(
+              { slug: target.slug, orderHash: existingOffer.orderHash },
+              'Cannot re-offer: Offer cancellation could not be verified on marketplace. Capital remains locked.'
+            );
+            return;
+          }
+
+          logger.info(
+            { slug: target.slug, cancelReason },
+            'Automatic Offer Cancellation: Cancellation verified ✅ Proceeding to recheck all trading criteria for re-entry...'
+          );
+        } else {
+          // Offer is active, NOT outbid, and within 20-minute expiry window
+          logger.debug(
+            { slug: target.slug, network: targetNetwork, price: existingOffer.priceEth },
+            'Active offer already in place at top price and within 20-minute expiry window.'
+          );
+          return;
+        }
+      }
+    }
 
     // 3.5. NFT RECENT FLOOR SALES REQUIREMENT CHECK
     // The bot must place offers only on NFT collections with at least 10 or more completed
@@ -326,22 +461,7 @@ export class CollectionBidderStrategy {
       return;
     }
 
-    // 7. CHECK IF EXISTING OFFER ALREADY ACTIVE OR UNVERIFIED
-    const existingOffer = this.inventoryManager.getActiveOffer(target.slug);
-    if (existingOffer) {
-      if (existingOffer.status === 'ACTIVE' && existingOffer.expiresTimestamp > Date.now()) {
-        logger.debug({ slug: target.slug, network: targetNetwork, price: existingOffer.priceEth }, 'Active offer already in place at target price');
-        return;
-      }
-      if (existingOffer.status === 'CANCELLATION_PENDING' || existingOffer.status === 'CANCELLATION_FAILED' || !existingOffer.cancellationVerified) {
-        logger.warn(
-          { slug: target.slug, orderHash: existingOffer.orderHash, status: existingOffer.status },
-          'Cannot place new offer: Previous offer cancellation is not yet confirmed/verified. Capital remains locked.'
-        );
-        return;
-      }
-    }
-
+    // 7. Active offer and capital allocation checks passed, proceeding to log and pre-flight
     logger.info(
       {
         collection: target.name,
@@ -569,14 +689,65 @@ export class CollectionBidderStrategy {
 
     // 2. Same NFT Re-Bidding Restriction & Capital Allocation Check
     const availableCapitalUsd = this.inventoryManager.getAvailableCapitalUsd();
-    const nftCheck = this.inventoryManager.canPlaceOfferOnNft(params.contractAddress, params.tokenId);
-    if (!nftCheck.allowed) {
+    if (this.inventoryManager.isNftOwnedOrUnresolved(params.contractAddress, params.tokenId)) {
+      const nftCheck = this.inventoryManager.canPlaceOfferOnNft(params.contractAddress, params.tokenId);
       logger.info({ contractAddress: params.contractAddress, tokenId: params.tokenId, reason: nftCheck.reason }, 'Item bid rejected');
       return { success: false, reason: nftCheck.reason };
     }
 
     // 3. Market Data & Pre-Checks
     const marketData = await this.apiService.getCollectionMarketData(params.collectionSlug, params.contractAddress);
+
+    // 3.0. Automatic Offer Cancellation & Re-entry Check for Item (Outbid & 20-Minute Expiry)
+    const itemKey = `${params.contractAddress.toLowerCase()}:${params.tokenId}`;
+    const existingItemOffer = this.inventoryManager.getActiveOffer(itemKey);
+    if (existingItemOffer) {
+      if (
+        existingItemOffer.status === 'CANCELLATION_PENDING' ||
+        existingItemOffer.status === 'CANCELLATION_FAILED' ||
+        (existingItemOffer.status === 'CANCELLED' && !existingItemOffer.cancellationVerified)
+      ) {
+        return {
+          success: false,
+          reason: 'Cannot place new offer: Previous offer cancellation is not yet confirmed/verified. Capital remains locked.'
+        };
+      }
+
+      if (existingItemOffer.status === 'ACTIVE') {
+        const isOutbid = marketData.topOfferEth > existingItemOffer.priceEth;
+        const isExpired = Date.now() - existingItemOffer.createdTimestamp >= (this.config.general.offerExpirationMinutes || 20) * 60 * 1000;
+
+        if (isOutbid || isExpired) {
+          const cancelReason = isOutbid
+            ? `Outbid by higher offer (${marketData.topOfferEth} ETH > ${existingItemOffer.priceEth} ETH)`
+            : '20-Minute Expiry (Unaccepted within 20 minutes)';
+
+          logger.info(
+            { tokenId: params.tokenId, orderHash: existingItemOffer.orderHash, cancelReason },
+            `Cancel When Outbid / Expiry: Cancelling outdated item offer (${cancelReason})...`
+          );
+
+          const cancelRes = await this.cancelAndVerifyOffer(existingItemOffer, cancelReason);
+          if (!cancelRes.success) {
+            return {
+              success: false,
+              reason: 'Cannot re-offer: Item offer cancellation could not be verified. Capital remains locked.'
+            };
+          }
+        } else {
+          return {
+            success: false,
+            reason: 'Active offer already in place on this item at top price and within 20-minute expiry window.'
+          };
+        }
+      }
+    }
+
+    const nftCheck = this.inventoryManager.canPlaceOfferOnNft(params.contractAddress, params.tokenId);
+    if (!nftCheck.allowed) {
+      logger.info({ contractAddress: params.contractAddress, tokenId: params.tokenId, reason: nftCheck.reason }, 'Item bid rejected');
+      return { success: false, reason: nftCheck.reason };
+    }
 
     // 3.0. Recent Floor Sales Requirement Check
     const minItemFloorSales = this.config.liquidity?.minSales3Hours ?? 10;

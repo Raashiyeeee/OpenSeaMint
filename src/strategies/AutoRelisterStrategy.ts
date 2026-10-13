@@ -231,6 +231,21 @@ export class AutoRelisterStrategy {
       marketData.fees
     );
 
+    // 4.5. Mandatory Creator Fee Disable Rule:
+    // If the creator fee is optional and can be disabled, the bot must disable it before executing any NFT sale.
+    // The bot must verify that the fee is disabled before proceeding with the sale.
+    const preSaleFeeVerification = this.seaportService.verifyCreatorFeeDisabledBeforeSale(
+      orderComponents.consideration,
+      marketData.fees
+    );
+    if (!preSaleFeeVerification.verified) {
+      logger.error(
+        { identifier: item.identifier, reason: preSaleFeeVerification.reason },
+        'MANDATORY CREATOR FEE DISABLE RULE: Aborting NFT sale execution because optional creator fee is not disabled!'
+      );
+      throw new Error(`NFT sale execution aborted: ${preSaleFeeVerification.reason}`);
+    }
+
     // 5. Submit listing order to OpenSea
     const postPayload = {
       parameters: orderComponents,
