@@ -9,13 +9,15 @@ A production-grade, secure, and event-driven NFT trading bot designed to trade o
 | Parameter | Robinhood Chain | Ethereum Mainnet |
 | :--- | :--- | :--- |
 | **Network Name** | Robinhood Chain | Ethereum Mainnet |
-| **Chain ID** | `466` | `1` |
-| **RPC URL** | `https://rpc.robinhoodchain.com` | `https://ethereum-rpc.publicnode.com` |
+| **Chain ID** | `4663` | `1` |
+| **RPC URL** | `https://rpc.mainnet.chain.robinhood.com` (public, rate-limited; override with `ROBINHOOD_RPC_URL`) | `https://ethereum-rpc.publicnode.com` (override with `ETHEREUM_RPC_URL`) |
 | **Currency** | `ETH` | `ETH` |
-| **Block Explorer** | [Robinhood Explorer](https://explorer.robinhoodchain.com) | [Etherscan](https://etherscan.io) |
+| **Block Explorer** | [Robinhood Explorer](https://robinhoodchain.blockscout.com) | [Etherscan](https://etherscan.io) |
 | **Estimated Gas** | ~$0.01 (Micro-fee friendly) | ~$3.50+ (Gas check protects capital) |
 
-Switch networks simply by setting `NETWORK=robinhood` or `NETWORK=mainnet` in `.env`.
+Select networks with `ACTIVE_NETWORKS=robinhood` or `ACTIVE_NETWORKS=robinhood,mainnet` in `.env`.
+
+**RPC keys:** never put provider API keys in `config/default.json`. Set private RPC URLs (e.g. `https://robinhood-mainnet.g.alchemy.com/v2/<YOUR_KEY>`) only via `ROBINHOOD_RPC_URL` / `ETHEREUM_RPC_URL` in your untracked `.env`.
 
 ---
 
@@ -51,7 +53,7 @@ The bot discounts the floor price (undercut percentage) to account for liquidity
 
 ### Rule 5: Dual Check (Check A & Check B)
 Before every offer, both checks must pass:
-1. **Check A (Capital)**: Is sufficient capital available within the $10 limit and complying with the configured 60% capital allocation limit?
+1. **Check A (Capital)**: Is sufficient capital available within the $10 limit and complying with the 70% capital allocation limit (active offers + purchased NFTs; 30% always reserved)?
 2. **Check B (Profitability)**: Is expected net profit $\ge \$0.20$ after royalties, marketplace fees, and network gas?
 
 Only when **BOTH** pass is an offer placed.
@@ -59,7 +61,7 @@ Only when **BOTH** pass is an offer placed.
 ### Rule 6: NFT Re-Bidding & Simultaneous Offers Rule
 1. **Same NFT Re-Bidding Restriction**: Once an offer is accepted and the bot acquires an NFT, the bot must not place another offer on that same NFT while it is owned or while the previous trade remains unresolved.
 2. **No Re-Bidding Before Sale**: The bot must never place another offer on the same NFT before the previously acquired NFT has been sold and the sale has been confirmed.
-3. **Simultaneous Offers on Different NFTs**: The bot may place offers on multiple different NFT items simultaneously, even while an earlier NFT purchase is awaiting resale. Every new offer must independently pass all required criteria and comply with the configured 60% capital allocation limit.
+3. **Simultaneous Offers on Different NFTs**: The bot may place offers on multiple different NFT items simultaneously, even while an earlier NFT purchase is awaiting resale. Every new offer must independently pass all required criteria and comply with the 70% capital allocation limit (30% reserved).
 4. **Independent NFT Tracking**: The bot tracks each NFT separately, including its token ID, collection, active offers, ownership status, listing status, and sale confirmation.
 * **Core Rule**: Never place another offer on the same NFT before its previous position is sold. After confirmed sale, re-bidding is allowed only if all criteria pass again. Offers on different eligible NFTs may run simultaneously within the capital limit.
 
@@ -144,8 +146,11 @@ cp .env.example .env
 ```
 Edit `.env` to select network:
 ```env
-NETWORK=robinhood
-RPC_URL=https://rpc.robinhoodchain.com
+ACTIVE_NETWORKS=robinhood
+ROBINHOOD_RPC_URL=https://rpc.mainnet.chain.robinhood.com   # or your private provider URL (keep it in .env only)
+ETHEREUM_RPC_URL=https://ethereum-rpc.publicnode.com
+OPENSEA_API_KEY=your_opensea_api_key_here
+INVENTORY_STATE_PATH=./data/inventory-state.json            # persisted owned-NFT / pause state
 BOT_MODE=SIMULATION # Or LIVE
 PRIVATE_KEY=your_private_key_here
 ```
@@ -172,3 +177,11 @@ Simulates full end-to-end lifecycle: scan $\rightarrow$ offer $\rightarrow$ capi
 ```bash
 npm run start
 ```
+
+## Profitability & Auto-Listing Rules (A-E)
+
+- **40% net margin**: every offer must yield net profit >= 40% of the offer price at the expected floor sale, after marketplace fee, the applicable (non-disableable) creator fee and gas. `profitTargets.defaultMinMarginPercent` / per-target `minMarginPercent` can only make this stricter (values below 40 are raised to 40).
+- **Minimum acceptable floor**: `minFloor = (offer * 1.40 + gas) / ((1 - undercut) * (1 - marketplaceFee - creatorFee))`; offers require `floor >= minFloor` **and** `floor >= offer * 1.30` (the 1.30x rule is kept; the 40% rule is always stricter, so they never conflict).
+- **Creator fee**: optional creator fees are excluded from signed offers and listings and verified absent before posting; mandatory creator fees are counted in net profit.
+- **Final validation**: right before every offer (incl. re-offers and single-token offers) fresh market data is re-fetched and mint-out, recent sales, dump protection, creator-fee status and profitability are re-checked at the exact bid.
+- **Auto-listing**: bought NFTs are listed at the lowest competitive price that still keeps the 40% margin; listed NFTs are monitored each cycle and repriced just under a cheaper competing listing when still profitable (previous listing cancelled off-chain). If matching is unprofitable the existing listing is kept (never below the 40%-margin price). Reprices are rate-limited by `general.relistCooldownMinutes` (default 10) and a 0.2% minimum price change.

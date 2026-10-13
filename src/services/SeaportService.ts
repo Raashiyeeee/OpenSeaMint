@@ -52,6 +52,10 @@ export class SeaportService {
     this.signer = signer;
   }
 
+  public getWalletAddress(): string {
+    return this.signer.address;
+  }
+
   /**
    * Query on-chain WETH balance of trading signer on the target network
    */
@@ -381,7 +385,10 @@ export class SeaportService {
 
     // Verify optional creator fees are truly disabled in listing order considerations before proceeding
     this.verifyOrderFees(feeConsiderations, fees);
-    this.verifyCreatorFeeDisabledBeforeSale(feeConsiderations, fees);
+    const preSaleCheck = this.verifyCreatorFeeDisabledBeforeSale(feeConsiderations, fees);
+    if (!preSaleCheck.verified) {
+      throw new Error(`NFT sale execution aborted: ${preSaleCheck.reason}`);
+    }
 
     const sellerWei = totalWei - totalFeesWei;
 
@@ -685,7 +692,7 @@ export class SeaportService {
   public async swapEthToWeth(
     amountEth?: number,
     networkKey?: string
-  ): Promise<{ success: boolean; txHash?: string; amountWrappedEth: number; error?: string }> {
+  ): Promise<{ success: boolean; verified?: boolean; txHash?: string; amountWrappedEth: number; error?: string }> {
     const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
     const networkInfo = this.config.networks?.[activeNetworkKey];
     const wethAddress = networkInfo?.wethAddress || this.wethAddress;
@@ -704,7 +711,7 @@ export class SeaportService {
           { network: activeNetworkKey, amountWrappedEth: wrapAmount, txHash: simTxHash },
           `[SIMULATION] ✅ Swapped ${wrapAmount} ETH to WETH successfully`
         );
-        return { success: true, txHash: simTxHash, amountWrappedEth: wrapAmount };
+        return { success: true, verified: true, txHash: simTxHash, amountWrappedEth: wrapAmount };
       }
 
       const provider = this.signer.provider || new ethers.JsonRpcProvider(networkInfo?.rpcUrl);
@@ -747,19 +754,22 @@ export class SeaportService {
       );
 
       // 3. Execute WETH deposit({ value }) on-chain
-      const wethContract = new ethers.Contract(
-        wethAddress,
-        [
-          'function deposit() public payable',
-          'function balanceOf(address) view returns (uint256)'
-        ],
-        connectedSigner
-      );
+      const wethContract = this.getWethContract(wethAddress, connectedSigner);
 
-      const valueWei = ethers.parseEther(amountToWrap.toFixed(18));
+      // toFixed(12) avoids binary float artifacts (e.g. 0.009 -> 0.008999999999999999) in the wei amount
+      const valueWei = ethers.parseEther(amountToWrap.toFixed(12));
+      const wethBefore: bigint = await wethContract.balanceOf(this.signer.address);
       const tx = await wethContract.deposit({ value: valueWei });
       logger.info({ txHash: tx.hash }, 'WETH deposit transaction broadcasted. Waiting for confirmation...');
       const receipt = await tx.wait(1);
+
+      // 4. Verify the wrap: receipt must be successful AND the WETH balance must have grown by the wrapped amount
+      const wethAfter: bigint = await wethContract.balanceOf(this.signer.address);
+      if (!receipt || receipt.status !== 1 || wethAfter - wethBefore < valueWei) {
+        const error = `WETH wrap verification failed (status: ${receipt?.status}, WETH delta: ${(wethAfter - wethBefore).toString()} wei, expected: ${valueWei.toString()} wei)`;
+        logger.error({ network: activeNetworkKey, txHash: receipt?.hash || tx.hash }, `❌ ${error}`);
+        return { success: false, verified: false, txHash: receipt?.hash || tx.hash, amountWrappedEth: 0, error };
+      }
 
       logger.info(
         {
@@ -771,14 +781,26 @@ export class SeaportService {
         `✅ AUTOMATIC WETH SWAP COMPLETE: Successfully swapped ${amountToWrap} ETH to WETH immediately!`
       );
 
-      return { success: true, txHash: receipt.hash, amountWrappedEth: amountToWrap };
+      return { success: true, verified: true, txHash: receipt.hash, amountWrappedEth: amountToWrap };
     } catch (err: any) {
       logger.error(
         { network: activeNetworkKey, error: err.message, wethAddress },
         '❌ AUTOMATIC WETH SWAP FAILED: Could not swap received ETH to WETH'
       );
-      return { success: false, error: err.message, amountWrappedEth: 0 };
+      return { success: false, verified: false, error: err.message, amountWrappedEth: 0 };
     }
+  }
+
+  /** WETH contract handle (separate method so it can be stubbed in tests). */
+  protected getWethContract(wethAddress: string, runner: any): any {
+    return new ethers.Contract(
+      wethAddress,
+      [
+        'function deposit() public payable',
+        'function balanceOf(address) view returns (uint256)'
+      ],
+      runner
+    );
   }
 
   /**
@@ -794,6 +816,7 @@ export class SeaportService {
     networkKey?: string
   ): Promise<{
     success: boolean;
+    verified: boolean;
     txHash?: string;
     amountWrappedEth: number;
     gasReserveRetainedEth: number;
@@ -805,7 +828,8 @@ export class SeaportService {
 
     // Convert 90% into WETH, keep 10% as gas fee reserve
     const amountToWrap = roundToPrecision((receivedEth * convertPercent) / 100, 6);
-    const gasReserveRetained = roundToPrecision((receivedEth * gasReservePercent) / 100, 6);
+    // The remainder (10%) stays as native ETH for the gas reserve
+    const gasReserveRetained = roundToPrecision(receivedEth - amountToWrap, 6);
 
     logger.info(
       {
@@ -826,18 +850,29 @@ export class SeaportService {
       );
       return {
         success: true,
+        verified: true,
         amountWrappedEth: 0,
         gasReserveRetainedEth: gasReserveRetained
       };
     }
 
     const swapRes = await this.swapEthToWeth(amountToWrap, activeNetworkKey);
+    // The full 90% must actually be wrapped and verified; a partial wrap (e.g. capped by low balance) is a failure
+    const fullyWrapped = Math.abs(swapRes.amountWrappedEth - amountToWrap) < 0.0000005;
+    const verified = swapRes.success && swapRes.verified === true && fullyWrapped;
+    if (!verified) {
+      logger.error(
+        { amountToWrap, amountWrappedEth: swapRes.amountWrappedEth, error: swapRes.error },
+        'POST-SALE CONVERSION FAILED ❌: 90% WETH wrap was not completed and verified.'
+      );
+    }
     return {
-      success: swapRes.success,
+      success: verified,
+      verified,
       txHash: swapRes.txHash,
       amountWrappedEth: swapRes.amountWrappedEth,
       gasReserveRetainedEth: gasReserveRetained,
-      error: swapRes.error
+      error: swapRes.error || (verified ? undefined : `Wrapped ${swapRes.amountWrappedEth} ETH of required ${amountToWrap} ETH`)
     };
   }
 

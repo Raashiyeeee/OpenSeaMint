@@ -1,4 +1,6 @@
-import { BotConfig, InventoryItem, ActiveOffer, TrackedNft, NftSaleConfirmation, MarkItemSoldResult } from '../types';
+import fs from 'fs';
+import path from 'path';
+import { BotConfig, InventoryItem, ActiveOffer, TrackedNft, NftSaleConfirmation, MarkItemSoldResult, OfferCyclePauseState } from '../types';
 import { roundToPrecision } from '../utils/math';
 import { logger } from '../utils/logger';
 
@@ -9,10 +11,145 @@ export class InventoryManager {
   private trackedNfts: Map<string, TrackedNft> = new Map();
   private totalCapitalUsd: number;
   private cumulativeProfitUsd: number = 0;
+  private offerCyclePause: OfferCyclePauseState = { paused: false, purchasedCountAtPause: 0, soldSincePause: 0 };
+  private statePath?: string;
 
-  constructor(config: BotConfig) {
+  /**
+   * @param statePath Optional JSON file used to persist owned-NFT / re-offer state and the capital
+   *                  reallocation pause across restarts. When omitted, state is in-memory only (tests).
+   */
+  constructor(config: BotConfig, statePath?: string) {
     this.config = config;
     this.totalCapitalUsd = config.capital?.totalTradingCapitalUsd ?? 10.0;
+    this.statePath = statePath;
+    this.loadState();
+  }
+
+  /**
+   * Re-Offer Rule persistence: Owned/unsold NFTs (inventory + independent NFT tracking), realized profit
+   * and the capital reallocation pause state are written to disk after every change so that a restart can
+   * never "forget" an NFT that was bought but not yet sold (which would allow re-offering on it).
+   */
+  private loadState(): void {
+    if (!this.statePath || !fs.existsSync(this.statePath)) return;
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.statePath, 'utf8'));
+      for (const item of raw.inventory || []) this.inventory.set(item.identifier, item);
+      for (const tracked of raw.trackedNfts || []) {
+        // Offers are not restored as active: on-chain/off-chain offers are re-verified by the cancellation logic
+        this.trackedNfts.set(tracked.identifier, { ...tracked, activeOffers: [] });
+      }
+      this.cumulativeProfitUsd = typeof raw.cumulativeProfitUsd === 'number' ? raw.cumulativeProfitUsd : 0;
+      if (raw.offerCyclePause) this.offerCyclePause = raw.offerCyclePause;
+      logger.info(
+        { statePath: this.statePath, inventory: this.inventory.size, trackedNfts: this.trackedNfts.size, paused: this.offerCyclePause.paused },
+        'Restored persisted inventory / re-offer / capital pause state'
+      );
+    } catch (err: any) {
+      // Fail closed: a corrupt state file must not silently allow re-offering on owned NFTs
+      throw new Error(`Failed to load persisted inventory state from ${this.statePath}: ${err.message}`);
+    }
+  }
+
+  private saveState(): void {
+    if (!this.statePath) return;
+    try {
+      const data = {
+        version: 1,
+        savedAt: Date.now(),
+        inventory: Array.from(this.inventory.values()),
+        trackedNfts: Array.from(this.trackedNfts.values()).map((t) => ({ ...t, activeOffers: [] })),
+        cumulativeProfitUsd: this.cumulativeProfitUsd,
+        offerCyclePause: this.offerCyclePause
+      };
+      fs.mkdirSync(path.dirname(this.statePath), { recursive: true });
+      const tmp = `${this.statePath}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+      fs.renameSync(tmp, this.statePath);
+    } catch (err: any) {
+      logger.error({ statePath: this.statePath, err: err.message }, 'Failed to persist inventory state');
+    }
+  }
+
+  /**
+   * Capital Reallocation Rule: at most 70% of total available capital may be committed
+   * (active offers + purchased NFTs awaiting sale). The remaining 30% is always reserved.
+   * maxOfferCapitalPercent may lower the limit but can never raise it above 70%.
+   */
+  public getOfferAllocationPercent(): number {
+    return Math.min(this.config.capital?.maxOfferCapitalPercent ?? 70.0, 70.0);
+  }
+
+  public getOfferAllocationLimitUsd(): number {
+    return roundToPrecision(this.getTotalCapitalUsd() * (this.getOfferAllocationPercent() / 100), 2);
+  }
+
+  /** Capital committed to purchased (bot-acquired) NFTs that have not yet been sold. */
+  public getPurchasedNftCapitalUsd(ethPriceUsd: number = 2700): number {
+    let sum = 0;
+    for (const item of this.inventory.values()) {
+      if ((item.status === 'PENDING_LISTING' || item.status === 'LISTED' || item.status === 'HOLDING') && !item.isExternalWalletItem) {
+        sum += item.acquiredPriceUsd || (item.acquiredPriceEth * ethPriceUsd);
+      }
+    }
+    return roundToPrecision(sum, 2);
+  }
+
+  public getPurchasedNftCount(): number {
+    let count = 0;
+    for (const item of this.inventory.values()) {
+      if ((item.status === 'PENDING_LISTING' || item.status === 'LISTED' || item.status === 'HOLDING') && !item.isExternalWalletItem) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  public getOfferCyclePauseState(): OfferCyclePauseState {
+    return { ...this.offerCyclePause };
+  }
+
+  /**
+   * Capital Reallocation Rule — pause / resume:
+   * - If the 70% allocation is fully committed to purchased NFTs (remaining room is smaller than the minimum
+   *   offer price), new offer cycles are PAUSED and the number of purchased NFTs at that moment is recorded.
+   * - Cycles RESUME once at least 40% of those purchased NFTs have been sold; the allocation is then
+   *   recomputed as 70% of the then-available (total) capital.
+   * Returns true when new offers may be placed.
+   */
+  public evaluateOfferCyclePause(ethPriceUsd: number = 2700): { paused: boolean; reason?: string } {
+    const minOfferUsd = this.config.capital?.minOfferPriceUsd ?? 1.0;
+    const resumePercent = 40;
+
+    if (this.offerCyclePause.paused) {
+      const required = Math.ceil((this.offerCyclePause.purchasedCountAtPause * resumePercent) / 100);
+      if (this.offerCyclePause.soldSincePause >= required) {
+        logger.info(
+          { soldSincePause: this.offerCyclePause.soldSincePause, purchasedCountAtPause: this.offerCyclePause.purchasedCountAtPause, newAllocationLimitUsd: this.getOfferAllocationLimitUsd() },
+          `Capital Reallocation Rule: ${this.offerCyclePause.soldSincePause}/${this.offerCyclePause.purchasedCountAtPause} purchased NFTs sold (>= ${resumePercent}%). RESUMING offer cycles with ${this.getOfferAllocationPercent()}% of current capital.`
+        );
+        this.offerCyclePause = { paused: false, purchasedCountAtPause: 0, soldSincePause: 0 };
+        this.saveState();
+      } else {
+        return {
+          paused: true,
+          reason: `Capital Reallocation Rule: offer cycles paused until ${required}/${this.offerCyclePause.purchasedCountAtPause} purchased NFTs are sold (sold so far: ${this.offerCyclePause.soldSincePause}).`
+        };
+      }
+    }
+
+    const limitUsd = this.getOfferAllocationLimitUsd();
+    const purchasedUsd = this.getPurchasedNftCapitalUsd(ethPriceUsd);
+    const purchasedCount = this.getPurchasedNftCount();
+    if (purchasedCount > 0 && limitUsd - purchasedUsd < minOfferUsd) {
+      this.offerCyclePause = { paused: true, pausedAt: Date.now(), purchasedCountAtPause: purchasedCount, soldSincePause: 0 };
+      this.saveState();
+      const required = Math.ceil((purchasedCount * resumePercent) / 100);
+      const reason = `Capital Reallocation Rule: ${this.getOfferAllocationPercent()}% allocation ($${limitUsd.toFixed(2)}) is fully committed to ${purchasedCount} purchased NFT(s) ($${purchasedUsd.toFixed(2)}). PAUSING offer cycles until ${required} of them are sold.`;
+      logger.warn({ limitUsd, purchasedUsd, purchasedCount }, reason);
+      return { paused: true, reason };
+    }
+    return { paused: false };
   }
 
   public getTotalCapitalUsd(): number {
@@ -87,22 +224,28 @@ export class InventoryManager {
   }
 
   /**
-   * Evaluates if capital can be allocated for an offer under the active-offer capital rule:
-   * Comply with the configured 60% capital allocation limit for simultaneous active offers.
+   * Evaluates if capital can be allocated for an offer under the Capital Reallocation Rule:
+   * active offers + purchased NFTs + the new offer must stay within 70% of total capital (30% reserved),
+   * and no new offers are allowed while offer cycles are paused.
    */
   public canAllocateCapitalForOffer(
     requiredCapitalUsd: number,
     ethPriceUsd: number = 2700
   ): { allowed: boolean; reason?: string } {
     const totalCapital = this.getTotalCapitalUsd();
-    const offerCapitalLimitPercent = this.config.capital?.maxOfferCapitalPercent ?? 60.0;
-    const maxActiveOfferCapitalUsd = roundToPrecision(totalCapital * (offerCapitalLimitPercent / 100), 2);
+    const offerCapitalLimitPercent = this.getOfferAllocationPercent();
+    const maxActiveOfferCapitalUsd = this.getOfferAllocationLimitUsd();
+
+    if (this.offerCyclePause.paused) {
+      return { allowed: false, reason: 'Capital Reallocation Rule: offer cycles are paused until 40% of purchased NFTs are sold.' };
+    }
 
     const currentOffersUsd = this.getActiveOffersCapitalUsd(ethPriceUsd);
-    if (currentOffersUsd + requiredCapitalUsd > maxActiveOfferCapitalUsd) {
+    const purchasedUsd = this.getPurchasedNftCapitalUsd(ethPriceUsd);
+    if (currentOffersUsd + purchasedUsd + requiredCapitalUsd > maxActiveOfferCapitalUsd + 0.000001) {
       return {
         allowed: false,
-        reason: `Active-offer capital allocation limit reached: Current active offers $${currentOffersUsd.toFixed(2)} + new offer $${requiredCapitalUsd.toFixed(2)} exceeds ${offerCapitalLimitPercent}% allocation limit ($${maxActiveOfferCapitalUsd.toFixed(2)} of $${totalCapital.toFixed(2)} total capital).`
+        reason: `Capital allocation limit reached: Current active offers $${currentOffersUsd.toFixed(2)} + purchased NFTs $${purchasedUsd.toFixed(2)} + new offer $${requiredCapitalUsd.toFixed(2)} exceeds ${offerCapitalLimitPercent}% allocation limit ($${maxActiveOfferCapitalUsd.toFixed(2)} of $${totalCapital.toFixed(2)} total capital; ${100 - offerCapitalLimitPercent}% reserved).`
       };
     }
 
@@ -143,13 +286,31 @@ export class InventoryManager {
   }
 
   /**
-   * Reconciles in-memory inventory against on-chain wallet items.
-   * If an NFT held in inventory is no longer present in wallet, it was sold or transferred.
-   * Automatically clears it, releases committed capital, and returns details for automatic ETH->WETH swapping.
+   * Returns inventory items (still held per our records) that are missing from the wallet's holdings.
+   * Missing does NOT mean sold: callers must confirm a sale event before calling reconcileWalletInventory.
+   */
+  public getItemsMissingFromWallet(ownedNfts: Array<{ contract?: string; identifier?: string }>): InventoryItem[] {
+    const ownedSet = new Set(
+      ownedNfts
+        .filter((n) => n.contract && n.identifier)
+        .map((n) => `${n.contract!.toLowerCase()}:${n.identifier}`)
+    );
+    return Array.from(this.inventory.values()).filter(
+      (item) => item.status !== 'SOLD' && item.status !== 'TRANSFERRED' && !ownedSet.has(item.identifier.toLowerCase())
+    );
+  }
+
+  /**
+   * Reconciles inventory against wallet holdings.
+   * - Missing NFT WITH a confirmed sale (confirmedSales) -> marked SOLD (capital released, may trigger WETH wrap).
+   * - Missing NFT WITHOUT a confirmed sale (plain transfer / unknown) -> marked TRANSFERRED: it is NOT treated as
+   *   sold, the re-offer block stays in place, no wrap is triggered, and it is flagged for review.
+   * - An NFT previously marked TRANSFERRED that is back in the wallet is restored to PENDING_LISTING.
    */
   public reconcileWalletInventory(
     ownedNfts: Array<{ contract?: string; identifier?: string }>,
-    ethPriceUsd: number = 2700
+    ethPriceUsd: number = 2700,
+    confirmedSales: Map<string, { salePriceEth: number; txHash?: string }> = new Map()
   ): Array<{ identifier: string; network?: string; netProceedsEth: number; soldEth: number }> {
     const ownedSet = new Set(
       ownedNfts
@@ -157,25 +318,98 @@ export class InventoryManager {
         .map((n) => `${n.contract!.toLowerCase()}:${n.identifier}`)
     );
 
-    const itemsToCheck = Array.from(this.inventory.values());
     const removedSoldItems: Array<{ identifier: string; network?: string; netProceedsEth: number; soldEth: number }> = [];
 
-    for (const item of itemsToCheck) {
-      if (item.status !== 'SOLD' && !ownedSet.has(item.identifier.toLowerCase())) {
+    for (const item of Array.from(this.inventory.values())) {
+      const key = item.identifier.toLowerCase();
+      if (item.status === 'TRANSFERRED' && ownedSet.has(key)) {
+        item.status = 'PENDING_LISTING';
+        item.ownershipStatus = 'OWNED';
+        item.listingStatus = 'PENDING_LISTING';
+        const tracked = this.trackedNfts.get(key);
+        if (tracked) {
+          tracked.ownershipStatus = 'OWNED';
+          tracked.listingStatus = 'PENDING_LISTING';
+        }
+        logger.info({ identifier: item.identifier }, 'Wallet reconciliation: previously transferred NFT is back in wallet. Restored to inventory.');
+        continue;
+      }
+      if (item.status === 'SOLD' || item.status === 'TRANSFERRED' || ownedSet.has(key)) continue;
+
+      const sale = confirmedSales.get(key) || confirmedSales.get(item.identifier);
+      if (sale) {
         logger.info(
-          { identifier: item.identifier, collectionSlug: item.collectionSlug, status: item.status },
-          'Wallet reconciliation: NFT is no longer in wallet (sold or transferred). Clearing from inventory and releasing capital.'
+          { identifier: item.identifier, collectionSlug: item.collectionSlug, salePriceEth: sale.salePriceEth, txHash: sale.txHash },
+          'Wallet reconciliation: confirmed SALE event found for NFT that left the wallet. Recording sale.'
         );
-        const res = this.markItemSold(item.identifier, undefined, ethPriceUsd);
+        const res = this.markItemSold(item.identifier, sale.salePriceEth > 0 ? sale.salePriceEth : undefined, ethPriceUsd, undefined, undefined, sale.txHash);
         removedSoldItems.push({
           identifier: item.identifier,
           network: item.network,
           netProceedsEth: res.netProceedsEth,
           soldEth: res.saleConfirmation.salePriceEth || 0
         });
+      } else {
+        this.markItemTransferred(item.identifier, 'NFT left the wallet without a confirmed sale event (plain transfer or unconfirmed). Not treated as sold.');
       }
     }
+    this.saveState();
     return removedSoldItems;
+  }
+
+  /**
+   * NFT left the wallet without a confirmed sale. It is kept (status TRANSFERRED / ownership UNRESOLVED) so the
+   * re-offer block stays in place; its capital is no longer counted as purchased inventory.
+   */
+  public markItemTransferred(identifier: string, reason: string): void {
+    const item = this.inventory.get(identifier);
+    if (item) {
+      item.status = 'TRANSFERRED';
+      item.ownershipStatus = 'UNRESOLVED';
+      item.holdReason = reason;
+    }
+    const tracked = this.trackedNfts.get(identifier.toLowerCase());
+    if (tracked) {
+      tracked.ownershipStatus = 'UNRESOLVED';
+      tracked.holdReason = reason;
+    }
+    logger.warn({ identifier, reason }, 'NFT TRANSFERRED (not sold): re-offer block kept, no WETH conversion. Manual review recommended.');
+    this.saveState();
+  }
+
+  /**
+   * Marks an offer as FULFILLED (accepted -> NFT bought). Used when cancellation verification finds the order filled.
+   */
+  public markOfferFulfilled(orderHash: string): void {
+    const offer = this.activeOffers.get(orderHash);
+    if (offer) {
+      offer.status = 'FULFILLED';
+      logger.info({ orderHash, collection: offer.collectionSlug }, 'Offer was ACCEPTED (order FULFILLED) — NFT purchase pending inventory sync.');
+    }
+  }
+
+  /**
+   * Finds (and consumes) a FULFILLED offer matching a newly discovered wallet NFT, so a bot purchase found
+   * by the wallet scan is tracked as a bot-acquired item (counted in capital) at its real offer price.
+   */
+  public consumeFulfilledOffer(contractAddress: string, tokenId: string): ActiveOffer | undefined {
+    for (const [key, offer] of this.activeOffers.entries()) {
+      if (
+        offer.status === 'FULFILLED' &&
+        offer.contractAddress.toLowerCase() === contractAddress.toLowerCase() &&
+        (!offer.tokenId || offer.tokenId === tokenId)
+      ) {
+        this.activeOffers.delete(key);
+        return offer;
+      }
+    }
+    return undefined;
+  }
+
+  /** Records until when an offchain-cancelled offer may still be filled (OpenSea last_signature_issued_valid_until). */
+  public setOfferFillableUntil(orderHash: string, fillableUntil: number): void {
+    const offer = this.activeOffers.get(orderHash);
+    if (offer) offer.fillableUntil = fillableUntil;
   }
 
   public getActiveTradesCount(): number {
@@ -290,7 +524,7 @@ export class InventoryManager {
       };
     }
 
-    // 3. Comply with configured 60% capital allocation limit
+    // 3. Comply with the 70% capital allocation limit (30% reserved)
     if (offerPriceUsd !== undefined && offerPriceUsd > 0) {
       const capitalCheck = this.canAllocateCapitalForOffer(offerPriceUsd, ethPriceUsd);
       if (!capitalCheck.allowed) {
@@ -367,6 +601,7 @@ export class InventoryManager {
       },
       'Acquired NFT! Added to inventory, capital remains committed until sold'
     );
+    this.saveState();
   }
 
   public updateListingStatus(identifier: string, listPriceEth: number, orderId: string, listPriceUsd?: number): void {
@@ -379,6 +614,7 @@ export class InventoryManager {
       item.listingStatus = 'LISTED';
       logger.info({ identifier, listPriceEth, listPriceUsd }, 'Item listed on OpenSea');
     }
+    this.saveState();
 
     const tracked = this.trackedNfts.get(identifier.toLowerCase());
     if (tracked) {
@@ -403,6 +639,7 @@ export class InventoryManager {
       tracked.listingStatus = 'HOLDING';
       tracked.holdReason = holdReason;
     }
+    this.saveState();
   }
 
   /**
@@ -443,6 +680,11 @@ export class InventoryManager {
       item.salePriceUsd = roundToPrecision(soldEth * ethPriceUsd, 2);
 
       this.inventory.delete(identifier);
+
+      // Capital Reallocation Rule: count bot-purchased NFTs sold while offer cycles are paused
+      if (this.offerCyclePause.paused && !item.isExternalWalletItem) {
+        this.offerCyclePause.soldSincePause++;
+      }
     }
 
     const soldUsd = roundToPrecision(soldEth * ethPriceUsd, 2);
@@ -487,6 +729,7 @@ export class InventoryManager {
       },
       'NFT Sold & Sale Confirmed! Capital released, trade resolved, and profit added to balance.'
     );
+    this.saveState();
 
     return {
       realizedProfitUsd,

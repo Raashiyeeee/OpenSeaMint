@@ -28,7 +28,7 @@ const CapitalSchema = z.object({
   minNetProfitUsd: z.number().nonnegative().default(0.20),
   minOfferPriceUsd: z.number().positive().default(1.00),
   maxBuyPriceUsd: z.number().positive().default(5.0),
-  maxOfferCapitalPercent: z.number().positive().max(100).default(60.0)
+  maxOfferCapitalPercent: z.number().positive().max(70).default(70.0)
 });
 
 const LiquiditySchema = z.object({
@@ -64,6 +64,7 @@ const BotConfigSchema = z.object({
     loopIntervalMs: z.number().int().positive(),
     offerExpirationMinutes: z.number().int().positive(),
     listingExpirationDays: z.number().int().positive(),
+    relistCooldownMinutes: z.number().positive().default(10),
     ignoredCollections: z.array(z.string()).optional(),
     postSaleWethConvertPercent: z.number().positive().max(100).default(90.0),
     postSaleGasReservePercent: z.number().nonnegative().max(100).default(10.0)

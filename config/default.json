@@ -17,7 +17,7 @@
     "minOfferPriceUsd": 1.0,
     "maxBuyPriceUsd": 5.0,
     "minNetProfitUsd": 0.20,
-    "maxOfferCapitalPercent": 60.0
+    "maxOfferCapitalPercent": 70.0
   },
   "liquidity": {
     "minSales3Hours": 10,
@@ -29,10 +29,10 @@
   "networks": {
     "robinhood": {
       "name": "Robinhood Chain",
-      "rpcUrl": "https://robinhood-mainnet.g.alchemy.com/v2/alch_7DXoXr7Spid6vkmQLn8SC",
+      "rpcUrl": "https://rpc.mainnet.chain.robinhood.com",
       "chainId": 4663,
       "currency": "ETH",
-      "blockExplorer": "https://explorer.robinhoodchain.com",
+      "blockExplorer": "https://robinhoodchain.blockscout.com",
       "estimatedGasCostUsd": 0.01,
       "seaportAddress": "0x0000000000000068F116a894984e2DB1123eB395",
       "conduitKey": "0x61159fefdfada89302ed55f8b9e89e2d67d8258712b3a3f89aa88525877f1d5e",
@@ -57,7 +57,7 @@
   },
   "profitTargets": {
     "defaultMinNetProfitUsd": 0.15,
-    "defaultMinMarginPercent": 15.0,
+    "defaultMinMarginPercent": 40.0,
     "undercutFloorByPercent": 1.0,
     "bidUnderFloorPercent": 15.0,
     "bidIncrementUsd": 0.05
@@ -81,7 +81,7 @@
       "maxBidEth": 0.0015,
       "targetNetProfitUsd": 0.20,
       "maxInventory": 1,
-      "minMarginPercent": 15.0,
+      "minMarginPercent": 40.0,
       "minSales24Hours": 10
     },
     {
@@ -94,7 +94,7 @@
       "targetNetProfitUsd": 0.15,
       "maxInventory": 1,
       "floorPriceMultiple": 0.85,
-      "minMarginPercent": 12.0,
+      "minMarginPercent": 40.0,
       "minSales24Hours": 10,
       "singleTokenBids": true
     }

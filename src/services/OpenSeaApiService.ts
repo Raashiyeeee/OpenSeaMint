@@ -1,5 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
-import { BotConfig, CollectionMarketData, FeeRecipient } from '../types';
+import { ethers } from 'ethers';
+import { BotConfig, CollectionMarketData, FeeRecipient, MintSupplySources } from '../types';
 import { logger } from '../utils/logger';
 
 export class OpenSeaApiService {
@@ -7,6 +8,7 @@ export class OpenSeaApiService {
   private config: BotConfig;
   private ethPriceCache: { price: number; timestamp: number } | null = null;
   private mockOrderStates: Map<string, { isCancelled: boolean; cancellationFails?: boolean; verificationFails?: boolean }> = new Map();
+  private saleOrderSideCache: Map<string, 'LISTING' | 'OFFER' | 'UNKNOWN'> = new Map();
 
   constructor(config: BotConfig) {
     this.config = config;
@@ -24,6 +26,119 @@ export class OpenSeaApiService {
 
     if (!apiKey) {
       logger.warn('OPENSEA_API_KEY not found in environment. Using public endpoints / simulated fallback data where required.');
+    }
+  }
+
+  /**
+   * Maps internal network keys to OpenSea API chain identifiers (per OpenSea API ChainIdentifier enum:
+   * 'ethereum', 'robinhood', 'base', 'polygon', ...). 'mainnet' is the only internal alias.
+   */
+  public static toOpenSeaChain(networkKey?: string): string {
+    if (!networkKey || networkKey === 'mainnet') return 'ethereum';
+    return networkKey;
+  }
+
+  /**
+   * 100% Mint-Out Rule — pure decision over all available supply sources.
+   * - Any source reporting an active mint, or total < max, => NOT minted out (verified incomplete).
+   * - Verified complete only when a max supply AND a total supply are known and total >= max.
+   *   On-chain totalSupply() is preferred over API totals.
+   * - Otherwise status is unverifiable (=> reject).
+   */
+  public static evaluateMintSupply(src: MintSupplySources): {
+    verified: boolean;
+    completed: boolean;
+    isMinting: boolean;
+    totalSupply?: number;
+    maxSupply?: number;
+    source: string;
+    reason?: string;
+  } {
+    const isMinting = src.dropIsMinting === true || src.collectionIsMinting === true;
+    const maxCandidates = [src.onChainMaxSupply, src.dropMaxSupply].filter((v): v is number => typeof v === 'number' && v > 0);
+    const totalCandidates = [src.onChainTotalSupply, src.dropTotalSupply, src.collectionTotalSupply].filter((v): v is number => typeof v === 'number' && v >= 0);
+    const maxSupply = maxCandidates.length > 0 ? Math.max(...maxCandidates) : undefined;
+    const totalSupply = totalCandidates.length > 0 ? totalCandidates[0] : undefined;
+    const source = [
+      src.onChainTotalSupply !== undefined || src.onChainMaxSupply !== undefined ? 'on-chain' : '',
+      src.dropMaxSupply !== undefined || src.dropTotalSupply !== undefined ? 'opensea-drop' : '',
+      src.collectionTotalSupply !== undefined ? 'opensea-collection' : ''
+    ].filter(Boolean).join('+') || 'none';
+
+    if (isMinting) {
+      return { verified: true, completed: false, isMinting, totalSupply, maxSupply, source, reason: 'Public mint is currently active (is_minting: true).' };
+    }
+    if (maxSupply !== undefined && totalSupply !== undefined) {
+      // Every known total must have reached the (largest) known max supply
+      const allReached = totalCandidates.every((t) => t >= maxSupply);
+      if (!allReached) {
+        const minTotal = Math.min(...totalCandidates);
+        return { verified: true, completed: false, isMinting, totalSupply: minTotal, maxSupply, source, reason: `Mint has not reached 100% of max supply (${minTotal}/${maxSupply}).` };
+      }
+      return { verified: true, completed: true, isMinting, totalSupply, maxSupply, source };
+    }
+    return {
+      verified: false, completed: false, isMinting, totalSupply, maxSupply, source,
+      reason: `Mint-out status could not be verified (total_supply: ${totalSupply ?? 'unknown'}, max_supply: ${maxSupply ?? 'unknown'}).`
+    };
+  }
+
+  /**
+   * Reads totalSupply() and a max-supply getter directly from the NFT contract via the network RPC.
+   * Common max getters are tried in order; all calls are read-only (eth_call).
+   */
+  public async readOnChainSupply(contractAddress: string, networkKey?: string): Promise<{ totalSupply?: number; maxSupply?: number }> {
+    const net = networkKey || this.config.general.network || 'robinhood';
+    const rpcUrl = this.config.networks?.[net]?.rpcUrl;
+    if (!rpcUrl || !contractAddress || !/^0x[a-fA-F0-9]{40}$/.test(contractAddress)) return {};
+    const provider = new ethers.JsonRpcProvider(rpcUrl, undefined, { staticNetwork: true });
+    const abi = [
+      'function totalSupply() view returns (uint256)',
+      'function maxSupply() view returns (uint256)',
+      'function MAX_SUPPLY() view returns (uint256)',
+      'function maxTokens() view returns (uint256)',
+      'function MAX_TOKENS() view returns (uint256)',
+      'function collectionSize() view returns (uint256)'
+    ];
+    const c = new ethers.Contract(contractAddress, abi, provider);
+    const toNum = (v: bigint) => (v <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(v) : undefined);
+    const result: { totalSupply?: number; maxSupply?: number } = {};
+    try {
+      result.totalSupply = toNum(await c.totalSupply());
+    } catch {
+      /* not ERC721Enumerable / no totalSupply */
+    }
+    for (const fn of ['maxSupply', 'MAX_SUPPLY', 'maxTokens', 'MAX_TOKENS', 'collectionSize']) {
+      try {
+        const v = toNum(await (c as any)[fn]());
+        if (v !== undefined && v > 0) {
+          result.maxSupply = v;
+          break;
+        }
+      } catch {
+        /* getter not implemented */
+      }
+    }
+    provider.destroy();
+    return result;
+  }
+
+  /**
+   * OpenSea Drops API (/api/v2/drops/{slug}): max_supply, total_supply, is_minting for drops minted on OpenSea.
+   * Returns {} when the collection is not an OpenSea drop or the call fails.
+   */
+  public async getDropSupply(collectionSlug: string): Promise<{ totalSupply?: number; maxSupply?: number; isMinting?: boolean }> {
+    try {
+      const res = await this.client.get(`/drops/${collectionSlug}`);
+      const d = res.data || {};
+      const num = (v: any) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? undefined : Number(v));
+      return {
+        totalSupply: num(d.total_supply),
+        maxSupply: num(d.max_supply),
+        isMinting: typeof d.is_minting === 'boolean' ? d.is_minting : undefined
+      };
+    } catch {
+      return {};
     }
   }
 
@@ -51,7 +166,7 @@ export class OpenSeaApiService {
   /**
    * Fetches collection stats and floor price from OpenSea v2 API
    */
-  public async getCollectionMarketData(collectionSlug: string, contractAddress: string): Promise<CollectionMarketData> {
+  public async getCollectionMarketData(collectionSlug: string, contractAddress: string, networkKey?: string): Promise<CollectionMarketData> {
     const ethPriceUsd = await this.getEthPriceUsd();
 
     try {
@@ -161,12 +276,10 @@ export class OpenSeaApiService {
       // 3. Fetch best offers
       let topOfferEth = 0; // Default 0 (never default to dummy 0.04 ETH)
       try {
-        const offersRes = await this.client.get(`/offers/collection/${collectionSlug}/all?limit=10`);
+        const offersRes = await this.client.get(`/offers/collection/${collectionSlug}/all?limit=100`);
         const offers = offersRes.data?.offers || [];
         for (const off of offers) {
-          const rawPrice = off?.price?.value;
-          const decimals = off?.price?.decimals || 18;
-          const offerEth = parseFloat(rawPrice) / Math.pow(10, decimals);
+          const offerEth = OpenSeaApiService.perUnitOfferPriceEth(off);
           // Only compete with valid collection offers that are strictly below floor price
           if (offerEth > 0 && offerEth < floorPriceEth && offerEth > topOfferEth) {
             topOfferEth = offerEth;
@@ -179,34 +292,31 @@ export class OpenSeaApiService {
       // 4. Fetch Liquidity Metrics with floor reference
       const liquidity = await this.getCollectionLiquidity(collectionSlug, floorPriceEth, sales24Hours);
 
-      // 5. Incomplete Public Mint & 100% Mint-Out Metrics
-      const isMinting = collectionData?.is_minting === true;
-      const totalSupply = typeof collectionData?.total_supply === 'number'
-        ? collectionData.total_supply
-        : (typeof collectionData?.stats?.total_supply === 'number' ? collectionData.stats.total_supply : undefined);
-      const maxSupply = typeof collectionData?.max_supply === 'number' ? collectionData.max_supply : undefined;
-
-      let mintCompleted = true;
-      let mintStatusVerified = true;
-      let mintDemandPassed = true;
-      let mintDemandReason: string | undefined;
-
-      // 100% Mint-Out Rule:
-      // If collection has not reached 100% of total mint supply, REJECT.
-      if (maxSupply !== undefined && maxSupply > 0 && totalSupply !== undefined && totalSupply < maxSupply) {
-        mintCompleted = false;
-        mintDemandPassed = false;
-        mintDemandReason = `Incomplete Collection: Mint has not reached 100% of total mint supply (${totalSupply}/${maxSupply} minted, ${((totalSupply / maxSupply) * 100).toFixed(1)}%). Core rule: If mint-out is not 100% complete, DO NOT OFFER ❌`;
-      } else if (isMinting) {
-        mintCompleted = false;
-        mintDemandPassed = false;
-        mintDemandReason = `Public mint is currently active (is_minting: true). Collection is not 100% minted out. Core rule: If mint-out is not 100% complete, DO NOT OFFER ❌`;
-      } else if (totalSupply === undefined && maxSupply === undefined && collectionData === undefined) {
-        mintStatusVerified = false;
-        mintCompleted = false;
-        mintDemandPassed = false;
-        mintDemandReason = 'Mint-out status could not be verified from reliable marketplace data. Core rule: If status cannot be verified, DO NOT OFFER ❌';
-      }
+      // 5. Incomplete Public Mint & 100% Mint-Out Metrics — combine on-chain supply, OpenSea Drops API and
+      //    OpenSea collection data. Reject unless 100% mint-out is positively verified.
+      const collectionTotalSupply = typeof collectionData?.total_supply === 'number' ? collectionData.total_supply : undefined;
+      const [drop, onChain] = await Promise.all([
+        this.getDropSupply(collectionSlug),
+        this.readOnChainSupply(contractAddress, networkKey).catch(() => ({} as { totalSupply?: number; maxSupply?: number }))
+      ]);
+      const mint = OpenSeaApiService.evaluateMintSupply({
+        collectionTotalSupply,
+        collectionIsMinting: collectionData?.is_minting === true ? true : undefined,
+        dropTotalSupply: drop.totalSupply,
+        dropMaxSupply: drop.maxSupply,
+        dropIsMinting: drop.isMinting,
+        onChainTotalSupply: onChain.totalSupply,
+        onChainMaxSupply: onChain.maxSupply
+      });
+      const isMinting = mint.isMinting;
+      const totalSupply = mint.totalSupply;
+      const maxSupply = mint.maxSupply;
+      const mintCompleted = mint.verified && mint.completed;
+      const mintStatusVerified = mint.verified;
+      let mintDemandPassed = mintCompleted;
+      let mintDemandReason: string | undefined = mintCompleted
+        ? undefined
+        : `${mint.reason} (sources: ${mint.source}). Core rule: If mint-out is not 100% complete or cannot be verified, DO NOT OFFER ❌`;
 
       if (!liquidity.liquidityPassed) {
         mintDemandPassed = false;
@@ -267,6 +377,7 @@ export class OpenSeaApiService {
         liquidityReason: 'Conservative fallback on error',
         isMinting: false,
         mintCompleted: false,
+        mintStatusVerified: false,
         mintDemandPassed: false,
         mintDemandReason: 'Conservative fallback on error'
       };
@@ -303,17 +414,32 @@ export class OpenSeaApiService {
     const maxFloorAllowed = floorPriceEth > 0 ? floorPriceEth * floorMaxPercent : Infinity;
 
     try {
-      const res = await this.client.get(`/events/collection/${collectionSlug}?event_type=sale&limit=50`);
-      const events = res.data?.asset_events || [];
+      // Fetch ALL sale events from the last 3 hours (paginated, bounded) so busy collections are not undercounted
+      const nowSec = Math.floor(Date.now() / 1000);
+      const events: any[] = [];
+      let next: string | undefined;
+      for (let page = 0; page < 10; page++) {
+        const url = `/events/collection/${collectionSlug}?event_type=sale&after=${threeHoursAgo}&limit=200` + (next ? `&next=${encodeURIComponent(next)}` : '');
+        const res = await this.client.get(url);
+        events.push(...(res.data?.asset_events || []));
+        next = res.data?.next;
+        if (!next) break;
+      }
 
-      // Filter events to strictly last 3 hours
-      const sales3HoursRaw = events.filter((e: any) => (e.event_timestamp || 0) >= threeHoursAgo);
+      // Filter events to strictly last 3 hours (anything older, or without a valid timestamp, never counts)
+      const sales3HoursRaw = events.filter((e: any) => {
+        const ts = Number(e.event_timestamp);
+        return Number.isFinite(ts) && ts >= threeHoursAgo && ts <= nowSec + 60;
+      });
 
       const qualifiedSales: any[] = [];
       const wallets3Hours = new Set<string>();
 
       for (const sale of sales3HoursRaw) {
         // Must be an actual completed sale (exclude pending, cancelled, or failed events)
+        if (sale.event_type && sale.event_type.toLowerCase() !== 'sale') {
+          continue;
+        }
         const status = (sale.status || '').toLowerCase();
         if (status === 'pending' || status === 'cancelled' || status === 'failed' || status === 'reverted' || sale.is_completed === false) {
           continue;
@@ -325,7 +451,9 @@ export class OpenSeaApiService {
         const tokenAddr = (sale.payment?.token_address || sale.payment_token?.address || '').toLowerCase();
         const wethAddresses = ['0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', '0x0bd7d308f8e1639fab988df18a8011f41eacad73'];
 
-        if (symbol !== 'ETH' || tokenName.includes('WRAPPED') || wethAddresses.includes(tokenAddr)) {
+        // Native ETH is reported with the zero address as payment token; any other token address is not native ETH
+        const isNativeTokenAddr = tokenAddr === '' || tokenAddr === '0x0000000000000000000000000000000000000000';
+        if (symbol !== 'ETH' || tokenName.includes('WRAPPED') || wethAddresses.includes(tokenAddr) || !isNativeTokenAddr) {
           // WETH sales strictly excluded
           continue;
         }
@@ -342,6 +470,16 @@ export class OpenSeaApiService {
 
         if (isOfferAcceptance) {
           continue; // Offer acceptances must not count toward this requirement
+        }
+
+        // Sale events do not carry an order type, so the filled Seaport order is looked up by order_hash:
+        // a filled OFFER (offerer gives ERC20/WETH, or criteria offer) is an accepted offer and is excluded.
+        // (Seaport offers cannot pay in native ETH, so the native-ETH filter above already removes nearly all of them.)
+        if (sale.order_hash) {
+          const side = await this.getSaleOrderSide(sale.order_hash, sale.chain, sale.protocol_address);
+          if (side === 'OFFER') {
+            continue;
+          }
         }
 
         // Parse price
@@ -373,7 +511,7 @@ export class OpenSeaApiService {
 
       const sales3Hours = qualifiedSales.length;
       const uniqueWallets3Hours = wallets3Hours.size;
-      const sales1HourList = qualifiedSales.filter((e: any) => (e.event_timestamp || 0) >= oneHourAgo);
+      const sales1HourList = qualifiedSales.filter((e: any) => Number(e.event_timestamp) >= oneHourAgo);
       const wallets1Hour = new Set<string>();
       for (const s of sales1HourList) {
         if (s.buyer) wallets1Hour.add(s.buyer.toLowerCase());
@@ -468,7 +606,7 @@ export class OpenSeaApiService {
   /**
    * Automatic Offer Cancellation: Initiates cancellation of an active offer via OpenSea API / Seaport
    */
-  public async cancelOffer(orderHash: string, chain: string = 'robinhood'): Promise<{ success: boolean; error?: string }> {
+  public async cancelOffer(orderHash: string, chain: string = 'robinhood'): Promise<{ success: boolean; error?: string; fillableUntil?: number }> {
     // 1. Mock state check for testing
     const mock = this.mockOrderStates.get(orderHash);
     if (mock) {
@@ -492,12 +630,19 @@ export class OpenSeaApiService {
 
     // 3. Live OpenSea v2 API cancellation
     try {
-      const chainSlug = chain === 'mainnet' ? 'ethereum' : chain;
-      const res = await this.client.post(`/orders/${chainSlug}/seaport/offers/cancel`, {
-        order_hash: orderHash
-      });
-      logger.info({ orderHash, chain: chainSlug, data: res.data }, 'OpenSea accepted offer cancellation request');
-      return { success: true };
+      const chainSlug = OpenSeaApiService.toOpenSeaChain(chain);
+      const seaportAddress = this.config.seaport.contractAddress;
+      const res = await this.client.post(`/orders/chain/${chainSlug}/protocol/${seaportAddress}/${orderHash}/cancel`, {});
+      // Per OpenSea docs: a fulfillment signature issued before the offchain cancel stays valid until
+      // last_signature_issued_valid_until ("0" = none issued). The order is still fillable until then.
+      const validUntilRaw = res.data?.last_signature_issued_valid_until;
+      let fillableUntil: number | undefined;
+      if (validUntilRaw && validUntilRaw !== '0') {
+        const parsed = Date.parse(validUntilRaw);
+        fillableUntil = Number.isFinite(parsed) ? parsed : Date.now() + 5 * 60 * 1000;
+      }
+      logger.info({ orderHash, chain: chainSlug, data: res.data, fillableUntil }, 'OpenSea accepted offer cancellation request');
+      return { success: true, fillableUntil };
     } catch (err: any) {
       const errorDetail = err.response?.data?.errors || err.response?.data || err.message;
       logger.error({ orderHash, chain, error: errorDetail }, 'OpenSea failed to cancel offer');
@@ -530,33 +675,162 @@ export class OpenSeaApiService {
       return { isInactive: true, status: 'CANCELLED' };
     }
 
-    // 3. Live OpenSea v2 API query to verify inactive status
+    // 3. Live OpenSea v2 Get Order: GET /orders/chain/{chain}/protocol/{protocol}/{order_hash} -> { order: { status } }
+    //    status enum (OpenSea docs): ACTIVE | INACTIVE | FULFILLED | EXPIRED | CANCELLED
     try {
-      const chainSlug = chain === 'mainnet' ? 'ethereum' : chain;
+      const chainSlug = OpenSeaApiService.toOpenSeaChain(chain);
       const seaportAddress = this.config.seaport.contractAddress;
       const res = await this.client.get(`/orders/chain/${chainSlug}/protocol/${seaportAddress}/${orderHash}`);
-      const order = res.data?.order || res.data;
-      const status = (order?.status || '').toLowerCase();
+      const order = res.data?.order;
+      const status = String(order?.status || '').toUpperCase();
 
-      // If status is cancelled, expired, or fulfilled -> it is inactive
-      if (status === 'cancelled' || status === 'expired' || status === 'filled' || status === 'inactive') {
-        return { isInactive: true, status: status.toUpperCase() };
+      if (status === 'CANCELLED' || status === 'EXPIRED') {
+        return { isInactive: true, status };
       }
-
-      // If status is active or valid -> it is still active!
-      if (status === 'active' || status === 'valid') {
-        return { isInactive: false, status: 'ACTIVE', error: `Offer ${orderHash} is still reported as ACTIVE on OpenSea.` };
+      if (status === 'FULFILLED') {
+        // The offer was ACCEPTED (NFT bought) — inactive, but this is a fill, not a cancellation
+        return { isInactive: true, status: 'FULFILLED' };
       }
-
-      // Unknown status -> conservative: assume still active
-      return { isInactive: false, status, error: `Unverified offer status: ${status}` };
+      if (status === 'ACTIVE' || status === 'INACTIVE') {
+        // INACTIVE = temporarily unfillable (e.g. balance/approval) and can revalidate — NOT cancelled
+        return { isInactive: false, status, error: `Offer ${orderHash} is still ${status} on OpenSea (not cancelled).` };
+      }
+      return { isInactive: false, status, error: `Unverified offer status: ${status || 'missing'}` };
     } catch (err: any) {
-      // 404 indicates order no longer found or expired/purged from active orderbook
-      if (err.response?.status === 404) {
-        return { isInactive: true, status: 'NOT_FOUND' };
-      }
+      // 404 does not prove cancellation (the order may simply be unknown/unindexed): treat as unverified.
+      // The strategy falls back to the on-chain Seaport getOrderStatus check.
       const errorMsg = err.response?.data?.errors || err.message;
-      return { isInactive: false, error: `Could not verify offer status via API: ${JSON.stringify(errorMsg)}` };
+      return {
+        isInactive: false,
+        status: err.response?.status === 404 ? 'NOT_FOUND' : undefined,
+        error: `Could not verify offer status via API: ${JSON.stringify(errorMsg)}`
+      };
+    }
+  }
+
+  /**
+   * Per-unit price (ETH) of an OpenSea offer object. price.value covers the whole order quantity,
+   * so it is divided by the number of NFTs requested (consideration[0].startAmount) for multi-quantity offers.
+   */
+  public static perUnitOfferPriceEth(off: any): number {
+    const rawPrice = off?.price?.value ?? off?.price?.current?.value;
+    const decimals = off?.price?.decimals ?? off?.price?.current?.decimals ?? 18;
+    const total = parseFloat(rawPrice) / Math.pow(10, decimals);
+    if (!Number.isFinite(total) || total <= 0) return 0;
+    const qtyRaw = off?.protocol_data?.parameters?.consideration?.[0]?.startAmount;
+    const qty = qtyRaw !== undefined && Number(qtyRaw) > 0 ? Number(qtyRaw) : 1;
+    return total / qty;
+  }
+
+  /**
+   * Best offer on a specific NFT (OpenSea: GET /offers/collection/{slug}/nfts/{identifier}/best).
+   * Returns per-unit price in ETH and the order hash, or undefined if none / unavailable.
+   */
+  /**
+   * Lowest active listing in the collection that is NOT ours (GET /listings/collection/{slug}/best, sorted by
+   * price ascending). Returns null when no competing listing exists, undefined when the lookup failed.
+   */
+  public async getLowestCompetingListing(
+    collectionSlug: string,
+    ourAddress: string
+  ): Promise<{ priceEth: number; orderHash?: string } | null | undefined> {
+    try {
+      const res = await this.client.get(`/listings/collection/${collectionSlug}/best?limit=50`);
+      const listings: any[] = res.data?.listings || [];
+      const ours = (ourAddress || '').toLowerCase();
+      for (const l of listings) {
+        const params = l?.protocol_data?.parameters;
+        if ((params?.offerer || '').toLowerCase() === ours) continue;
+        const cur = l?.price?.current;
+        if (!cur?.value) continue;
+        const qty = Number(params?.offer?.[0]?.startAmount || 1) || 1;
+        const priceEth = Number(cur.value) / Math.pow(10, cur.decimals ?? 18) / qty;
+        if (priceEth > 0) return { priceEth, orderHash: l.order_hash };
+      }
+      return null;
+    } catch (err: any) {
+      logger.warn({ slug: collectionSlug, err: err.message }, 'Failed to fetch competing listings');
+      return undefined;
+    }
+  }
+
+    public async getBestNftOffer(collectionSlug: string, tokenId: string): Promise<{ priceEth: number; orderHash?: string } | undefined> {
+    try {
+      const res = await this.client.get(`/offers/collection/${collectionSlug}/nfts/${tokenId}/best`);
+      const priceEth = OpenSeaApiService.perUnitOfferPriceEth(res.data);
+      if (priceEth <= 0) return undefined;
+      return { priceEth, orderHash: res.data?.order_hash };
+    } catch (err: any) {
+      logger.debug({ collectionSlug, tokenId, err: err.message }, 'Could not fetch best NFT offer');
+      return undefined;
+    }
+  }
+
+  /**
+   * Classifies the Seaport order filled by a sale: LISTING (seller's ask filled — a genuine buy) or
+   * OFFER (a bid was accepted). Uses GET /orders/... on the sale's order_hash. Cached per order hash.
+   */
+  public async getSaleOrderSide(orderHash: string, chain?: string, protocolAddress?: string): Promise<'LISTING' | 'OFFER' | 'UNKNOWN'> {
+    const cached = this.saleOrderSideCache.get(orderHash);
+    if (cached) return cached;
+    let side: 'LISTING' | 'OFFER' | 'UNKNOWN' = 'UNKNOWN';
+    try {
+      const chainSlug = chain || 'ethereum';
+      const protocol = protocolAddress || this.config.seaport.contractAddress;
+      const res = await this.client.get(`/orders/chain/${chainSlug}/protocol/${protocol}/${orderHash}`);
+      const order = res.data?.order;
+      if (order) {
+        const offerItems: any[] = order.protocol_data?.parameters?.offer || [];
+        const firstType = offerItems.length > 0 ? Number(offerItems[0].itemType) : undefined;
+        if (order.criteria || firstType === 1) {
+          side = 'OFFER'; // offerer supplies ERC20 (WETH) => bid
+        } else if (firstType !== undefined && firstType >= 2) {
+          side = 'LISTING'; // offerer supplies the NFT => ask
+        } else if (order.type) {
+          side = 'LISTING'; // Listing schema carries `type` (basic/english/...)
+        }
+      }
+    } catch {
+      side = 'UNKNOWN';
+    }
+    if (side !== 'UNKNOWN') this.saleOrderSideCache.set(orderHash, side);
+    return side;
+  }
+
+  /**
+   * Confirms a SALE of a specific NFT by our wallet (seller) since `afterSec`, via
+   * GET /events/chain/{chain}/contract/{address}/nfts/{identifier}?event_type=sale&after=...
+   * Returns the sale, null if no sale (e.g. a plain transfer), or undefined if it could not be checked.
+   */
+  public async getConfirmedNftSale(
+    contractAddress: string,
+    tokenId: string,
+    sellerAddress: string,
+    networkKey?: string,
+    afterSec?: number
+  ): Promise<{ salePriceEth: number; txHash?: string; timestamp: number; paymentSymbol: string } | null | undefined> {
+    try {
+      const chainSlug = OpenSeaApiService.toOpenSeaChain(networkKey);
+      const after = afterSec ? `&after=${Math.max(0, Math.floor(afterSec) - 60)}` : '';
+      const res = await this.client.get(`/events/chain/${chainSlug}/contract/${contractAddress}/nfts/${tokenId}?event_type=sale&limit=50${after}`);
+      const events: any[] = res.data?.asset_events || [];
+      const sale = events.find(
+        (e) => (!e.event_type || String(e.event_type).toLowerCase() === 'sale') &&
+          String(e.seller || '').toLowerCase() === sellerAddress.toLowerCase()
+      );
+      if (!sale) return null;
+      const quantity = sale.payment?.quantity;
+      const decimals = sale.payment?.decimals ?? 18;
+      const salePriceEth = quantity ? parseFloat(quantity) / Math.pow(10, decimals) : 0;
+      return {
+        salePriceEth,
+        txHash: sale.transaction,
+        timestamp: Number(sale.event_timestamp) || 0,
+        paymentSymbol: String(sale.payment?.symbol || '').toUpperCase()
+      };
+    } catch (err: any) {
+      logger.debug({ contractAddress, tokenId, err: err.message }, 'Could not query NFT sale events');
+      return undefined;
     }
   }
 
@@ -598,19 +872,32 @@ export class OpenSeaApiService {
   }
 
   /**
-   * Fetch NFTs currently owned by a wallet on a specified chain
+   * Fetch NFTs currently owned by a wallet on a specified chain (paginated).
+   * Returns null when ownership cannot be determined (API error) so callers never mistake an
+   * API failure for "NFT left the wallet".
    */
-  public async getAccountNfts(walletAddress: string, collectionSlug?: string, chain: string = 'robinhood'): Promise<any[]> {
+  public async getAccountNfts(walletAddress: string, collectionSlug?: string, chain: string = 'robinhood'): Promise<any[] | null> {
     try {
-      const chainSlug = chain === 'mainnet' ? 'ethereum' : chain;
-      const url = collectionSlug 
-        ? `/chain/${chainSlug}/account/${walletAddress}/nfts?collection=${collectionSlug}&limit=50`
-        : `/chain/${chainSlug}/account/${walletAddress}/nfts?limit=50`;
-      const res = await this.client.get(url);
-      return res.data?.nfts || [];
+      const chainSlug = OpenSeaApiService.toOpenSeaChain(chain);
+      const base = collectionSlug
+        ? `/chain/${chainSlug}/account/${walletAddress}/nfts?collection=${collectionSlug}&limit=200`
+        : `/chain/${chainSlug}/account/${walletAddress}/nfts?limit=200`;
+      const all: any[] = [];
+      let next: string | undefined;
+      for (let page = 0; page < 20; page++) {
+        const res = await this.client.get(base + (next ? `&next=${encodeURIComponent(next)}` : ''));
+        all.push(...(res.data?.nfts || []));
+        next = res.data?.next;
+        if (!next) break;
+      }
+      if (next) {
+        // Could not read the complete holdings list: ownership is not reliably known
+        return null;
+      }
+      return all;
     } catch (err: any) {
-      logger.debug(`Could not fetch NFTs for ${walletAddress} on ${chain}: ${err.message}`);
-      return [];
+      logger.warn(`Could not fetch NFTs for ${walletAddress} on ${chain}: ${err.message}`);
+      return null;
     }
   }
 
@@ -622,7 +909,7 @@ export class OpenSeaApiService {
     minFloorUsd: number = 0.50,
     maxFloorUsd: number = 3.50
   ): Promise<any[]> {
-    const chainSlug = networkKey === 'robinhood' ? 'robinhood' : 'ethereum';
+    const chainSlug = OpenSeaApiService.toOpenSeaChain(networkKey);
     const ethPriceUsd = await this.getEthPriceUsd();
     const discovered: any[] = [];
 

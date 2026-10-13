@@ -102,10 +102,10 @@ assert.strictEqual(capitalExceededTrade.checkACapitalPassed, false, 'Check A mus
 console.log('Test 4 PASSED: Capital limit check correctly failed: ' + capitalExceededTrade.reason, '\n');
 
 // --------------------------------------------------------------------------
-// TEST 5: Simultaneous Offers Across Qualifying NFTs & 60% Capital Allocation Rule
-// Number of NFTs is unlimited by count; limited only by active-offer capital allocation (e.g. 60% of $10 = $6.00 max).
+// TEST 5: Simultaneous Offers Across Qualifying NFTs & 70% Capital Allocation Rule
+// Number of NFTs is unlimited by count; limited only by capital allocation (70% of $10 = $7.00 max, 30% reserved).
 // --------------------------------------------------------------------------
-console.log('--- Test 5: Simultaneous Offers & 60% Active-Offer Capital Allocation ---');
+console.log('--- Test 5: Simultaneous Offers & 70% Capital Allocation ---');
 const inventoryManager = new InventoryManager(config);
 
 assert.strictEqual(inventoryManager.getTotalCapitalUsd(), 10.0, 'Total capital must be $10');
@@ -113,7 +113,7 @@ assert.strictEqual(inventoryManager.getAvailableCapitalUsd(), 10.0, 'Available c
 
 // Place first simultaneous offer ($2.50)
 const offer1Check = inventoryManager.canAllocateCapitalForOffer(2.50);
-assert.strictEqual(offer1Check.allowed, true, 'First offer ($2.50 <= $6.00 limit) must be allowed');
+assert.strictEqual(offer1Check.allowed, true, 'First offer ($2.50 <= $7.00 limit) must be allowed');
 inventoryManager.registerActiveOffer({
   orderHash: 'offer_1',
   collectionSlug: 'collection-a',
@@ -127,7 +127,7 @@ inventoryManager.registerActiveOffer({
 
 // Place second simultaneous offer ($2.50) across another qualifying collection (count is unlimited!)
 const offer2Check = inventoryManager.canAllocateCapitalForOffer(2.50);
-assert.strictEqual(offer2Check.allowed, true, 'Second simultaneous offer ($2.50 + $2.50 = $5.00 <= $6.00) must be allowed');
+assert.strictEqual(offer2Check.allowed, true, 'Second simultaneous offer ($2.50 + $2.50 = $5.00 <= $7.00) must be allowed');
 inventoryManager.registerActiveOffer({
   orderHash: 'offer_2',
   collectionSlug: 'collection-b',
@@ -140,9 +140,9 @@ inventoryManager.registerActiveOffer({
 });
 console.log('Simultaneous offers allowed across multiple collections: Total active offers = $' + inventoryManager.getActiveOffersCapitalUsd());
 
-// Attempt third offer ($2.00) -> $5.00 + $2.00 = $7.00 > $6.00 (60% of $10) -> Must be blocked!
-const offer3Check = inventoryManager.canAllocateCapitalForOffer(2.00);
-assert.strictEqual(offer3Check.allowed, false, 'Third offer exceeding 60% active offer allocation ($7.00 > $6.00) must be blocked');
+// Attempt third offer ($2.50) -> $5.00 + $2.50 = $7.50 > $7.00 (70% of $10) -> Must be blocked!
+const offer3Check = inventoryManager.canAllocateCapitalForOffer(2.50);
+assert.strictEqual(offer3Check.allowed, false, 'Third offer exceeding 70% allocation ($7.50 > $7.00) must be blocked');
 console.log('Third offer blocked by capital allocation limit:', offer3Check.reason);
 
 // Now simulate NFT acquired & then sold for $4.00
@@ -156,7 +156,7 @@ const saleResult = inventoryManager.markItemSold(
 
 assert(saleResult.newTotalCapitalUsd >= 10.0, 'Capital after sale must be updated with profit');
 console.log('Sale completed: Capital released, new balance: $' + saleResult.newTotalCapitalUsd);
-console.log('Test 5 PASSED: Simultaneous offers and 60% active-offer capital allocation verified!\n');
+console.log('Test 5 PASSED: Simultaneous offers and 70% capital allocation verified!\n');
 
 // --------------------------------------------------------------------------
 // TEST 6: Network Gas Impact: Robinhood Chain vs Ethereum Mainnet
@@ -165,7 +165,7 @@ console.log('Test 5 PASSED: Simultaneous offers and 60% active-offer capital all
 console.log('--- Test 6: Network Gas Comparison on $10 Trade ---');
 const rhTrade = pricingEngine.evaluateOfferScenario({
   offerPriceUsd: 10.0,
-  floorPriceUsd: 13.0,
+  floorPriceUsd: 15.0, // 40% net margin rule: floor 13 (~23% margin) no longer qualifies
   royaltyPercent: 5.0,
   marketplaceFeePercent: 0.5,
   networkGasUsd: 0.01, // Robinhood Chain low gas
@@ -175,7 +175,7 @@ const rhTrade = pricingEngine.evaluateOfferScenario({
 
 const ethMainnetTrade = pricingEngine.evaluateOfferScenario({
   offerPriceUsd: 10.0,
-  floorPriceUsd: 13.0,
+  floorPriceUsd: 15.0,
   royaltyPercent: 5.0,
   marketplaceFeePercent: 0.5,
   networkGasUsd: 3.50, // Ethereum Mainnet high gas
@@ -208,6 +208,11 @@ const lowVolumeData: CollectionMarketData = {
   timestamp: Date.now(),
   sales1Hour: 5,
   uniqueWallets1Hour: 2,
+  sales3Hours: 5,
+  uniqueWallets3Hours: 2,
+  mintStatusVerified: true,
+  totalSupply: 1000,
+  maxSupply: 1000,
   liquidityPassed: false
 };
 const lowVolCalc = pricingEngine.calculateMaxBid(lowVolumeData, 2.0, 10.0, 'robinhood');
@@ -227,7 +232,12 @@ const washTradingData: CollectionMarketData = {
   ethPriceUsd: 2700,
   timestamp: Date.now(),
   sales1Hour: 16,
-  uniqueWallets1Hour: 1, // Only 1 wallet!
+  uniqueWallets1Hour: 1,
+  sales3Hours: 16,
+  uniqueWallets3Hours: 1,
+  mintStatusVerified: true,
+  totalSupply: 1000,
+  maxSupply: 1000, // Only 1 wallet!
   liquidityPassed: false
 };
 const washCalc = pricingEngine.calculateMaxBid(washTradingData, 2.0, 10.0, 'robinhood');
@@ -248,6 +258,11 @@ const liquidData: CollectionMarketData = {
   timestamp: Date.now(),
   sales1Hour: 25,
   uniqueWallets1Hour: 12,
+  sales3Hours: 25,
+  uniqueWallets3Hours: 12,
+  mintStatusVerified: true,
+  totalSupply: 1000,
+  maxSupply: 1000,
   liquidityPassed: true
 };
 const liquidCalc = pricingEngine.calculateMaxBid(liquidData, 2.0, 10.0, 'robinhood');
@@ -271,6 +286,11 @@ const highMarginData: CollectionMarketData = {
   timestamp: Date.now(),
   sales1Hour: 20,
   uniqueWallets1Hour: 6,
+  sales3Hours: 20,
+  uniqueWallets3Hours: 6,
+  mintStatusVerified: true,
+  totalSupply: 1000,
+  maxSupply: 1000,
   liquidityPassed: true
 };
 const highMarginCalc = pricingEngine.calculateMaxBid(highMarginData, 0.20, 10.0, 'robinhood');
@@ -296,6 +316,11 @@ const expensiveData: CollectionMarketData = {
   timestamp: Date.now(),
   sales1Hour: 25,
   uniqueWallets1Hour: 8,
+  sales3Hours: 25,
+  uniqueWallets3Hours: 8,
+  mintStatusVerified: true,
+  totalSupply: 1000,
+  maxSupply: 1000,
   liquidityPassed: true
 };
 const expensiveCalc = pricingEngine.calculateMaxBid(expensiveData, 0.20, 10.0, 'robinhood');
@@ -365,6 +390,11 @@ const optionalFeeData: CollectionMarketData = {
   timestamp: Date.now(),
   sales1Hour: 25,
   uniqueWallets1Hour: 8,
+  sales3Hours: 25,
+  uniqueWallets3Hours: 8,
+  mintStatusVerified: true,
+  totalSupply: 1000,
+  maxSupply: 1000,
   liquidityPassed: true,
   fees: [
     { fee: 0.5, recipient: '0x0000a26b00c1f0df003000390027140000faa719', required: true }, // OpenSea
@@ -430,8 +460,8 @@ reconcileInvManager.addInventoryItem({
 });
 assert.strictEqual(reconcileInvManager.getInventoryCount(), 1, 'Inventory count should be 1');
 
-// Now simulate user sold the NFT on OpenSea/wallet: Wallet now has 0 NFTs
-const removed = reconcileInvManager.reconcileWalletInventory([]);
+// Now simulate user sold the NFT on OpenSea/wallet: Wallet now has 0 NFTs and a confirmed sale event exists
+const removed = reconcileInvManager.reconcileWalletInventory([], 2700, new Map([['0xcontract1:100', { salePriceEth: 0.0015, txHash: '0xsale13' }]]));
 assert.strictEqual(removed.length, 1, 'Should reconcile and remove sold NFT');
 assert.strictEqual(reconcileInvManager.getInventoryCount(), 0, 'Inventory count must reset to 0');
 assert.strictEqual(reconcileInvManager.canBidOnCollection('slug-a', 5), true, 'Bidding must be allowed once inventory is cleared');
@@ -1251,7 +1281,10 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     uniqueWallets3Hours: 6,
     liquidityPassed: false,
     liquidityReason: 'Only 6 native ETH floor sales in last 3h (< 10 required)',
-    mintCompleted: true
+    mintCompleted: true,
+    mintStatusVerified: true,
+    totalSupply: 1000,
+    maxSupply: 1000
   };
   const calcFailedSales = pricingEngine.calculateMaxBid(baseEligibleData, 0.20, 10.0, 'robinhood');
   assert.strictEqual(calcFailedSales.checkLLiquidityPassed, false, 'Liquidity check must fail on sales volume');
@@ -1317,11 +1350,11 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     expiresTimestamp: Date.now() + 20 * 60 * 1000,
     status: 'ACTIVE'
   });
-  // Attempting $1.50 offer: $5.50 + $1.50 = $7.00 > $6.00 (60% of $10.00)
-  const capitalExceededCheck = cancelTestInv.canAllocateCapitalForOffer(1.50);
-  assert.strictEqual(capitalExceededCheck.allowed, false, 'Must reject offer that exceeds 60% active offer allocation limit');
+  // Attempting $2.00 offer: $5.50 + $2.00 = $7.50 > $7.00 (70% of $10.00)
+  const capitalExceededCheck = cancelTestInv.canAllocateCapitalForOffer(2.00);
+  assert.strictEqual(capitalExceededCheck.allowed, false, 'Must reject offer that exceeds 70% allocation limit');
   assert(capitalExceededCheck.reason?.includes('allocation limit'), 'Reason must specify capital allocation limit');
-  console.log('Case 17l PASSED: Re-filtering rejects NFT when active offer capital limit (>60%) would be exceeded ✅');
+  console.log('Case 17l PASSED: Re-filtering rejects NFT when capital allocation limit (>70%) would be exceeded ✅');
 
   // Case 17m: Re-Offer Rule - All conditions pass -> New offer permitted!
   cancelTestInv.cancelActiveOffer('other-collection'); // Clear the temporary offer
@@ -1341,6 +1374,9 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     uniqueWallets3Hours: 9, // PASSED: >= 5
     liquidityPassed: true,
     mintCompleted: true,
+    mintStatusVerified: true,
+    totalSupply: 1000,
+    maxSupply: 1000,
     referenceFloorEth: 0.00165,
     floorDeclinePercent: 3.0 // PASSED: < 40%
   };
@@ -1436,15 +1472,15 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     status: 'LISTED'
   });
 
-  // Reconcile when NFT is sold on-chain (disappears from wallet)
-  const reconciledSales = postSaleInvManager.reconcileWalletInventory([]);
+  // Reconcile when NFT is sold on-chain (disappears from wallet AND a confirmed sale event exists)
+  const reconciledSales = postSaleInvManager.reconcileWalletInventory([], 2700, new Map([[`${testSoldContract.toLowerCase()}:888`, { salePriceEth: 0.0025, txHash: '0xsale18c' }]]));
   assert.strictEqual(reconciledSales.length, 1, 'Reconciliation must detect 1 sold NFT');
   assert.strictEqual(reconciledSales[0].netProceedsEth, 0.002475, 'Reconciled sale proceeds must be 0.002475 ETH (0.0025 - 1% fee)');
 
   const reconcileSwap = await testSeaport.handlePostSaleEthConversion(reconciledSales[0].netProceedsEth, reconciledSales[0].network);
   assert.strictEqual(reconcileSwap.success, true, 'Reconciled sale ETH to WETH conversion must succeed');
   assert.strictEqual(reconcileSwap.amountWrappedEth, 0.002228, 'Reconciled amount wrapped must be exactly 90% of proceeds (0.002475 * 0.9 = 0.002228 ETH)');
-  assert.strictEqual(reconcileSwap.gasReserveRetainedEth, 0.000248, 'Reconciled gas reserve retained must be exactly 10% of proceeds (0.002475 * 0.1 = 0.000248 ETH)');
+  assert.strictEqual(reconcileSwap.gasReserveRetainedEth, 0.000247, 'Reconciled gas reserve must be the remaining ~10% of proceeds (0.002475 - 0.002228 = 0.000247 ETH)');
   console.log('Case 18c PASSED: Reconciled sale automatically triggers 90% WETH conversion (' + reconcileSwap.amountWrappedEth + ' ETH) & 10% gas reserve (' + reconcileSwap.gasReserveRetainedEth + ' ETH)! ✅\n');
 
   // --------------------------------------------------------------------------
@@ -1502,8 +1538,9 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     sales1Hour: 5,
     uniqueWallets3Hours: 6,
     liquidityPassed: true,
-    isMintCompleted: true,
-    totalMinted: 10000,
+    mintCompleted: true,
+    mintStatusVerified: true,
+    totalSupply: 10000,
     maxSupply: 10000,
     referenceFloorEth: 0.0020
   });
@@ -1549,8 +1586,9 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     sales1Hour: 5,
     uniqueWallets3Hours: 6,
     liquidityPassed: true,
-    isMintCompleted: true,
-    totalMinted: 10000,
+    mintCompleted: true,
+    mintStatusVerified: true,
+    totalSupply: 10000,
     maxSupply: 10000,
     referenceFloorEth: 0.0020
   });
@@ -1594,8 +1632,9 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     sales1Hour: 5,
     uniqueWallets3Hours: 8,
     liquidityPassed: true,
-    isMintCompleted: true,
-    totalMinted: 10000,
+    mintCompleted: true,
+    mintStatusVerified: true,
+    totalSupply: 10000,
     maxSupply: 10000,
     referenceFloorEth: 0.0025
   });
