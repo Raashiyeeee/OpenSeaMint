@@ -70,10 +70,17 @@ export class AutoRelisterStrategy {
     const activeNetworks = this.config.general.activeNetworks || ['robinhood'];
     const allOwnedNfts: any[] = [];
     const ethPriceUsd = await this.apiService.getEthPriceUsd();
+    // If holdings could not be fully read on ANY network, ownership is unknown: skip reconciliation this cycle
+    let holdingsComplete = true;
 
     for (const net of activeNetworks) {
       try {
         const ownedNfts = await this.apiService.getAccountNfts(walletAddress, undefined, net);
+        if (ownedNfts === null) {
+          holdingsComplete = false;
+          logger.warn({ net }, 'Wallet holdings unavailable on this network. Skipping sale/transfer reconciliation this cycle.');
+          continue;
+        }
         for (const nft of ownedNfts) {
           allOwnedNfts.push(nft);
           const contractAddress = nft.contract;
@@ -91,7 +98,9 @@ export class AutoRelisterStrategy {
           if (!existing) {
             logger.info({ identifier, slug, net }, 'Discovered unlisted NFT in wallet during scan. Adding to relist queue!');
             let acquiredPriceEth = 0.0004;
-            const matchingOffer = this.inventoryManager.getActiveOffer(slug);
+            // A FULFILLED bot offer matching this NFT means the bot bought it: track as bot-acquired (counts toward capital)
+            const fulfilledOffer = this.inventoryManager.consumeFulfilledOffer(contractAddress, tokenId);
+            const matchingOffer = fulfilledOffer || this.inventoryManager.getActiveOffer(slug);
             if (matchingOffer && matchingOffer.priceEth > 0) {
               acquiredPriceEth = matchingOffer.priceEth;
             } else {
@@ -108,9 +117,10 @@ export class AutoRelisterStrategy {
               tokenId,
               network: net,
               acquiredPriceEth,
+              acquiredPriceUsd: fulfilledOffer ? fulfilledOffer.priceUsd : undefined,
               acquiredAtTimestamp: Date.now(),
               status: 'PENDING_LISTING',
-              isExternalWalletItem: true
+              isExternalWalletItem: !fulfilledOffer
             };
             this.inventoryManager.addInventoryItem(newItem);
           } else if (existing.status === 'HOLDING' && existing.acquiredPriceEth >= 0.003 && net === 'robinhood') {
@@ -127,9 +137,30 @@ export class AutoRelisterStrategy {
       }
     }
 
-    // Reconcile wallet holdings: If an NFT previously in inventory was sold or transferred,
-    // automatically clear it, release its locked capital and inventory slot, and swap ETH back to WETH.
-    const soldItems = this.inventoryManager.reconcileWalletInventory(allOwnedNfts, ethPriceUsd);
+    // Reconcile wallet holdings: an NFT that left the wallet is treated as SOLD only when a confirmed sale event
+    // (seller = our wallet) exists. Plain transfers keep the re-offer block and never trigger a WETH wrap.
+    const soldItems: Array<{ identifier: string; network?: string; netProceedsEth: number; soldEth: number }> = [];
+    if (holdingsComplete) {
+      const missing = this.inventoryManager.getItemsMissingFromWallet(allOwnedNfts);
+      const confirmedSales = new Map<string, { salePriceEth: number; txHash?: string }>();
+      const stillUnknown: Array<{ contract: string; identifier: string }> = [];
+      for (const item of missing) {
+        const sale = await this.apiService.getConfirmedNftSale(
+          item.contractAddress,
+          item.tokenId,
+          walletAddress,
+          item.network || this.config.general.network || 'robinhood',
+          item.acquiredAtTimestamp ? item.acquiredAtTimestamp / 1000 : undefined
+        );
+        if (sale === undefined) {
+          // Could not check: treat as still owned this cycle (neither sold nor transferred)
+          stillUnknown.push({ contract: item.contractAddress, identifier: item.tokenId });
+        } else if (sale) {
+          confirmedSales.set(item.identifier.toLowerCase(), { salePriceEth: sale.salePriceEth, txHash: sale.txHash });
+        }
+      }
+      soldItems.push(...this.inventoryManager.reconcileWalletInventory([...allOwnedNfts, ...stillUnknown], ethPriceUsd, confirmedSales));
+    }
     for (const sold of soldItems) {
       const net = sold.network || this.config.general.network || 'robinhood';
       logger.info(

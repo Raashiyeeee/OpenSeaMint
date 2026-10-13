@@ -47,10 +47,11 @@ export class CollectionBidderStrategy {
    */
   public async reverifyMintOutBeforeOffer(
     collectionSlug: string,
-    contractAddress: string
+    contractAddress: string,
+    networkKey?: string
   ): Promise<{ passed: boolean; reason: string }> {
     try {
-      const freshData = await this.apiService.getCollectionMarketData(collectionSlug, contractAddress);
+      const freshData = await this.apiService.getCollectionMarketData(collectionSlug, contractAddress, networkKey);
       const check = this.pricingEngine.verifyMintCompletion(freshData);
       if (!check.passed) {
         logger.error(
@@ -81,20 +82,51 @@ export class CollectionBidderStrategy {
     const network = offer.network || 'robinhood';
 
     // 1. Mark status CANCELLATION_PENDING (capital stays locked!)
+    const alreadyRequested = offer.status === 'CANCELLATION_PENDING' && offer.fillableUntil !== undefined;
     this.inventoryManager.initiateOfferCancellation(orderHash);
 
     try {
-      // 2. Request marketplace cancellation
-      const cancelRes = await this.apiService.cancelOffer(orderHash, network);
-      if (!cancelRes.success) {
-        logger.warn(
-          { orderHash, network, error: cancelRes.error, reason },
-          'Marketplace cancel request failed or queued. Will perform verification check.'
-        );
+      // 2. Request marketplace (offchain) cancellation — once
+      if (!alreadyRequested) {
+        const cancelRes = await this.apiService.cancelOffer(orderHash, network);
+        if (!cancelRes.success) {
+          logger.warn(
+            { orderHash, network, error: cancelRes.error, reason },
+            'Marketplace cancel request failed or queued. Will perform verification check.'
+          );
+        }
+        if (cancelRes.fillableUntil) {
+          this.inventoryManager.setOfferFillableUntil(orderHash, cancelRes.fillableUntil);
+        }
       }
 
       // 3. Verify offer is inactive before releasing capital
-      const verification = await this.apiService.verifyOfferInactive(orderHash, network);
+      let verification = await this.apiService.verifyOfferInactive(orderHash, network);
+
+      // 3a. Offer was accepted while we were cancelling: it is a FILL, not a cancellation
+      if (verification.status === 'FULFILLED') {
+        this.inventoryManager.markOfferFulfilled(orderHash);
+        logger.info({ orderHash, collection: offer.collectionSlug }, 'Offer was accepted before cancellation completed (FULFILLED). Tracking purchase.');
+        return { success: false, error: 'Offer was fulfilled (accepted) before cancellation' };
+      }
+
+      // 3b. API could not confirm: fall back to on-chain Seaport getOrderStatus (isCancelled)
+      if (!verification.isInactive && verification.status !== 'ACTIVE' && verification.status !== 'INACTIVE') {
+        const cancelledOnChain = await this.seaportService.isOrderCancelledOnChain(orderHash, network);
+        if (cancelledOnChain) {
+          verification = { isInactive: true, status: 'CANCELLED_ONCHAIN' };
+        }
+      }
+
+      // 3c. Offchain cancel: a previously issued fulfillment signature may still fill the order until it expires
+      const fillableUntil = this.inventoryManager.getActiveOffer(orderHash)?.fillableUntil ?? offer.fillableUntil;
+      if (verification.isInactive && verification.status === 'CANCELLED' && fillableUntil && Date.now() < fillableUntil) {
+        logger.info(
+          { orderHash, fillableUntil: new Date(fillableUntil).toISOString() },
+          'Offer cancelled offchain but an issued fulfillment signature is still valid. Capital stays locked until it expires.'
+        );
+        return { success: false, error: 'Awaiting expiry of last issued fulfillment signature' };
+      }
 
       if (verification.isInactive) {
         // Verification confirmed: release capital
@@ -192,7 +224,16 @@ export class CollectionBidderStrategy {
 
     for (const offer of activeOffers) {
       try {
-        const marketData = await this.apiService.getCollectionMarketData(offer.collectionSlug, offer.contractAddress);
+        const marketData = await this.apiService.getCollectionMarketData(offer.collectionSlug, offer.contractAddress, offer.network);
+        // Single-NFT offers compete with offers on that specific NFT AND with collection offers
+        let competingTopEth = marketData.topOfferEth || 0;
+        if (offer.tokenId) {
+          const bestNft = await this.apiService.getBestNftOffer(offer.collectionSlug, offer.tokenId);
+          if (bestNft && bestNft.orderHash !== offer.orderHash && bestNft.priceEth > competingTopEth) {
+            competingTopEth = bestNft.priceEth;
+          }
+        }
+        marketData.topOfferEth = competingTopEth;
         if (marketData.topOfferEth && marketData.topOfferEth > offer.priceEth) {
           logger.info(
             {
@@ -347,7 +388,7 @@ export class CollectionBidderStrategy {
     }
 
     // 3. FETCH LATEST MARKET DATA
-    const marketData = await this.apiService.getCollectionMarketData(target.slug, target.contractAddress);
+    const marketData = await this.apiService.getCollectionMarketData(target.slug, target.contractAddress, targetNetwork);
 
     // 3.1. AUTOMATIC OFFER CANCELLATION & RE-ENTRY CHECK (Outbid & 20-Minute Expiry Rules)
     const existingOffer = this.inventoryManager.getActiveOffer(target.slug);
@@ -605,7 +646,7 @@ export class CollectionBidderStrategy {
     }
 
     // 5) Fresh 100% Mint-Out re-verification immediately before signing/posting (covers automatic re-offers)
-    const freshMintCheck = await this.reverifyMintOutBeforeOffer(target.slug, target.contractAddress);
+    const freshMintCheck = await this.reverifyMintOutBeforeOffer(target.slug, target.contractAddress, targetNetwork);
     if (!freshMintCheck.passed) {
       return;
     }
@@ -657,7 +698,7 @@ export class CollectionBidderStrategy {
             }
 
             // 100% Mint-Out Rule: re-verify before EVERY single-token offer
-            const tokenMintCheck = await this.reverifyMintOutBeforeOffer(target.slug, target.contractAddress);
+            const tokenMintCheck = await this.reverifyMintOutBeforeOffer(target.slug, target.contractAddress, targetNetwork);
             if (!tokenMintCheck.passed) {
               logger.info({ tokenId: tok.tokenId, slug: target.slug, reason: tokenMintCheck.reason }, 'NFT OFFER SKIPPED: Mint-out not verified');
               break;
@@ -752,7 +793,7 @@ export class CollectionBidderStrategy {
     }
 
     // 3. Market Data & Pre-Checks
-    const marketData = await this.apiService.getCollectionMarketData(params.collectionSlug, params.contractAddress);
+    const marketData = await this.apiService.getCollectionMarketData(params.collectionSlug, params.contractAddress, targetNetwork);
 
     // 3.0. Automatic Offer Cancellation & Re-entry Check for Item (Outbid & 20-Minute Expiry)
     const itemKey = `${params.contractAddress.toLowerCase()}:${params.tokenId}`;
@@ -770,6 +811,13 @@ export class CollectionBidderStrategy {
       }
 
       if (existingItemOffer.status === 'ACTIVE') {
+        // Compare against the best offer on THIS NFT as well as collection offers
+        const bestNftOffer = await this.apiService.getBestNftOffer(params.collectionSlug, params.tokenId);
+        const competingBestEth = Math.max(
+          marketData.topOfferEth || 0,
+          bestNftOffer && bestNftOffer.orderHash !== existingItemOffer.orderHash ? bestNftOffer.priceEth : 0
+        );
+        marketData.topOfferEth = competingBestEth;
         const isOutbid = marketData.topOfferEth > existingItemOffer.priceEth;
         const isExpired = Date.now() - existingItemOffer.createdTimestamp >= this.getOfferMaxAgeMinutes() * 60 * 1000;
 
@@ -927,7 +975,7 @@ export class CollectionBidderStrategy {
     }
 
     // 5) Fresh 100% Mint-Out re-verification immediately before signing/posting (covers automatic re-offers)
-    const freshItemMintCheck = await this.reverifyMintOutBeforeOffer(params.collectionSlug, params.contractAddress);
+    const freshItemMintCheck = await this.reverifyMintOutBeforeOffer(params.collectionSlug, params.contractAddress, targetNetwork);
     if (!freshItemMintCheck.passed) {
       return { success: false, reason: freshItemMintCheck.reason };
     }

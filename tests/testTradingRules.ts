@@ -9,6 +9,7 @@ import { OpenSeaApiService } from '../src/services/OpenSeaApiService';
 import { SeaportService } from '../src/services/SeaportService';
 import { CircuitBreaker } from '../src/security/CircuitBreaker';
 import { CollectionBidderStrategy } from '../src/strategies/CollectionBidderStrategy';
+import { AutoRelisterStrategy } from '../src/strategies/AutoRelisterStrategy';
 import { loadConfig } from '../src/config/schema';
 import { CollectionMarketData } from '../src/types';
 
@@ -59,6 +60,7 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   (seaport as any).getWethBalance = async () => 1.0;
   (seaport as any).createSignedCollectionOffer = async () => ({ orderComponents: {}, signature: '0xsig' });
   (seaport as any).createSignedItemOffer = async () => ({ orderComponents: {}, signature: '0xsig' });
+  (seaport as any).isOrderCancelledOnChain = async () => false; // never touch a live RPC in tests
   const bidder = new CollectionBidderStrategy(config, api, pricingEngine, seaport, inv, new CircuitBreaker(config));
   return { bidder, seaport };
 }
@@ -88,28 +90,44 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   assert.strictEqual(pricingEngine.verifyMintCompletion(baseMarketData()).passed, true, 'Verified 100% mint-out must pass');
   console.log('Case R1a-d PASSED: Mint-out requires positive verification (total >= max, both known) ✅');
 
-  // 1e. API: collection without max_supply -> mintStatusVerified false; with total == max -> verified
+  // 1e. API: supply sources = OpenSea Drops API + on-chain totalSupply()/maxSupply() (+ collection total_supply)
   const mintApi = new OpenSeaApiService(config);
   (mintApi as any).getEthPriceUsd = async () => 2700;
   (mintApi as any).getCollectionLiquidity = async () => ({
     sales3Hours: 12, uniqueWallets3Hours: 8, sales1Hour: 4, uniqueWallets1Hour: 4, liquidityPassed: true
   });
-  let collectionPayload: any = { total_supply: 500, fees: [] };
   (mintApi as any).client = {
     get: async (url: string) => {
-      if (url.startsWith('/collections/') && !url.includes('/stats')) return { data: collectionPayload };
+      if (url.startsWith('/collections/') && !url.includes('/stats')) return { data: { total_supply: 500, fees: [] } };
       if (url.includes('/stats')) return { data: { total: { floor_price: 0.002, floor_price_symbol: 'ETH' } } };
       return { data: { offers: [] } };
     }
   };
-  const noMax = await mintApi.getCollectionMarketData('rules-collection', ZERO);
-  assert.strictEqual(noMax.mintStatusVerified, false, 'Missing max_supply must leave mint-out unverified');
-  assert.strictEqual(noMax.mintCompleted, false, 'Missing max_supply must not be treated as minted out');
-  collectionPayload = { total_supply: 500, max_supply: 500, is_minting: false, fees: [] };
-  const fullMint = await mintApi.getCollectionMarketData('rules-collection', ZERO);
-  assert.strictEqual(fullMint.mintStatusVerified, true, 'total == max must verify mint-out');
-  assert.strictEqual(fullMint.mintCompleted, true, 'total == max must be minted out');
-  console.log('Case R1e PASSED: API only marks mint-out verified when total_supply >= max_supply ✅');
+  let dropStub: any = {};
+  let chainStub: any = {};
+  (mintApi as any).getDropSupply = async () => dropStub;
+  (mintApi as any).readOnChainSupply = async () => chainStub;
+  const noMax = await mintApi.getCollectionMarketData('rules-collection', ZERO, 'robinhood');
+  assert.strictEqual(noMax.mintStatusVerified, false, 'Only total_supply known -> unverifiable');
+  assert.strictEqual(noMax.mintCompleted, false, 'Unverifiable must not be treated as minted out');
+  dropStub = { totalSupply: 500, maxSupply: 500, isMinting: false };
+  const viaDrop = await mintApi.getCollectionMarketData('rules-collection', ZERO, 'robinhood');
+  assert.strictEqual(viaDrop.mintStatusVerified, true, 'Drops API total == max must verify');
+  assert.strictEqual(viaDrop.mintCompleted, true);
+  dropStub = {};
+  chainStub = { totalSupply: 500, maxSupply: 500 };
+  const viaChain = await mintApi.getCollectionMarketData('rules-collection', ZERO, 'robinhood');
+  assert.strictEqual(viaChain.mintCompleted, true, 'On-chain totalSupply == maxSupply must verify');
+  chainStub = { totalSupply: 480, maxSupply: 500 };
+  const chainIncomplete = await mintApi.getCollectionMarketData('rules-collection', ZERO, 'robinhood');
+  assert.strictEqual(chainIncomplete.mintCompleted, false, 'On-chain 480/500 must reject even if API total says 500');
+  dropStub = { totalSupply: 500, maxSupply: 500, isMinting: true };
+  chainStub = {};
+  assert.strictEqual((await mintApi.getCollectionMarketData('rules-collection', ZERO, 'robinhood')).mintCompleted, false, 'Active drop mint must reject');
+  // Pure decision rules
+  assert.strictEqual(OpenSeaApiService.evaluateMintSupply({ dropMaxSupply: 0, dropTotalSupply: 100 }).verified, false, 'max_supply 0 (open edition/unknown) is unverifiable');
+  assert.strictEqual(OpenSeaApiService.evaluateMintSupply({ onChainMaxSupply: 1000, onChainTotalSupply: 1000, collectionTotalSupply: 990 }).completed, false, 'Any source below max -> reject');
+  console.log('Case R1e PASSED: Mint-out verified from Drops API / on-chain supply; conflicts or unknown max reject ✅');
 
   // 1f. Re-verification immediately before posting: fresh data shows incomplete mint -> no offer posted
   const reverifyApi = new OpenSeaApiService(config);
@@ -269,10 +287,18 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   events.push(mk(23, { order_type: 'collection_offer' })); // accepted offer
   events.push(mk(24, { status: 'pending' })); // not completed
   events.push(mk(25, { event_timestamp: undefined })); // no timestamp
+  events.push(mk(26, { order_hash: '0xbid', chain: 'robinhood' })); // accepted offer detected via order lookup
   let page = 0;
   let firstUrl = '';
+  let orderLookups = 0;
   (salesApi as any).client = {
     get: async (url: string) => {
+      if (url.startsWith('/orders/')) {
+        orderLookups++;
+        // Sale with order_hash 0xbid was an accepted bid (offerer gave WETH, itemType 1)
+        if (url.endsWith('/0xbid')) return { data: { order: { protocol_data: { parameters: { offer: [{ itemType: 1 }] } } } } };
+        return { data: { order: { protocol_data: { parameters: { offer: [{ itemType: 2 }] } }, type: 'basic' } } };
+      }
       if (!firstUrl) firstUrl = url;
       page++;
       // Paginated: return half the events with a cursor, then the rest
@@ -285,12 +311,13 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   assert.strictEqual(page, 2, 'Sales query must follow pagination');
   assert.strictEqual(liq9.sales3Hours, 9, 'Only completed native ETH floor sales within 3h count');
   assert.strictEqual(liq9.liquidityPassed, false, '9 qualifying sales must fail');
+  assert(orderLookups >= 1, 'Sale order must be looked up to detect accepted offers');
   events.push(mk(9));
   page = 0;
   const liq10 = await salesApi.getCollectionLiquidity('rules-collection', 0.002);
   assert.strictEqual(liq10.sales3Hours, 10);
   assert.strictEqual(liq10.liquidityPassed, true, '10 qualifying sales must pass');
-  console.log('Case R5a PASSED: WETH, non-native tokens, >3h old, accepted offers, pending sales excluded; pagination followed ✅');
+  console.log('Case R5a PASSED: WETH, non-native tokens, >3h old, accepted offers (fields + order lookup), pending sales excluded; pagination followed ✅');
 
   // 5b. Strategy/pricing never fall back to 1h counts when the 3h count is missing
   const noThreeHour = baseMarketData({ sales3Hours: undefined, sales1Hour: 50, uniqueWallets3Hours: undefined, uniqueWallets1Hour: 20 });
@@ -427,6 +454,128 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   inv8c.evaluateOfferCyclePause();
   assert.strictEqual(new InventoryManager(config, stateFile8).getOfferCyclePauseState().paused, true, 'Pause must persist across restarts');
   console.log('Case R8a-e PASSED: 70%/30% split, purchased NFTs counted, pause until 40% sold, resume at 70% of new capital ✅\n');
+
+  // ------------------------------------------------------------------------
+  // CAVEAT FIXES: OpenSea API semantics, outbid per NFT, transfers vs sales, secrets
+  // ------------------------------------------------------------------------
+  console.log('--- Caveat Fixes ---');
+  // C1. Chain identifiers per OpenSea ChainIdentifier enum
+  assert.strictEqual(OpenSeaApiService.toOpenSeaChain('mainnet'), 'ethereum');
+  assert.strictEqual(OpenSeaApiService.toOpenSeaChain('robinhood'), 'robinhood');
+  // C2. Get Order status enum: ACTIVE | INACTIVE | FULFILLED | EXPIRED | CANCELLED; 404 is NOT proof of cancellation
+  const statusApi = new OpenSeaApiService(config);
+  let orderResponse: any = { data: { order: { status: 'INACTIVE' } } };
+  (statusApi as any).client = { get: async () => { if (orderResponse instanceof Error) throw orderResponse; return orderResponse; } };
+  assert.strictEqual((await statusApi.verifyOfferInactive('0x1', 'robinhood')).isInactive, false, 'INACTIVE can revalidate -> not cancelled');
+  orderResponse = { data: { order: { status: 'CANCELLED' } } };
+  assert.strictEqual((await statusApi.verifyOfferInactive('0x1', 'robinhood')).isInactive, true);
+  orderResponse = { data: { order: { status: 'FULFILLED' } } };
+  assert.strictEqual((await statusApi.verifyOfferInactive('0x1', 'robinhood')).status, 'FULFILLED');
+  const nf: any = new Error('not found'); nf.response = { status: 404, data: { errors: ['not found'] } };
+  orderResponse = nf;
+  assert.strictEqual((await statusApi.verifyOfferInactive('0x1', 'robinhood')).isInactive, false, '404 must be unverified');
+  // C3. Offchain cancel: order stays fillable until last_signature_issued_valid_until
+  const cancelApi2 = new OpenSeaApiService(config);
+  const until = new Date(Date.now() + 3 * 60 * 1000).toISOString();
+  (cancelApi2 as any).client = { post: async () => ({ data: { last_signature_issued_valid_until: until } }) };
+  const c2 = await cancelApi2.cancelOffer('0xabc', 'robinhood');
+  assert.strictEqual(c2.fillableUntil, Date.parse(until), 'fillableUntil parsed from cancel response');
+  const c2Inv = new InventoryManager(config);
+  const c2Api = new OpenSeaApiService(config);
+  (c2Api as any).cancelOffer = async () => ({ success: true, fillableUntil: Date.now() + 3 * 60 * 1000 });
+  (c2Api as any).verifyOfferInactive = async () => ({ isInactive: true, status: 'CANCELLED' });
+  const { bidder: c2Bidder } = makeBidder(c2Api, c2Inv);
+  const mkOffer = () => ({
+    orderHash: 'offchain_cancel', collectionSlug: 'c2', contractAddress: ZERO, network: 'robinhood',
+    priceEth: 0.001, priceUsd: 2.7, createdTimestamp: Date.now() - 21 * 60000, expiresTimestamp: Date.now(), status: 'ACTIVE' as const
+  });
+  c2Inv.registerActiveOffer(mkOffer());
+  const c2Res = await c2Bidder.cancelAndVerifyOffer(c2Inv.getActiveOffer('offchain_cancel')!);
+  assert.strictEqual(c2Res.success, false, 'Must wait for issued fulfillment signature to expire');
+  assert.strictEqual(c2Inv.getActiveOffersCapitalUsd(), 2.7, 'Capital stays locked while order is still fillable');
+  // C4. Offer FULFILLED during cancellation -> recorded as a fill, not a cancellation
+  const c4Inv = new InventoryManager(config);
+  const c4Api = new OpenSeaApiService(config);
+  (c4Api as any).cancelOffer = async () => ({ success: false, error: 'already filled' });
+  (c4Api as any).verifyOfferInactive = async () => ({ isInactive: true, status: 'FULFILLED' });
+  const { bidder: c4Bidder } = makeBidder(c4Api, c4Inv);
+  c4Inv.registerActiveOffer({ ...mkOffer(), orderHash: 'filled_offer' });
+  const c4Res = await c4Bidder.cancelAndVerifyOffer(c4Inv.getActiveOffer('filled_offer')!);
+  assert.strictEqual(c4Res.success, false);
+  assert.strictEqual(c4Inv.getAllActiveOffers().find((o) => o.orderHash === 'filled_offer')?.status, 'FULFILLED');
+  const consumed = c4Inv.consumeFulfilledOffer(ZERO, '1');
+  assert(consumed && consumed.orderHash === 'filled_offer', 'Wallet scan can attribute the bought NFT to the filled offer');
+  // C5. Single-NFT outbid uses best offer on that NFT (and collection offers)
+  const c5Inv = new InventoryManager(config);
+  const c5Api = new OpenSeaApiService(config);
+  (c5Api as any).getCollectionMarketData = async () => baseMarketData({ topOfferEth: 0.0005 });
+  (c5Api as any).getBestNftOffer = async () => ({ priceEth: 0.0012, orderHash: 'someone_else' });
+  let c5Cancelled = 0;
+  (c5Api as any).cancelOffer = async () => { c5Cancelled++; return { success: true }; };
+  (c5Api as any).verifyOfferInactive = async () => ({ isInactive: true, status: 'CANCELLED' });
+  const { bidder: c5Bidder } = makeBidder(c5Api, c5Inv);
+  c5Inv.registerActiveOffer({ ...mkOffer(), orderHash: 'item_offer', tokenId: '42', createdTimestamp: Date.now(), expiresTimestamp: Date.now() + 600000 });
+  const c5Res = await c5Bidder.processOutbidOfferCancellations();
+  assert.strictEqual(c5Res.cancelled, 1, 'Item offer outbid by a higher offer on that NFT must be cancelled');
+  assert.strictEqual(c5Cancelled, 1);
+  // own best offer must not count as outbid
+  const c5bInv = new InventoryManager(config);
+  (c5Api as any).getBestNftOffer = async () => ({ priceEth: 0.001, orderHash: 'item_offer2' });
+  const { bidder: c5bBidder } = makeBidder(c5Api, c5bInv);
+  c5bInv.registerActiveOffer({ ...mkOffer(), orderHash: 'item_offer2', tokenId: '43', createdTimestamp: Date.now(), expiresTimestamp: Date.now() + 600000 });
+  assert.strictEqual((await c5bBidder.processOutbidOfferCancellations()).cancelled, 0, 'Our own best offer is not an outbid');
+  // C6. Multi-quantity offers are compared per unit
+  assert.strictEqual(
+    OpenSeaApiService.perUnitOfferPriceEth({ price: { value: '3000000000000000', decimals: 18 }, protocol_data: { parameters: { consideration: [{ startAmount: '3' }] } } }),
+    0.001
+  );
+  // C7. Transfers vs sales: only a confirmed sale event marks SOLD and triggers a wrap
+  const c7Inv = new InventoryManager(config);
+  const c7Api = new OpenSeaApiService(config);
+  const c7Seaport = new SeaportService(config, Wallet.createRandom());
+  let wraps = 0;
+  (c7Seaport as any).handlePostSaleEthConversion = async () => { wraps++; return { success: true, verified: true, amountWrappedEth: 0, gasReserveRetainedEth: 0 }; };
+  (c7Seaport as any).ensureNftConduitApproval = async () => true;
+  (c7Api as any).getEthPriceUsd = async () => 2700;
+  const wallet = '0x00000000000000000000000000000000000000aa';
+  for (const id of ['1', '2', '3']) {
+    c7Inv.addInventoryItem({
+      identifier: `${nftContract}:${id}`, collectionSlug: 'ignored-c7', contractAddress: nftContract, tokenId: id, network: 'robinhood',
+      acquiredPriceEth: 0.0005, acquiredPriceUsd: 1.35, acquiredAtTimestamp: Date.now(), status: 'LISTED'
+    });
+  }
+  (c7Api as any).getAccountNfts = async () => []; // all three left the wallet
+  (c7Api as any).getConfirmedNftSale = async (_c: string, tokenId: string) => {
+    if (tokenId === '1') return { salePriceEth: 0.0009, txHash: '0xsold', timestamp: 0, paymentSymbol: 'ETH' }; // real sale
+    if (tokenId === '2') return null; // plain transfer
+    return undefined; // could not check
+  };
+  const c7Config = { ...config, general: { ...config.general, activeNetworks: ['robinhood'], ignoredCollections: ['ignored-c7'] } };
+  const c7Relister = new AutoRelisterStrategy(c7Config as any, c7Api, pricingEngine, c7Seaport, c7Inv, new CircuitBreaker(config));
+  await c7Relister.scanAndRelistUnlistedInventory(wallet);
+  assert.strictEqual(wraps, 1, 'Only the confirmed sale triggers a WETH wrap');
+  assert.strictEqual(c7Inv.isNftSaleConfirmed(nftContract, '1'), true, 'Confirmed sale recorded');
+  assert.strictEqual(c7Inv.canPlaceOfferOnNft(nftContract, '2').allowed, false, 'Transferred NFT keeps the re-offer block');
+  assert.strictEqual(c7Inv.getInventoryItem(`${nftContract}:2`)?.status, 'TRANSFERRED');
+  assert.notStrictEqual(c7Inv.getInventoryItem(`${nftContract}:3`)?.status, 'TRANSFERRED', 'Unknown status is left untouched');
+  assert.strictEqual(c7Inv.canPlaceOfferOnNft(nftContract, '3').allowed, false);
+  // Holdings API failure -> no reconciliation at all (an API error is never "NFT left the wallet")
+  const c7bInv = new InventoryManager(config);
+  c7bInv.addInventoryItem({
+    identifier: `${nftContract}:9`, collectionSlug: 'ignored-c7', contractAddress: nftContract, tokenId: '9', network: 'robinhood',
+    acquiredPriceEth: 0.0005, acquiredAtTimestamp: Date.now(), status: 'LISTED'
+  });
+  (c7Api as any).getAccountNfts = async () => null;
+  let saleLookups = 0;
+  (c7Api as any).getConfirmedNftSale = async () => { saleLookups++; return null; };
+  await new AutoRelisterStrategy(c7Config as any, c7Api, pricingEngine, c7Seaport, c7bInv, new CircuitBreaker(config)).scanAndRelistUnlistedInventory(wallet);
+  assert.strictEqual(saleLookups, 0);
+  assert.strictEqual(c7bInv.getInventoryItem(`${nftContract}:9`)?.status, 'LISTED', 'Holdings API failure must not change inventory');
+  // C8. No provider keys committed in config / .env.example
+  const cfgRaw = fs.readFileSync(path.resolve(__dirname, '../config/default.json'), 'utf8');
+  const envRaw = fs.readFileSync(path.resolve(__dirname, '../.env.example'), 'utf8');
+  assert(!/alch_[A-Za-z0-9]+/.test(cfgRaw) && !/alch_[A-Za-z0-9]+/.test(envRaw), 'No Alchemy key may be committed');
+  console.log('Case C1-C8 PASSED: OpenSea chain/status/cancel semantics, per-NFT outbid, per-unit offers, sale-vs-transfer, no committed RPC keys ✅\n');
 
   process.env.BOT_MODE = originalBotMode;
   console.log('================================================================');

@@ -286,13 +286,31 @@ export class InventoryManager {
   }
 
   /**
-   * Reconciles in-memory inventory against on-chain wallet items.
-   * If an NFT held in inventory is no longer present in wallet, it was sold or transferred.
-   * Automatically clears it, releases committed capital, and returns details for automatic ETH->WETH swapping.
+   * Returns inventory items (still held per our records) that are missing from the wallet's holdings.
+   * Missing does NOT mean sold: callers must confirm a sale event before calling reconcileWalletInventory.
+   */
+  public getItemsMissingFromWallet(ownedNfts: Array<{ contract?: string; identifier?: string }>): InventoryItem[] {
+    const ownedSet = new Set(
+      ownedNfts
+        .filter((n) => n.contract && n.identifier)
+        .map((n) => `${n.contract!.toLowerCase()}:${n.identifier}`)
+    );
+    return Array.from(this.inventory.values()).filter(
+      (item) => item.status !== 'SOLD' && item.status !== 'TRANSFERRED' && !ownedSet.has(item.identifier.toLowerCase())
+    );
+  }
+
+  /**
+   * Reconciles inventory against wallet holdings.
+   * - Missing NFT WITH a confirmed sale (confirmedSales) -> marked SOLD (capital released, may trigger WETH wrap).
+   * - Missing NFT WITHOUT a confirmed sale (plain transfer / unknown) -> marked TRANSFERRED: it is NOT treated as
+   *   sold, the re-offer block stays in place, no wrap is triggered, and it is flagged for review.
+   * - An NFT previously marked TRANSFERRED that is back in the wallet is restored to PENDING_LISTING.
    */
   public reconcileWalletInventory(
     ownedNfts: Array<{ contract?: string; identifier?: string }>,
-    ethPriceUsd: number = 2700
+    ethPriceUsd: number = 2700,
+    confirmedSales: Map<string, { salePriceEth: number; txHash?: string }> = new Map()
   ): Array<{ identifier: string; network?: string; netProceedsEth: number; soldEth: number }> {
     const ownedSet = new Set(
       ownedNfts
@@ -300,25 +318,98 @@ export class InventoryManager {
         .map((n) => `${n.contract!.toLowerCase()}:${n.identifier}`)
     );
 
-    const itemsToCheck = Array.from(this.inventory.values());
     const removedSoldItems: Array<{ identifier: string; network?: string; netProceedsEth: number; soldEth: number }> = [];
 
-    for (const item of itemsToCheck) {
-      if (item.status !== 'SOLD' && !ownedSet.has(item.identifier.toLowerCase())) {
+    for (const item of Array.from(this.inventory.values())) {
+      const key = item.identifier.toLowerCase();
+      if (item.status === 'TRANSFERRED' && ownedSet.has(key)) {
+        item.status = 'PENDING_LISTING';
+        item.ownershipStatus = 'OWNED';
+        item.listingStatus = 'PENDING_LISTING';
+        const tracked = this.trackedNfts.get(key);
+        if (tracked) {
+          tracked.ownershipStatus = 'OWNED';
+          tracked.listingStatus = 'PENDING_LISTING';
+        }
+        logger.info({ identifier: item.identifier }, 'Wallet reconciliation: previously transferred NFT is back in wallet. Restored to inventory.');
+        continue;
+      }
+      if (item.status === 'SOLD' || item.status === 'TRANSFERRED' || ownedSet.has(key)) continue;
+
+      const sale = confirmedSales.get(key) || confirmedSales.get(item.identifier);
+      if (sale) {
         logger.info(
-          { identifier: item.identifier, collectionSlug: item.collectionSlug, status: item.status },
-          'Wallet reconciliation: NFT is no longer in wallet (sold or transferred). Clearing from inventory and releasing capital.'
+          { identifier: item.identifier, collectionSlug: item.collectionSlug, salePriceEth: sale.salePriceEth, txHash: sale.txHash },
+          'Wallet reconciliation: confirmed SALE event found for NFT that left the wallet. Recording sale.'
         );
-        const res = this.markItemSold(item.identifier, undefined, ethPriceUsd);
+        const res = this.markItemSold(item.identifier, sale.salePriceEth > 0 ? sale.salePriceEth : undefined, ethPriceUsd, undefined, undefined, sale.txHash);
         removedSoldItems.push({
           identifier: item.identifier,
           network: item.network,
           netProceedsEth: res.netProceedsEth,
           soldEth: res.saleConfirmation.salePriceEth || 0
         });
+      } else {
+        this.markItemTransferred(item.identifier, 'NFT left the wallet without a confirmed sale event (plain transfer or unconfirmed). Not treated as sold.');
       }
     }
+    this.saveState();
     return removedSoldItems;
+  }
+
+  /**
+   * NFT left the wallet without a confirmed sale. It is kept (status TRANSFERRED / ownership UNRESOLVED) so the
+   * re-offer block stays in place; its capital is no longer counted as purchased inventory.
+   */
+  public markItemTransferred(identifier: string, reason: string): void {
+    const item = this.inventory.get(identifier);
+    if (item) {
+      item.status = 'TRANSFERRED';
+      item.ownershipStatus = 'UNRESOLVED';
+      item.holdReason = reason;
+    }
+    const tracked = this.trackedNfts.get(identifier.toLowerCase());
+    if (tracked) {
+      tracked.ownershipStatus = 'UNRESOLVED';
+      tracked.holdReason = reason;
+    }
+    logger.warn({ identifier, reason }, 'NFT TRANSFERRED (not sold): re-offer block kept, no WETH conversion. Manual review recommended.');
+    this.saveState();
+  }
+
+  /**
+   * Marks an offer as FULFILLED (accepted -> NFT bought). Used when cancellation verification finds the order filled.
+   */
+  public markOfferFulfilled(orderHash: string): void {
+    const offer = this.activeOffers.get(orderHash);
+    if (offer) {
+      offer.status = 'FULFILLED';
+      logger.info({ orderHash, collection: offer.collectionSlug }, 'Offer was ACCEPTED (order FULFILLED) — NFT purchase pending inventory sync.');
+    }
+  }
+
+  /**
+   * Finds (and consumes) a FULFILLED offer matching a newly discovered wallet NFT, so a bot purchase found
+   * by the wallet scan is tracked as a bot-acquired item (counted in capital) at its real offer price.
+   */
+  public consumeFulfilledOffer(contractAddress: string, tokenId: string): ActiveOffer | undefined {
+    for (const [key, offer] of this.activeOffers.entries()) {
+      if (
+        offer.status === 'FULFILLED' &&
+        offer.contractAddress.toLowerCase() === contractAddress.toLowerCase() &&
+        (!offer.tokenId || offer.tokenId === tokenId)
+      ) {
+        this.activeOffers.delete(key);
+        return offer;
+      }
+    }
+    return undefined;
+  }
+
+  /** Records until when an offchain-cancelled offer may still be filled (OpenSea last_signature_issued_valid_until). */
+  public setOfferFillableUntil(orderHash: string, fillableUntil: number): void {
+    const offer = this.activeOffers.get(orderHash);
+    if (offer) offer.fillableUntil = fillableUntil;
   }
 
   public getActiveTradesCount(): number {
