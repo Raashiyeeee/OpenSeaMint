@@ -185,3 +185,21 @@ npm run start
 - **Creator fee**: optional creator fees are excluded from signed offers and listings and verified absent before posting; mandatory creator fees are counted in net profit.
 - **Final validation**: right before every offer (incl. re-offers and single-token offers) fresh market data is re-fetched and mint-out, recent sales, dump protection, creator-fee status and profitability are re-checked at the exact bid.
 - **Auto-listing**: bought NFTs are listed at the lowest competitive price that still keeps the 40% margin; listed NFTs are monitored each cycle and repriced just under a cheaper competing listing when still profitable (previous listing cancelled off-chain). If matching is unprofitable the existing listing is kept (never below the 40%-margin price). Reprices are rate-limited by `general.relistCooldownMinutes` (default 10) and a 0.2% minimum price change.
+
+## OpenSea Rate Limiting & Caching
+
+All OpenSea API calls go through one process-wide limiter (`src/utils/OpenSeaRateLimiter.ts`) and always send the `x-api-key` header (`OPENSEA_API_KEY`). Optional config block (defaults shown):
+
+```json
+"opensea": {
+  "requestsPerSecond": 3, "maxConcurrent": 2,
+  "maxRetries": 4, "baseRetryDelayMs": 1000, "maxRetryDelayMs": 30000,
+  "cacheTtlMs": { "collection": 600000, "stats": 60000, "offers": 20000, "salesEvents": 120000, "mintComplete": 21600000, "mintIncomplete": 120000 }
+}
+```
+
+- 429 / 5xx / network errors are retried with exponential backoff + jitter, honouring `Retry-After` (a 429 pauses the shared limiter for every caller). 4xx errors such as 404 are not retried.
+- Per-collection data is cached; only successful results are cached. Verified fully-minted results are cached for 6h.
+- Collections are evaluated sequentially in stages: fees, then mint-out, then the creator-fee ceiling, then floor stats, then offers, and only then the paginated sales events. Cheap rejections never trigger the sales fetch.
+- If data still can't be fetched, the collection is logged as `SKIPPED (data unavailable, will retry)` and no offer is placed.
+- Strategy cycles never overlap. If a cycle runs longer than `loopIntervalMs`, the next tick is skipped.

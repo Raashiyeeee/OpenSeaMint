@@ -54,7 +54,24 @@ const NetworkInfoSchema = z.object({
   wethAddress: z.string().optional()
 });
 
+const OpenSeaApiSchema = z.object({
+  requestsPerSecond: z.number().positive().max(20).default(3),
+  maxConcurrent: z.number().int().positive().max(10).default(2),
+  maxRetries: z.number().int().nonnegative().max(10).default(4),
+  baseRetryDelayMs: z.number().int().positive().default(1000),
+  maxRetryDelayMs: z.number().int().positive().default(30000),
+  cacheTtlMs: z.object({
+    collection: z.number().int().nonnegative().default(600000),
+    stats: z.number().int().nonnegative().default(60000),
+    offers: z.number().int().nonnegative().default(20000),
+    salesEvents: z.number().int().nonnegative().default(120000),
+    mintComplete: z.number().int().nonnegative().default(21600000),
+    mintIncomplete: z.number().int().nonnegative().default(120000)
+  }).default({})
+});
+
 const BotConfigSchema = z.object({
+  opensea: OpenSeaApiSchema.default({}),
   general: z.object({
     network: z.enum(['robinhood', 'mainnet', 'base', 'polygon', 'sepolia']).optional(),
     activeNetworks: z.array(z.string()).default(['robinhood']),
