@@ -115,23 +115,29 @@ async function main() {
       const slug = eventData.collection?.slug || '';
       const contract = eventData.item?.nft_id?.split('/')?.[1] || '';
       const tokenId = eventData.item?.nft_id?.split('/')?.[2] || '';
-      let priceEth = parseFloat(eventData.payment_token?.eth_price || '0');
-      if (!priceEth || priceEth <= 0 || priceEth >= 0.003) {
-        const activeOffer = inventoryManager.getActiveOffer(slug);
-        if (activeOffer && activeOffer.priceEth > 0) {
-          priceEth = activeOffer.priceEth;
-        } else {
-          try {
-            const marketData = await apiService.getCollectionMarketData(slug, contract);
-            priceEth = marketData.topOfferEth > 0 ? marketData.topOfferEth : (marketData.floorPriceEth * 0.85);
-          } catch {
-            priceEth = 0.0004;
-          }
+      const chainPart = eventData.item?.nft_id?.split('/')?.[0] || '';
+      const network = chainPart === 'ethereum' ? 'mainnet' : chainPart || undefined;
+      // Cost basis = the price of OUR offer that was accepted. Only if unknown, fall back conservatively to the
+      // higher of floor / top offer (overstating cost keeps the 40%-margin listing price on the safe side).
+      let priceEth = 0;
+      const activeOffer = inventoryManager.getActiveOffer(slug);
+      if (activeOffer && activeOffer.priceEth > 0) {
+        priceEth = activeOffer.priceEth;
+      } else {
+        try {
+          const marketData = await apiService.getCollectionMarketData(slug, contract, network);
+          priceEth = Math.max(marketData.topOfferEth || 0, marketData.floorPriceEth || 0);
+        } catch {
+          priceEth = 0;
         }
+      }
+      if (!(priceEth > 0)) {
+        logger.error({ slug, tokenId }, 'Cost basis of received NFT unknown; not auto-listing (wallet scan will retry).');
+        return;
       }
 
       logger.info({ slug, tokenId, priceEth }, 'Incoming transfer received! Triggering automatic relist.');
-      await relisterStrategy.handleItemAcquired(slug, contract, tokenId, priceEth);
+      await relisterStrategy.handleItemAcquired(slug, contract, tokenId, priceEth, network);
     } catch (err: any) {
       logger.error({ err }, 'Error processing nft_received event');
     }

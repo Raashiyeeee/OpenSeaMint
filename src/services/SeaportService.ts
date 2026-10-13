@@ -52,6 +52,10 @@ export class SeaportService {
     this.signer = signer;
   }
 
+  public getWalletAddress(): string {
+    return this.signer.address;
+  }
+
   /**
    * Query on-chain WETH balance of trading signer on the target network
    */

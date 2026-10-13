@@ -37,7 +37,8 @@ export class AutoRelisterStrategy {
     collectionSlug: string,
     contractAddress: string,
     tokenId: string,
-    acquiredPriceEth: number
+    acquiredPriceEth: number,
+    network?: string
   ): Promise<void> {
     const identifier = `${contractAddress.toLowerCase()}:${tokenId}`;
     logger.info({ identifier, acquiredPriceEth }, 'Triggering automated relist routine for newly acquired NFT');
@@ -47,6 +48,7 @@ export class AutoRelisterStrategy {
       collectionSlug,
       contractAddress,
       tokenId,
+      network,
       acquiredPriceEth,
       acquiredAtTimestamp: Date.now(),
       status: 'PENDING_LISTING'
@@ -186,9 +188,49 @@ export class AutoRelisterStrategy {
         logger.error({ identifier: item.identifier, error: err.message }, 'Error during unlisted inventory relist scan');
       }
     }
+
+    // 3. Continuous competitive monitoring of our ACTIVE listings
+    await this.monitorListedInventory();
   }
 
-  private async relistItem(item: InventoryItem): Promise<void> {
+  /** Minimum time between two price updates of the same listing (anti relist churn). */
+  private getRepriceCooldownMs(): number {
+    return (this.config.general.relistCooldownMinutes ?? 10) * 60 * 1000;
+  }
+
+  /** Minimum relative price change that justifies a relist (anti churn). */
+  private static readonly MIN_REPRICE_CHANGE_PERCENT = 0.2;
+
+  /**
+   * Rule E — Competitive listing monitor. For every LISTED item:
+   *  - if a competitor lists below us, relist just under them, but ONLY if that price still yields the 40% net
+   *    margin after all fees (incl. the applicable creator fee);
+   *  - if matching them is not profitable, HOLD: keep the existing listing (always >= the 40%-margin price, so never
+   *    a loss) and keep monitoring; we reprice to the top position as soon as it is profitable again;
+   *  - reprices are rate-limited (cooldown + minimum price change). Listings/cancels are off-chain (no gas).
+   */
+  public async monitorListedInventory(): Promise<void> {
+    const listed = this.inventoryManager.getAllInventory().filter((i) => i.status === 'LISTED');
+    if (listed.length === 0) return;
+    const ourAddress = this.seaportService.getWalletAddress();
+    for (const item of listed) {
+      try {
+        const ourPrice = item.currentListingPriceEth;
+        if (!ourPrice || ourPrice <= 0) continue;
+        if (item.lastListingUpdateAt && Date.now() - item.lastListingUpdateAt < this.getRepriceCooldownMs()) continue;
+        const competitor = await this.apiService.getLowestCompetingListing(item.collectionSlug, ourAddress);
+        if (competitor === undefined || competitor === null) continue; // unknown or no competition: we are top
+        if (competitor.priceEth >= ourPrice) continue; // already lowest
+        const dropPercent = ((ourPrice - competitor.priceEth) / ourPrice) * 100;
+        if (dropPercent < AutoRelisterStrategy.MIN_REPRICE_CHANGE_PERCENT) continue;
+        await this.relistItem(item, competitor.priceEth);
+      } catch (err: any) {
+        logger.error({ identifier: item.identifier, error: err.message }, 'Error during competitive listing monitor');
+      }
+    }
+  }
+
+  private async relistItem(item: InventoryItem, knownCompetitorEth?: number): Promise<void> {
     const ignored = this.config.general.ignoredCollections || ['robin-owls', 'robin-owls-269031093'];
     if (ignored.some((i) => item.collectionSlug.toLowerCase().includes(i.toLowerCase()) || item.contractAddress.toLowerCase().includes(i.toLowerCase()))) {
       item.status = 'ERROR';
@@ -198,10 +240,18 @@ export class AutoRelisterStrategy {
     }
 
     // 1. Fetch current collection floor & fees
+    const networkKey = item.network || this.config.general.network || 'robinhood';
     const marketData = await this.apiService.getCollectionMarketData(
       item.collectionSlug,
-      item.contractAddress
+      item.contractAddress,
+      networkKey
     );
+    const wasListed = item.status === 'LISTED' && !!item.listingOrderId;
+    let competitorEth = knownCompetitorEth;
+    if (competitorEth === undefined) {
+      const comp = await this.apiService.getLowestCompetingListing(item.collectionSlug, this.seaportService.getWalletAddress());
+      if (comp) competitorEth = comp.priceEth;
+    }
 
     // 2. Find target collection configuration if exists
     const targetConfig = this.config.targetCollections.find(
@@ -218,10 +268,19 @@ export class AutoRelisterStrategy {
         royaltyFeeBps: marketData.royaltyFeeBps,
         ethPriceUsd: marketData.ethPriceUsd
       },
-      targetProfitUsd
+      targetProfitUsd,
+      networkKey,
+      competitorEth
     );
 
     if (listingEval.action === 'HOLD') {
+      if (wasListed) {
+        // Keep the existing listing: it is already priced at/above the 40%-margin price (never a loss).
+        item.holdReason = `Competitor below profitable price; keeping current listing at ${item.currentListingPriceEth} ETH. ${listingEval.reason}`;
+        item.lastListingUpdateAt = Date.now();
+        logger.warn({ identifier: item.identifier, reason: listingEval.reason }, 'Undercut not profitable: holding current listing (no loss sale)');
+        return;
+      }
       logger.warn(
         { identifier: item.identifier, reason: listingEval.reason },
         'Floor Dump Protection active: Holding NFT to prevent loss sale'
@@ -231,6 +290,9 @@ export class AutoRelisterStrategy {
     }
 
     const listPriceEth = listingEval.recommendedListPriceEth!;
+    if (wasListed && item.currentListingPriceEth && listPriceEth >= item.currentListingPriceEth) {
+      return; // no improvement: avoid churn
+    }
     const expectedNetProfitUsd = listingEval.expectedNetProfitUsd!;
 
     logger.info(
@@ -244,9 +306,7 @@ export class AutoRelisterStrategy {
       'Market supports profitable sale: Listing NFT on OpenSea'
     );
 
-    const activeNets = this.config.general.activeNetworks || ['robinhood'];
-    const chainSlug = this.config.general.network 
-      || (activeNets.includes('robinhood') && !activeNets.includes('mainnet') ? 'robinhood' : 'ethereum');
+    const chainSlug = OpenSeaApiService.toOpenSeaChain(networkKey);
 
     // 3.5. Ensure on-chain ERC721 conduit approval is active
     await this.seaportService.ensureNftConduitApproval(item.contractAddress, chainSlug);
@@ -285,7 +345,15 @@ export class AutoRelisterStrategy {
     };
 
     try {
+      // Reprice: cancel our previous (higher) listing so only one listing is live
+      if (wasListed && item.listingOrderId && !item.listingOrderId.startsWith('sim_')) {
+        const cancel = await this.apiService.cancelOffer(item.listingOrderId, networkKey);
+        if (!cancel.success) {
+          logger.warn({ identifier: item.identifier, error: cancel.error }, 'Previous listing cancel failed; new lower listing still takes priority');
+        }
+      }
       const res = await this.apiService.postListing(chainSlug, postPayload);
+      item.lastListingUpdateAt = Date.now();
 
       // 6. Update inventory tracking
       const listPriceUsd = listPriceEth * (marketData.ethPriceUsd || 2700);

@@ -165,7 +165,7 @@ console.log('Test 5 PASSED: Simultaneous offers and 70% capital allocation verif
 console.log('--- Test 6: Network Gas Comparison on $10 Trade ---');
 const rhTrade = pricingEngine.evaluateOfferScenario({
   offerPriceUsd: 10.0,
-  floorPriceUsd: 13.0,
+  floorPriceUsd: 15.0, // 40% net margin rule: floor 13 (~23% margin) no longer qualifies
   royaltyPercent: 5.0,
   marketplaceFeePercent: 0.5,
   networkGasUsd: 0.01, // Robinhood Chain low gas
@@ -175,7 +175,7 @@ const rhTrade = pricingEngine.evaluateOfferScenario({
 
 const ethMainnetTrade = pricingEngine.evaluateOfferScenario({
   offerPriceUsd: 10.0,
-  floorPriceUsd: 13.0,
+  floorPriceUsd: 15.0,
   royaltyPercent: 5.0,
   marketplaceFeePercent: 0.5,
   networkGasUsd: 3.50, // Ethereum Mainnet high gas

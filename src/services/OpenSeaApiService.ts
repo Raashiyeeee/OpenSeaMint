@@ -726,7 +726,35 @@ export class OpenSeaApiService {
    * Best offer on a specific NFT (OpenSea: GET /offers/collection/{slug}/nfts/{identifier}/best).
    * Returns per-unit price in ETH and the order hash, or undefined if none / unavailable.
    */
-  public async getBestNftOffer(collectionSlug: string, tokenId: string): Promise<{ priceEth: number; orderHash?: string } | undefined> {
+  /**
+   * Lowest active listing in the collection that is NOT ours (GET /listings/collection/{slug}/best, sorted by
+   * price ascending). Returns null when no competing listing exists, undefined when the lookup failed.
+   */
+  public async getLowestCompetingListing(
+    collectionSlug: string,
+    ourAddress: string
+  ): Promise<{ priceEth: number; orderHash?: string } | null | undefined> {
+    try {
+      const res = await this.client.get(`/listings/collection/${collectionSlug}/best?limit=50`);
+      const listings: any[] = res.data?.listings || [];
+      const ours = (ourAddress || '').toLowerCase();
+      for (const l of listings) {
+        const params = l?.protocol_data?.parameters;
+        if ((params?.offerer || '').toLowerCase() === ours) continue;
+        const cur = l?.price?.current;
+        if (!cur?.value) continue;
+        const qty = Number(params?.offer?.[0]?.startAmount || 1) || 1;
+        const priceEth = Number(cur.value) / Math.pow(10, cur.decimals ?? 18) / qty;
+        if (priceEth > 0) return { priceEth, orderHash: l.order_hash };
+      }
+      return null;
+    } catch (err: any) {
+      logger.warn({ slug: collectionSlug, err: err.message }, 'Failed to fetch competing listings');
+      return undefined;
+    }
+  }
+
+    public async getBestNftOffer(collectionSlug: string, tokenId: string): Promise<{ priceEth: number; orderHash?: string } | undefined> {
     try {
       const res = await this.client.get(`/offers/collection/${collectionSlug}/nfts/${tokenId}/best`);
       const priceEth = OpenSeaApiService.perUnitOfferPriceEth(res.data);
