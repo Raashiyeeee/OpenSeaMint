@@ -21,24 +21,35 @@ export class PricingEngine {
     royaltyPercent: number; // e.g. 10 for 10%
     marketplaceFeePercent?: number; // e.g. 0.5 for 0.5%
     networkGasUsd?: number;
+    otherCostsUsd?: number;
     availableCapitalUsd?: number;
     minNetProfitUsd?: number;
     minOfferPriceUsd?: number;
     liquidityDiscountPercent?: number; // e.g. 0% for exact floor, or 1% undercut
     minFloorMultiplier?: number;
     enforceFloorRatio?: boolean;
+    minMarginPercent?: number;
+    sales3Hours?: number;
+    minSales3Hours?: number;
   }): {
+    expectedSaleRevenueUsd: number;
+    purchasePriceUsd: number;
+    totalCostsUsd: number;
     netProceedsUsd: number;
     royaltyUsd: number;
+    creatorFeeUsd: number;
     marketplaceFeeUsd: number;
     gasUsd: number;
+    otherCostsUsd: number;
     expectedNetProfitUsd: number;
+    marginPercent: number;
     checkACapitalPassed: boolean;
     checkMinOfferPassed: boolean;
     checkBProfitPassed: boolean;
     checkFFloorRatioPassed: boolean;
     checkMintCompletedPassed: boolean;
     checkMarketDumpPassed: boolean;
+    checkLiquidityPassed: boolean;
     floorDeclinePercent: number;
     isProfitable: boolean;
     decision: 'ACCEPT' | 'REJECT';
@@ -52,31 +63,49 @@ export class PricingEngine {
       royaltyPercent,
       marketplaceFeePercent = 0.5,
       networkGasUsd = 0.0,
+      otherCostsUsd = 0.0,
       availableCapitalUsd = this.config.capital?.totalTradingCapitalUsd ?? 10.0,
-      minNetProfitUsd = this.config.capital?.minNetProfitUsd ?? 2.0,
+      minNetProfitUsd = this.config.capital?.minNetProfitUsd ?? 0.20,
       minOfferPriceUsd = this.config.capital?.minOfferPriceUsd ?? 1.00,
       liquidityDiscountPercent = 0.0,
-      minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40,
-      enforceFloorRatio = false
+      minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30,
+      enforceFloorRatio = false,
+      minMarginPercent,
+      sales3Hours,
+      minSales3Hours = this.config.liquidity?.minSales3Hours ?? 10
     } = params;
 
     // Realistic resale price factoring liquidity / undercut
     const realisticSalePriceUsd = floorPriceUsd * (1 - liquidityDiscountPercent / 100);
+    const expectedSaleRevenueUsd = roundToPrecision(realisticSalePriceUsd, 2);
+    const purchasePriceUsd = roundToPrecision(offerPriceUsd, 2);
 
-    // Royalty calculation
-    const royaltyUsd = realisticSalePriceUsd * (royaltyPercent / 100);
+    // Creator royalty calculation
+    const royaltyUsd = roundToPrecision(realisticSalePriceUsd * (royaltyPercent / 100), 2);
+    const creatorFeeUsd = royaltyUsd;
 
     // Marketplace fee calculation
-    const marketplaceFeeUsd = realisticSalePriceUsd * (marketplaceFeePercent / 100);
+    const marketplaceFeeUsd = roundToPrecision(realisticSalePriceUsd * (marketplaceFeePercent / 100), 2);
 
-    // Gas costs
-    const gasUsd = networkGasUsd;
+    // Gas costs & other costs
+    const gasUsd = roundToPrecision(networkGasUsd, 2);
+    const extraCostsUsd = roundToPrecision(otherCostsUsd, 2);
 
-    // Net proceeds from sale after royalty & marketplace fees
-    const netProceedsUsd = realisticSalePriceUsd - royaltyUsd - marketplaceFeeUsd;
+    // Formula 2: Total Acquisition and Selling Costs
+    // Total costs must include purchase price, creator fees, marketplace fees, gas fees, and other applicable costs.
+    const totalCostsUsd = roundToPrecision(
+      purchasePriceUsd + creatorFeeUsd + marketplaceFeeUsd + gasUsd + extraCostsUsd,
+      2
+    );
 
-    // Net profit = Net Sale Proceeds - Acquisition Cost - Gas/Other costs
-    const expectedNetProfitUsd = netProceedsUsd - offerPriceUsd - gasUsd;
+    // Formula 2: Net Profit = Expected Sale Revenue - Total Acquisition and Selling Costs
+    const expectedNetProfitUsd = roundToPrecision(expectedSaleRevenueUsd - totalCostsUsd, 2);
+
+    // Net proceeds from sale after royalty & marketplace fees (for backward compatibility)
+    const netProceedsUsd = roundToPrecision(realisticSalePriceUsd - royaltyUsd - marketplaceFeeUsd, 2);
+
+    // Profit margin percentage relative to acquisition cost
+    const marginPercent = offerPriceUsd > 0 ? roundToPrecision((expectedNetProfitUsd / offerPriceUsd) * 100, 2) : 0;
 
     // Check A: Capital check
     const checkACapitalPassed = offerPriceUsd <= availableCapitalUsd && offerPriceUsd > 0;
@@ -84,10 +113,11 @@ export class PricingEngine {
     // Check A2: Minimum Offer Price Rule ($1.00 minimum offer per NFT)
     const checkMinOfferPassed = offerPriceUsd >= minOfferPriceUsd;
 
-    // Check B: Profitability check
-    const checkBProfitPassed = expectedNetProfitUsd >= minNetProfitUsd && expectedNetProfitUsd > 0;
+    // Check B: Profitability check (including creator fees and all costs)
+    const marginCheckPassed = minMarginPercent !== undefined ? marginPercent >= minMarginPercent : true;
+    const checkBProfitPassed = expectedNetProfitUsd >= minNetProfitUsd && expectedNetProfitUsd > 0 && marginCheckPassed;
 
-    // Check F: Minimum Floor Difference (Formula: Floor Price >= Offer Price * 1.40, excluding creator fees from this comparison)
+    // Check F: Minimum Floor Difference (Formula 1: Floor Price >= Offer Price * 1.30, excluding creator fees from this comparison)
     const checkFFloorRatioPassed = offerPriceUsd > 0 && floorPriceUsd >= (offerPriceUsd * minFloorMultiplier - 0.000001);
 
     // Condition 1: Incomplete Public Mint Protection
@@ -98,7 +128,18 @@ export class PricingEngine {
     const floorDeclinePercent = refFloorUsd > 0 ? roundToPrecision(((refFloorUsd - floorPriceUsd) / refFloorUsd) * 100, 2) : 0;
     const checkMarketDumpPassed = floorDeclinePercent < 40.0;
 
-    const isProfitable = checkACapitalPassed && checkMinOfferPassed && checkBProfitPassed && (enforceFloorRatio ? checkFFloorRatioPassed : true) && checkMintCompletedPassed && checkMarketDumpPassed;
+    // Core rule: High sales volume alone is not enough
+    const checkLiquidityPassed = sales3Hours !== undefined ? sales3Hours >= minSales3Hours : true;
+
+    const isProfitable =
+      checkACapitalPassed &&
+      checkMinOfferPassed &&
+      checkBProfitPassed &&
+      (enforceFloorRatio ? checkFFloorRatioPassed : true) &&
+      checkMintCompletedPassed &&
+      checkMarketDumpPassed &&
+      checkLiquidityPassed;
+
     const decision: 'ACCEPT' | 'REJECT' = isProfitable ? 'ACCEPT' : 'REJECT';
 
     let reason = 'All criteria passed';
@@ -108,6 +149,8 @@ export class PricingEngine {
       reason = 'Incomplete Public Mint: Public mint has not completed successfully or collection lacks sufficient mint demand. Strict Rejection ❌';
     } else if (!checkMarketDumpPassed) {
       reason = `Market Dump Protection: Floor declined by ${floorDeclinePercent.toFixed(1)}% >= 40% threshold (Reference: $${refFloorUsd.toFixed(2)}, Current: $${floorPriceUsd.toFixed(2)}). Strict Rejection ❌`;
+    } else if (!checkLiquidityPassed) {
+      reason = `Recent Floor Sales Requirement Failed ❌: Only ${sales3Hours}/${minSales3Hours} completed native ETH floor sales in last 3 hours. High volume required.`;
     } else if (!checkACapitalPassed) {
       reason = `Check A Failed: Required capital ($${offerPriceUsd.toFixed(2)}) exceeds available capital ($${availableCapitalUsd.toFixed(2)})`;
     } else if (expectedNetProfitUsd <= 0) {
@@ -119,17 +162,24 @@ export class PricingEngine {
     }
 
     return {
-      netProceedsUsd: roundToPrecision(netProceedsUsd, 2),
-      royaltyUsd: roundToPrecision(royaltyUsd, 2),
-      marketplaceFeeUsd: roundToPrecision(marketplaceFeeUsd, 2),
-      gasUsd: roundToPrecision(gasUsd, 2),
-      expectedNetProfitUsd: roundToPrecision(expectedNetProfitUsd, 2),
+      expectedSaleRevenueUsd,
+      purchasePriceUsd,
+      totalCostsUsd,
+      netProceedsUsd,
+      royaltyUsd,
+      creatorFeeUsd,
+      marketplaceFeeUsd,
+      gasUsd,
+      otherCostsUsd: extraCostsUsd,
+      expectedNetProfitUsd,
+      marginPercent,
       checkACapitalPassed,
       checkMinOfferPassed,
       checkBProfitPassed,
       checkFFloorRatioPassed,
       checkMintCompletedPassed,
       checkMarketDumpPassed,
+      checkLiquidityPassed,
       floorDeclinePercent,
       isProfitable,
       decision,
@@ -138,15 +188,154 @@ export class PricingEngine {
   }
 
   /**
+   * NFT Offer Profitability Rule — Creator Fee Included in Profit Calculation:
+   *
+   * The bot must calculate the expected net profit, including creator fees and all applicable trading costs,
+   * before placing any NFT offer.
+   *
+   * Mandatory condition: The current floor price must be at least 30% higher than the proposed offer price,
+   * excluding creator fees from this specific 30% comparison. However, the bot must separately include creator fees
+   * in the net-profit calculation and reject any offer that does not meet the minimum required profit margin.
+   *
+   * Formula 1 — Floor price requirement:
+   *   Floor Price >= Offer Price * 1.30
+   *
+   * Formula 2 — Net profitability:
+   *   Net Profit = Expected Sale Revenue - Total Acquisition and Selling Costs
+   *   Total costs must include the purchase price, creator fees, marketplace fees, gas fees, and other applicable costs.
+   *
+   * Example: If the highest existing offer is $1.00, the bot considers placing an offer of $1.25, and the floor price is $1.50,
+   * the bot must not automatically accept this trade. If a 10% creator fee and other costs eliminate the expected profit,
+   * the offer must be rejected.
+   *
+   * Core rule: High sales volume alone is not enough. The bot may place an offer only when the floor-price requirement
+   * is satisfied and the trade is expected to generate the required net profit after all applicable fees.
+   */
+  public evaluateProposedOffer(params: {
+    proposedOfferUsd: number;
+    currentFloorUsd: number;
+    highestExistingOfferUsd?: number;
+    creatorFeePercent: number; // e.g. 10 for 10%
+    marketplaceFeePercent?: number; // e.g. 0.5 for 0.5%
+    estimatedGasUsd?: number;
+    otherCostsUsd?: number;
+    minNetProfitUsd?: number;
+    minMarginPercent?: number;
+    sales3Hours?: number;
+    minSales3Hours?: number;
+    liquidityDiscountPercent?: number;
+  }): {
+    decision: 'ACCEPT' | 'REJECT';
+    isAcceptable: boolean;
+    floorRequirementPassed: boolean;
+    netProfitabilityPassed: boolean;
+    salesVolumePassed: boolean;
+    expectedSaleRevenueUsd: number;
+    totalAcquisitionAndSellingCostsUsd: number;
+    expectedNetProfitUsd: number;
+    marginPercent: number;
+    requiredFloorUsd: number;
+    costsBreakdown: {
+      purchasePriceUsd: number;
+      creatorFeeUsd: number;
+      marketplaceFeeUsd: number;
+      gasFeeUsd: number;
+      otherCostsUsd: number;
+    };
+    reason: string;
+  } {
+    const {
+      proposedOfferUsd,
+      currentFloorUsd,
+      creatorFeePercent,
+      marketplaceFeePercent = 0.5,
+      estimatedGasUsd = 0.01,
+      otherCostsUsd = 0.0,
+      minNetProfitUsd = this.config.capital?.minNetProfitUsd ?? 0.20,
+      minMarginPercent = this.config.profitTargets?.defaultMinMarginPercent ?? 15.0,
+      sales3Hours,
+      minSales3Hours = this.config.liquidity?.minSales3Hours ?? 10,
+      liquidityDiscountPercent = 0.0
+    } = params;
+
+    // Formula 1 — Floor price requirement:
+    // Floor Price >= Offer Price * 1.30 (excluding creator fees from this specific 30% comparison)
+    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30;
+    const requiredFloorUsd = roundToPrecision(proposedOfferUsd * minFloorMultiplier, 2);
+    const floorRequirementPassed = proposedOfferUsd > 0 && currentFloorUsd >= (proposedOfferUsd * minFloorMultiplier - 0.000001);
+
+    // Formula 2 — Net profitability:
+    // Net Profit = Expected Sale Revenue - Total Acquisition and Selling Costs
+    const realisticSalePriceUsd = currentFloorUsd * (1 - liquidityDiscountPercent / 100);
+    const expectedSaleRevenueUsd = roundToPrecision(realisticSalePriceUsd, 2);
+    const purchasePriceUsd = roundToPrecision(proposedOfferUsd, 2);
+    const creatorFeeUsd = roundToPrecision(realisticSalePriceUsd * (creatorFeePercent / 100), 2);
+    const marketplaceFeeUsd = roundToPrecision(realisticSalePriceUsd * (marketplaceFeePercent / 100), 2);
+    const gasFeeUsd = roundToPrecision(estimatedGasUsd, 2);
+    const extraCostsUsd = roundToPrecision(otherCostsUsd, 2);
+
+    const totalAcquisitionAndSellingCostsUsd = roundToPrecision(
+      purchasePriceUsd + creatorFeeUsd + marketplaceFeeUsd + gasFeeUsd + extraCostsUsd,
+      2
+    );
+
+    const expectedNetProfitUsd = roundToPrecision(expectedSaleRevenueUsd - totalAcquisitionAndSellingCostsUsd, 2);
+    const marginPercent = proposedOfferUsd > 0 ? roundToPrecision((expectedNetProfitUsd / proposedOfferUsd) * 100, 2) : 0;
+
+    const netProfitabilityPassed =
+      expectedNetProfitUsd >= minNetProfitUsd &&
+      expectedNetProfitUsd > 0 &&
+      marginPercent >= minMarginPercent;
+
+    // Core rule: High sales volume alone is not enough
+    const salesVolumePassed = sales3Hours !== undefined ? sales3Hours >= minSales3Hours : true;
+
+    const isAcceptable = floorRequirementPassed && netProfitabilityPassed && salesVolumePassed;
+    const decision: 'ACCEPT' | 'REJECT' = isAcceptable ? 'ACCEPT' : 'REJECT';
+
+    let reason = 'Offer meets 30% floor requirement and generates required net profit after all applicable fees.';
+    if (!floorRequirementPassed) {
+      reason = `Formula 1 Rejected ❌: Floor price ($${currentFloorUsd.toFixed(2)}) is not at least 30% higher than proposed offer ($${proposedOfferUsd.toFixed(2)}). Required Floor >= $${requiredFloorUsd.toFixed(2)} (Floor Price >= Offer Price * 1.30, creator fees excluded from ratio).`;
+    } else if (expectedNetProfitUsd <= 0) {
+      reason = `Formula 2 Rejected ❌: Trade yields negative or zero net profit ($${expectedNetProfitUsd.toFixed(2)}) after creator fee ($${creatorFeeUsd.toFixed(2)}), marketplace fee ($${marketplaceFeeUsd.toFixed(2)}), and gas ($${gasFeeUsd.toFixed(2)}).`;
+    } else if (!netProfitabilityPassed) {
+      reason = `Formula 2 Rejected ❌: Expected net profit ($${expectedNetProfitUsd.toFixed(2)}, margin: ${marginPercent.toFixed(1)}%) does not meet minimum profit threshold ($${minNetProfitUsd.toFixed(2)} / ${minMarginPercent}% margin) after creator fee ($${creatorFeeUsd.toFixed(2)}) and all trading costs.`;
+    } else if (!salesVolumePassed) {
+      reason = `Sales Volume Rejected ❌: Collection has only ${sales3Hours}/${minSales3Hours} floor sales in last 3 hours. High sales volume required.`;
+    }
+
+    return {
+      decision,
+      isAcceptable,
+      floorRequirementPassed,
+      netProfitabilityPassed,
+      salesVolumePassed,
+      expectedSaleRevenueUsd,
+      totalAcquisitionAndSellingCostsUsd,
+      expectedNetProfitUsd,
+      marginPercent,
+      requiredFloorUsd,
+      costsBreakdown: {
+        purchasePriceUsd,
+        creatorFeeUsd,
+        marketplaceFeeUsd,
+        gasFeeUsd,
+        otherCostsUsd: extraCostsUsd
+      },
+      reason
+    };
+  }
+
+  /**
    * Verifies NFT Offer Eligibility Rules:
    * Rule 1. Native ETH Sales: At least 10 completed floor-price sales within the last 3 hours, paid in native ETH. WETH sales must not count.
    * Rule 2. Actual Floor Sales: Genuine completed sales must occur at or around the current floor price. Offer acceptances and WETH sales must not count toward this requirement.
-   * Rule 3. Minimum Floor Difference: The current floor price must be at least 40% higher than the bot's offer price.
-   *         Formula: "Floor Price >= Offer Price * 1.40"
-   * Rule 4. Creator Fee Exclusion: Calculate the 40% floor-to-offer price difference without including creator fees in this specific calculation.
+   * Rule 3. Minimum Floor Difference: The current floor price must be at least 30% higher than the bot's offer price.
+   *         Formula: "Floor Price >= Offer Price * 1.30"
+   * Rule 4. Creator Fee Exclusion: Calculate the 30% floor-to-offer price difference without including creator fees in this specific calculation.
    * Rule 5. Mandatory Rejection: If any condition fails, the bot must not place an offer.
    * Core Rule: Only place offers when there are at least 10 genuine native ETH floor-price sales in the last 3 hours
-   * and the current floor is at least 40% above the offer price, excluding creator fees from this comparison.
+   * and the current floor is at least 30% above the offer price, excluding creator fees from this comparison.
    */
   public evaluateOfferEligibility(params: {
     floorPriceEth: number;
@@ -166,7 +355,7 @@ export class PricingEngine {
       offerPriceEth,
       sales3HoursNativeEth,
       minSales3Hours = this.config.liquidity?.minSales3Hours ?? 10,
-      minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40
+      minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30
     } = params;
 
     const nativeEthFloorSalesPassed = sales3HoursNativeEth >= minSales3Hours;
@@ -255,8 +444,8 @@ export class PricingEngine {
     const minMarginPercent = targetConfig?.minMarginPercent ?? this.config.profitTargets.defaultMinMarginPercent ?? 15.0;
     const maxMarginBidEth = netProceedsAfterGasEth / (1 + (minMarginPercent / 100));
     
-    // Floor ratio ceiling (Floor Price >= Offer Price * 1.40, excluding creator fees from this comparison)
-    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.40;
+    // Floor ratio ceiling (Floor Price >= Offer Price * 1.30, excluding creator fees from this comparison)
+    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30;
     const maxOfferFloorRuleEth = floor / minFloorMultiplier;
 
     // Larry's strategy: floor price multiple (e.g. 0.85 = 15% discount)
@@ -310,18 +499,32 @@ export class PricingEngine {
 
     const bidPriceUsd = roundToPrecision(finalBidEth * ethPriceUsd, 2);
 
-    // Recompute exact margins based on this bid price
+    // Formula 2: Total Acquisition and Selling Costs & Expected Net Profit
+    // Net Profit = Expected Sale Revenue - Total Acquisition and Selling Costs
+    // Total costs include purchase price, creator fees, marketplace fees, gas fees
+    const expectedSaleRevenueEth = targetListPriceEth;
+    const expectedSaleRevenueUsd = targetListPriceUsd;
+    const purchasePriceEth = finalBidEth;
+    const purchasePriceUsd = bidPriceUsd;
+    const creatorFeeEth = royaltyFeeEth;
+    const creatorFeeUsd = roundToPrecision(creatorFeeEth * ethPriceUsd, 2);
+    const openseaFeeUsdAmount = roundToPrecision(openseaFeeEth * ethPriceUsd, 2);
+    const estimatedGasCostUsdAmount = roundToPrecision(estimatedGasCostEth * ethPriceUsd, 2);
+
+    const totalCostsEth = purchasePriceEth + creatorFeeEth + openseaFeeEth + estimatedGasCostEth;
+    const totalCostsUsd = roundToPrecision(totalCostsEth * ethPriceUsd, 2);
+
     const grossProfitEth = targetListPriceEth - finalBidEth;
     const grossProfitUsd = roundToPrecision(grossProfitEth * ethPriceUsd, 2);
-    const netProfitEth = targetListPriceEth - totalFeesEth - finalBidEth - estimatedGasCostEth;
+    const netProfitEth = expectedSaleRevenueEth - totalCostsEth;
     const netProfitUsd = roundToPrecision(netProfitEth * ethPriceUsd, 2);
     const marginPercent = finalBidEth > 0 ? (netProfitEth / finalBidEth) * 100 : 0;
 
     // Final Buy Filter (NFT Offer Eligibility Rules & Protections):
     // Rule 1: 10+ completed sales within 3 hours in native ETH (WETH strictly excluded)
     // Rule 2: Genuine completed sales around current floor-price range (offer acceptances excluded)
-    // Rule 3: Floor Price >= Offer Price * 1.40 (current floor at least 40% higher than offer)
-    // Rule 4: Creator fee excluded from the 40% floor-to-offer price comparison
+    // Rule 3: Floor Price >= Offer Price * 1.30 (current floor at least 30% higher than offer)
+    // Rule 4: Creator fee excluded from the 30% floor-to-offer price comparison
     // Condition 1: Incomplete Public Mint — Strict Rejection
     // Condition 2: Market Dump Protection — Floor decline < 40%
     const sales3Hours = marketData.sales3Hours ?? marketData.sales1Hour ?? 0;
@@ -334,7 +537,7 @@ export class PricingEngine {
     const checkLLiquidityPassed = marketData.liquidityPassed !== false &&
       sales3Hours >= minSales && uniqueWallets3Hours >= minWallets;
 
-    // Rule 3 & 4: Floor difference calculation compares raw Floor Price to Offer Price directly without creator fees
+    // Formula 1 & Rule 4: Floor difference calculation compares raw Floor Price to Offer Price directly without creator fees (Floor >= Offer * 1.30)
     const checkFFloorRatioPassed = finalBidEth > 0 && floor >= (finalBidEth * minFloorMultiplier - 0.000001);
     const checkACapitalPassed = finalBidEth <= maxCapitalEth && finalBidEth > 0 && bidPriceUsd <= maxBuyPriceUsd;
 
@@ -387,16 +590,20 @@ export class PricingEngine {
       bidPriceUsd,
       targetListPriceEth,
       targetListPriceUsd,
+      expectedSaleRevenueUsd,
+      purchasePriceUsd,
+      creatorFeeUsd,
+      totalCostsUsd,
       grossProfitEth: roundToPrecision(grossProfitEth, 6),
       grossProfitUsd,
       openseaFeeEth: roundToPrecision(openseaFeeEth, 6),
-      openseaFeeUsd: roundToPrecision(openseaFeeUsd, 2),
+      openseaFeeUsd: openseaFeeUsdAmount,
       royaltyFeeEth: roundToPrecision(royaltyFeeEth, 6),
-      royaltyFeeUsd: roundToPrecision(royaltyFeeUsd, 2),
+      royaltyFeeUsd: creatorFeeUsd,
       totalFeesEth: roundToPrecision(totalFeesEth, 6),
-      totalFeesUsd: roundToPrecision(totalFeesUsd, 2),
+      totalFeesUsd: roundToPrecision(totalFeesEth * ethPriceUsd, 2),
       estimatedGasCostEth: roundToPrecision(estimatedGasCostEth, 6),
-      estimatedGasCostUsd: roundToPrecision(estimatedGasCostUsd, 2),
+      estimatedGasCostUsd: estimatedGasCostUsdAmount,
       netProfitEth: roundToPrecision(netProfitEth, 6),
       netProfitUsd,
       marginPercent: roundToPrecision(marginPercent, 2),

@@ -441,8 +441,8 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
 // TEST 14: NFT Offer Eligibility Rules
 // Rule 1: Native ETH Sales (>= 10 floor sales in last 3h paid in native ETH. WETH must not count)
 // Rule 2: Actual Floor Sales (genuine sales around floor. Offer acceptances and WETH sales must not count)
-// Rule 3: Minimum Floor Difference (Floor Price >= Offer Price * 1.40, floor at least 40% higher)
-// Rule 4: Creator Fee Exclusion (calculate 40% difference without including creator fees in comparison)
+// Rule 3: Minimum Floor Difference (Floor Price >= Offer Price * 1.30, floor at least 30% higher)
+// Rule 4: Creator Fee Exclusion (calculate 30% difference without including creator fees in comparison)
 // Rule 5: Mandatory Rejection (if any condition fails, bot must not place an offer)
 // --------------------------------------------------------------------------
 (async () => {
@@ -626,59 +626,59 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   assert.strictEqual(floorRangeResult.liquidityPassed, true, 'At least 10 genuine floor sales passes liquidity check');
   console.log('Case 14c PASSED: Outlier & below-floor sales excluded. Exactly 10/10 genuine floor sales -> PASSED ✅');
 
-  // Case 14d: Minimum 40% Floor Difference Formula (Current Floor Price >= Offer Price * 1.40)
-  // Floor: 0.0014 ETH, Offer: 0.0010 ETH -> 0.0014 >= 0.0010 * 1.40 -> Exactly 40% -> PASSES
-  const floor40Pass = pricingEngine.evaluateOfferEligibility({
-    floorPriceEth: 0.0014,
+  // Case 14d: Minimum 30% Floor Difference Formula (Current Floor Price >= Offer Price * 1.30)
+  // Floor: 0.0013 ETH, Offer: 0.0010 ETH -> 0.0013 >= 0.0010 * 1.30 -> Exactly 30% -> PASSES
+  const floor30Pass = pricingEngine.evaluateOfferEligibility({
+    floorPriceEth: 0.0013,
     offerPriceEth: 0.0010,
     sales3HoursNativeEth: 10
   });
-  assert.strictEqual(floor40Pass.eligible, true, 'Offer with 40% floor premium must be eligible');
-  assert.strictEqual(floor40Pass.floorDifferencePassed, true, 'Floor difference check must pass');
-  console.log('Case 14d PASSED: Floor 0.0014 ETH >= Offer 0.0010 ETH * 1.40 -> PASSED ✅');
+  assert.strictEqual(floor30Pass.eligible, true, 'Offer with 30% floor premium must be eligible');
+  assert.strictEqual(floor30Pass.floorDifferencePassed, true, 'Floor difference check must pass');
+  console.log('Case 14d PASSED: Floor 0.0013 ETH >= Offer 0.0010 ETH * 1.30 -> PASSED ✅');
 
-  // Test User Required Examples (Table):
-  // - Offer: $1.00 -> Minimum floor: $1.40
-  // - Offer: $2.00 -> Minimum floor: $2.80
-  // - Offer: $3.00 -> Minimum floor: $4.20
-  // - Offer: $5.00 -> Minimum floor: $7.00
-  const exampleTable1 = pricingEngine.evaluateOfferScenario({ offerPriceUsd: 1.00, floorPriceUsd: 1.40, royaltyPercent: 0, enforceFloorRatio: true });
-  assert.strictEqual(exampleTable1.checkFFloorRatioPassed, true, 'Offer $1.00 with Floor $1.40 must pass 40% rule');
+  // Test User Required Examples (Table with 30% floor multiplier):
+  // - Offer: $1.00 -> Minimum floor: $1.30
+  // - Offer: $2.00 -> Minimum floor: $2.60
+  // - Offer: $3.00 -> Minimum floor: $3.90
+  // - Offer: $5.00 -> Minimum floor: $6.50
+  const exampleTable1 = pricingEngine.evaluateOfferScenario({ offerPriceUsd: 1.00, floorPriceUsd: 1.30, royaltyPercent: 0, enforceFloorRatio: true });
+  assert.strictEqual(exampleTable1.checkFFloorRatioPassed, true, 'Offer $1.00 with Floor $1.30 must pass 30% rule');
   assert.strictEqual(exampleTable1.checkMinOfferPassed, true, 'Offer $1.00 must pass minimum offer price rule');
 
-  const exampleTable2 = pricingEngine.evaluateOfferScenario({ offerPriceUsd: 2.00, floorPriceUsd: 2.80, royaltyPercent: 0, enforceFloorRatio: true });
-  assert.strictEqual(exampleTable2.checkFFloorRatioPassed, true, 'Offer $2.00 with Floor $2.80 must pass 40% rule');
+  const exampleTable2 = pricingEngine.evaluateOfferScenario({ offerPriceUsd: 2.00, floorPriceUsd: 2.60, royaltyPercent: 0, enforceFloorRatio: true });
+  assert.strictEqual(exampleTable2.checkFFloorRatioPassed, true, 'Offer $2.00 with Floor $2.60 must pass 30% rule');
   assert.strictEqual(exampleTable2.checkMinOfferPassed, true, 'Offer $2.00 must pass minimum offer price rule');
 
-  const exampleTable3 = pricingEngine.evaluateOfferScenario({ offerPriceUsd: 3.00, floorPriceUsd: 4.20, royaltyPercent: 0, enforceFloorRatio: true });
-  assert.strictEqual(exampleTable3.checkFFloorRatioPassed, true, 'Offer $3.00 with Floor $4.20 must pass 40% rule');
+  const exampleTable3 = pricingEngine.evaluateOfferScenario({ offerPriceUsd: 3.00, floorPriceUsd: 3.90, royaltyPercent: 0, enforceFloorRatio: true });
+  assert.strictEqual(exampleTable3.checkFFloorRatioPassed, true, 'Offer $3.00 with Floor $3.90 must pass 30% rule');
   assert.strictEqual(exampleTable3.checkMinOfferPassed, true, 'Offer $3.00 must pass minimum offer price rule');
 
-  const exampleTable4 = pricingEngine.evaluateOfferScenario({ offerPriceUsd: 5.00, floorPriceUsd: 7.00, royaltyPercent: 0, enforceFloorRatio: true });
-  assert.strictEqual(exampleTable4.checkFFloorRatioPassed, true, 'Offer $5.00 with Floor $7.00 must pass 40% rule');
+  const exampleTable4 = pricingEngine.evaluateOfferScenario({ offerPriceUsd: 5.00, floorPriceUsd: 6.50, royaltyPercent: 0, enforceFloorRatio: true });
+  assert.strictEqual(exampleTable4.checkFFloorRatioPassed, true, 'Offer $5.00 with Floor $6.50 must pass 30% rule');
   assert.strictEqual(exampleTable4.checkMinOfferPassed, true, 'Offer $5.00 must pass minimum offer price rule');
-  console.log('Case 14d2 PASSED: Verified all user table examples ($1.00->$1.40, $2.00->$2.80, $3.00->$4.20, $5.00->$7.00) ✅');
+  console.log('Case 14d2 PASSED: Verified all user table examples ($1.00->$1.30, $2.00->$2.60, $3.00->$3.90, $5.00->$6.50) ✅');
 
-  // Case 14e: Floor Difference Fails (< 1.40 * Offer -> Mandatory Rejection)
-  // Floor: 0.00139 ETH, Offer: 0.0010 ETH -> 0.00139 < 0.00140 (only 39% higher) -> REJECT!
-  const floor39Fail = pricingEngine.evaluateOfferEligibility({
-    floorPriceEth: 0.00139,
+  // Case 14e: Floor Difference Fails (< 1.30 * Offer -> Mandatory Rejection)
+  // Floor: 0.00129 ETH, Offer: 0.0010 ETH -> 0.00129 < 0.00130 (only 29% higher) -> REJECT!
+  const floor29Fail = pricingEngine.evaluateOfferEligibility({
+    floorPriceEth: 0.00129,
     offerPriceEth: 0.0010,
     sales3HoursNativeEth: 10
   });
-  assert.strictEqual(floor39Fail.eligible, false, 'Offer below 40% floor premium must be rejected');
-  assert.strictEqual(floor39Fail.floorDifferencePassed, false, 'Floor difference check must fail');
-  assert(floor39Fail.reason.includes('Mandatory Rejection'), 'Must state Mandatory Rejection');
-  console.log('Case 14e PASSED: Floor 0.00139 ETH < Offer 0.0010 ETH * 1.40 -> MANDATORY REJECTION ✅');
+  assert.strictEqual(floor29Fail.eligible, false, 'Offer below 30% floor premium must be rejected');
+  assert.strictEqual(floor29Fail.floorDifferencePassed, false, 'Floor difference check must fail');
+  assert(floor29Fail.reason.includes('Mandatory Rejection'), 'Must state Mandatory Rejection');
+  console.log('Case 14e PASSED: Floor 0.00129 ETH < Offer 0.0010 ETH * 1.30 -> MANDATORY REJECTION ✅');
 
-  // Case 14f: Creator Fee Exclusion from 40% Floor Difference Calculation
-  // The 40% comparison is strictly between raw Floor Price and Offer Price without subtracting creator fees.
-  // With 10% creator fee (royaltyFeeBps: 1000), Floor = 0.0014 ETH and Offer = 0.0010 ETH:
-  // Floor Price (0.0014) is still >= Offer Price (0.0010) * 1.40 because creator fee is NOT deducted in this ratio check!
+  // Case 14f: Creator Fee Exclusion from 30% Floor Difference Calculation
+  // The 30% comparison is strictly between raw Floor Price and Offer Price without subtracting creator fees.
+  // With 10% creator fee (royaltyFeeBps: 1000), Floor = 0.0013 ETH and Offer = 0.0010 ETH:
+  // Floor Price (0.0013) is still >= Offer Price (0.0010) * 1.30 because creator fee is NOT deducted in this ratio check!
   const marketDataWithRoyalty: CollectionMarketData = {
     slug: 'creator-fee-excluded-ratio',
     contractAddress: '0x8888888888888888888888888888888888888888',
-    floorPriceEth: 0.0014, // Raw floor
+    floorPriceEth: 0.0013, // Raw floor
     topOfferEth: 0.0005,
     numListings: 10,
     openseaFeeBps: 50,
@@ -691,28 +691,28 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     liquidityPassed: true
   };
   const calcWithRoyalty = pricingEngine.calculateMaxBid(marketDataWithRoyalty, 0.10, 10.0, 'robinhood');
-  // Bid calculated by pricing engine must respect floor / 1.40 ceiling (0.0014 / 1.40 = 0.0010 ETH)
-  assert(calcWithRoyalty.bidPriceEth <= 0.0010, `Calculated bid (${calcWithRoyalty.bidPriceEth}) must not exceed Floor / 1.40 (0.0010)`);
-  assert.strictEqual(calcWithRoyalty.checkFFloorRatioPassed, true, '40% floor ratio comparison must pass excluding creator fees');
-  console.log('Case 14f PASSED: Creator fee excluded in 40% floor difference calculation -> PASSED ✅');
+  // Bid calculated by pricing engine must respect floor / 1.30 ceiling (0.0013 / 1.30 = 0.0010 ETH)
+  assert(calcWithRoyalty.bidPriceEth <= 0.0010, `Calculated bid (${calcWithRoyalty.bidPriceEth}) must not exceed Floor / 1.30 (0.0010)`);
+  assert.strictEqual(calcWithRoyalty.checkFFloorRatioPassed, true, '30% floor ratio comparison must pass excluding creator fees');
+  console.log('Case 14f PASSED: Creator fee excluded in 30% floor difference calculation -> PASSED ✅');
 
-  // Case 14g: Mandatory Rejection in evaluateOfferScenario with enforceFloorRatio (< 40%)
+  // Case 14g: Mandatory Rejection in evaluateOfferScenario with enforceFloorRatio (< 30%)
   const rejectedScenario = pricingEngine.evaluateOfferScenario({
     offerPriceUsd: 1.00,
-    floorPriceUsd: 1.35, // Only 35% above offer (< 40%)
+    floorPriceUsd: 1.25, // Only 25% above offer (< 30%)
     royaltyPercent: 0,
     minNetProfitUsd: 0.10,
     enforceFloorRatio: true
   });
-  assert.strictEqual(rejectedScenario.decision, 'REJECT', 'Scenario failing 40% floor difference must be REJECTED');
+  assert.strictEqual(rejectedScenario.decision, 'REJECT', 'Scenario failing 30% floor difference must be REJECTED');
   assert.strictEqual(rejectedScenario.checkFFloorRatioPassed, false, 'checkFFloorRatioPassed must be false');
-  console.log('Case 14g PASSED: evaluateOfferScenario with enforceFloorRatio rejects sub-40% trades -> MANDATORY REJECTION ✅');
+  console.log('Case 14g PASSED: evaluateOfferScenario with enforceFloorRatio rejects sub-30% trades -> MANDATORY REJECTION ✅');
 
   // Case 14h: Minimum Offer Price Rule ($1.00 USD per NFT) & Prevent Accidental Low-Value Purchases
   // Offers below $1.00 (e.g., $0.30, $0.40) are strictly prohibited even if profitable or allowed by market!
   const lowOffer030 = pricingEngine.evaluateOfferScenario({
     offerPriceUsd: 0.30,
-    floorPriceUsd: 2.00, // Floor is well above 40%
+    floorPriceUsd: 2.00, // Floor is well above 30%
     royaltyPercent: 0,
     minNetProfitUsd: 0.10,
     enforceFloorRatio: true
@@ -731,17 +731,94 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   assert.strictEqual(lowOffer040.decision, 'REJECT', 'Offer of $0.40 must be strictly REJECTED');
   assert.strictEqual(lowOffer040.checkMinOfferPassed, false, 'checkMinOfferPassed must be false for $0.40');
 
-  // Offer at exactly $1.00 with $1.40 floor passes
+  // Offer at exactly $1.00 with $1.30 floor passes
   const validMinOffer = pricingEngine.evaluateOfferScenario({
     offerPriceUsd: 1.00,
-    floorPriceUsd: 1.40,
+    floorPriceUsd: 1.30,
     royaltyPercent: 0,
     minNetProfitUsd: 0.10,
     enforceFloorRatio: true
   });
   assert.strictEqual(validMinOffer.checkMinOfferPassed, true, 'checkMinOfferPassed must be true for $1.00');
-  assert.strictEqual(validMinOffer.checkFFloorRatioPassed, true, 'checkFFloorRatioPassed must be true for $1.00 offer with $1.40 floor');
-  console.log('Case 14h PASSED: Strictly rejected $0.30 and $0.40 offers; accepted $1.00 offer -> PASSED ✅\n');
+  assert.strictEqual(validMinOffer.checkFFloorRatioPassed, true, 'checkFFloorRatioPassed must be true for $1.00 offer with $1.30 floor');
+  console.log('Case 14h PASSED: Strictly rejected $0.30 and $0.40 offers; accepted $1.00 offer -> PASSED ✅');
+
+  // --------------------------------------------------------------------------
+  // TEST 14i: NFT Offer Profitability Rule — Creator Fee Included in Profit Calculation
+  // User Prompt Example:
+  // "If the highest existing offer is $1.00, the bot considers placing an offer of $1.25,
+  // and the floor price is $1.50, the bot must not automatically accept this trade.
+  // If a 10% creator fee and other costs eliminate the expected profit, the offer must be rejected.
+  // Core rule: High sales volume alone is not enough. The bot may place an offer only when
+  // the floor-price requirement is satisfied and the trade is expected to generate the required net profit after all applicable fees."
+  // --------------------------------------------------------------------------
+  console.log('--- Case 14i: User Example — Highest Offer $1.00, Considers $1.25, Floor $1.50, 10% Creator Fee ---');
+  const userExampleEval = pricingEngine.evaluateProposedOffer({
+    highestExistingOfferUsd: 1.00,
+    proposedOfferUsd: 1.25,
+    currentFloorUsd: 1.50,
+    creatorFeePercent: 10.0,
+    marketplaceFeePercent: 0.5,
+    estimatedGasUsd: 0.01,
+    minNetProfitUsd: 0.20,
+    minMarginPercent: 15.0,
+    sales3Hours: 50 // HIGH SALES VOLUME!
+  });
+
+  // Verify Formula 1: Floor Price ($1.50) >= Offer Price ($1.25) * 1.30 = $1.625 -> FAILS!
+  assert.strictEqual(userExampleEval.floorRequirementPassed, false, 'Formula 1 must fail: $1.50 < $1.25 * 1.30 = $1.625');
+  assert.strictEqual(userExampleEval.requiredFloorUsd, 1.63, 'Required floor should be $1.63 (or 1.625)');
+
+  // Verify Formula 2: Total Acquisition and Selling Costs:
+  // Purchase price: $1.25, Creator fee (10%): $0.15, Marketplace fee (0.5%): $0.0075, Gas: $0.01
+  // Total costs: $1.4175 (~$1.42)
+  // Expected Net Profit: $1.50 - $1.4175 = $0.0825 < $0.20 min threshold and 6.6% < 15% min margin
+  assert.strictEqual(userExampleEval.costsBreakdown.purchasePriceUsd, 1.25, 'Purchase price must be $1.25');
+  assert.strictEqual(userExampleEval.costsBreakdown.creatorFeeUsd, 0.15, '10% creator fee must be $0.15');
+  assert(userExampleEval.totalAcquisitionAndSellingCostsUsd >= 1.41, 'Total costs must include purchase price, creator fees, marketplace fees, gas');
+  assert(userExampleEval.expectedNetProfitUsd < 0.20, 'Net profit after creator fees is below required $0.20 threshold');
+  assert.strictEqual(userExampleEval.netProfitabilityPassed, false, 'Formula 2 must fail due to insufficient profit after creator fee');
+
+  // Verify Core Rule: High sales volume alone is not enough!
+  assert.strictEqual(userExampleEval.salesVolumePassed, true, 'Sales volume is high (50 sales)');
+  assert.strictEqual(userExampleEval.decision, 'REJECT', 'Bot must REJECT trade despite high sales volume');
+  assert.strictEqual(userExampleEval.isAcceptable, false, 'Trade is not acceptable');
+  console.log('Case 14i PASSED: User Example rejected due to 30% floor requirement AND 10% creator fee eliminating profit (high volume cannot override) ✅');
+
+  // Case 14j: Trade where Floor requirement passes ($1.25 offer with $1.65 floor),
+  // but high creator fee + gas eliminates profit -> REJECT!
+  const highFeeReject = pricingEngine.evaluateProposedOffer({
+    proposedOfferUsd: 1.25,
+    currentFloorUsd: 1.65, // Floor is 32% higher (passes Formula 1: 1.65 >= 1.25 * 1.30 = 1.625)
+    creatorFeePercent: 10.0, // 10% creator fee ($0.165)
+    marketplaceFeePercent: 2.5, // 2.5% OpenSea fee ($0.041)
+    estimatedGasUsd: 0.25, // $0.25 gas
+    minNetProfitUsd: 0.20,
+    minMarginPercent: 15.0
+  });
+  assert.strictEqual(highFeeReject.floorRequirementPassed, true, 'Formula 1 passes: $1.65 >= $1.25 * 1.30');
+  assert.strictEqual(highFeeReject.netProfitabilityPassed, false, 'Formula 2 must fail: 10% creator fee + costs eliminate profit');
+  assert.strictEqual(highFeeReject.decision, 'REJECT', 'Trade must be rejected when creator fees eliminate profit');
+  console.log('Case 14j PASSED: Formula 1 passes but Formula 2 fails due to creator fee -> REJECTED ✅');
+
+  // Case 14k: Trade where both Formula 1 and Formula 2 pass -> ACCEPT!
+  // Offer $1.25, Floor $2.00 (60% higher), 5% creator fee ($0.10), 0.5% fee ($0.01), $0.01 gas
+  // Total costs: $1.25 + $0.10 + $0.01 + $0.01 = $1.37
+  // Net profit: $2.00 - $1.37 = $0.63 >= $0.20 (50.4% margin >= 15%)
+  const allPassTrade = pricingEngine.evaluateProposedOffer({
+    proposedOfferUsd: 1.25,
+    currentFloorUsd: 2.00,
+    creatorFeePercent: 5.0,
+    marketplaceFeePercent: 0.5,
+    estimatedGasUsd: 0.01,
+    minNetProfitUsd: 0.20,
+    minMarginPercent: 15.0,
+    sales3Hours: 15
+  });
+  assert.strictEqual(allPassTrade.floorRequirementPassed, true, 'Formula 1 passes');
+  assert.strictEqual(allPassTrade.netProfitabilityPassed, true, 'Formula 2 passes');
+  assert.strictEqual(allPassTrade.decision, 'ACCEPT', 'Offer must be ACCEPTED when floor requirement and net profit after fees are satisfied');
+  console.log('Case 14k PASSED: Trade meets Formula 1 (Floor >= Offer * 1.30) and Formula 2 (Net profit after all costs) -> ACCEPTED ✅\n');
 
   // --------------------------------------------------------------------------
   // TEST 15: NFT Re-Bidding & Simultaneous Offers Rule Verification

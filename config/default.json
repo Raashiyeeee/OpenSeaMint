@@ -22,7 +22,7 @@
   "liquidity": {
     "minSales3Hours": 10,
     "minUniqueWallets3Hours": 5,
-    "minFloorMultiplier": 1.40,
+    "minFloorMultiplier": 1.30,
     "floorRangeMinPercent": 80.0,
     "floorRangeMaxPercent": 135.0
   },

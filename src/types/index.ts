@@ -22,7 +22,7 @@ export interface CapitalConfig {
 export interface LiquidityConfig {
   minSales3Hours: number;           // Minimum 10 completed floor sales in last 3 hours in native ETH (WETH & offers excluded)
   minUniqueWallets3Hours: number;    // Minimum 5 unique wallets in last 3 hours
-  minFloorMultiplier?: number;      // Floor must be >= 1.40 * Offer (40% higher)
+  minFloorMultiplier?: number;      // Floor must be >= 1.30 * Offer (30% higher)
   floorRangeMinPercent?: number;    // Floor sales range min (e.g. 80%)
   floorRangeMaxPercent?: number;    // Floor sales range max (e.g. 135%)
   minSales24Hours?: number;
@@ -150,6 +150,10 @@ export interface ProfitCalculationResult {
   totalFeesUsd: number;
   estimatedGasCostEth: number;
   estimatedGasCostUsd: number;
+  expectedSaleRevenueUsd?: number;
+  purchasePriceUsd?: number;
+  creatorFeeUsd?: number;
+  totalCostsUsd?: number;
   netProfitEth: number;
   netProfitUsd: number;
   marginPercent: number;
