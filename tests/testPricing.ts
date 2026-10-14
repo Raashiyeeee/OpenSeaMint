@@ -1550,6 +1550,7 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
   (test19Api as any).cancelOffer = async () => ({ success: true });
   (test19Api as any).verifyOfferInactive = async () => ({ isInactive: true });
   (test19Api as any).postCollectionOffer = async () => ({ order_hash: 'offer_outbid_reentered' });
+  (test19Api as any).invalidateCollectionCache = () => undefined;
   (test19Seaport as any).getWethBalance = async () => 1.0;
 
   // Run outbid cancellation scan
@@ -1642,6 +1643,8 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     referenceFloorEth: 0.0025
   });
   (test19Api as any).postCollectionOffer = async () => ({ order_hash: 'offer_expired_reentered' });
+  // Competing top below our re-entry bid so the bot can reclaim #1 profitably
+  (test19Api as any).getTopCompetingCollectionOffer = async () => ({ priceEth: 0.0009, orderHash: 'lower_competitor' });
 
   // Process automatic 20-minute cancellations
   const expireResult = await test19Bidder.processAutomaticOfferCancellations(20);

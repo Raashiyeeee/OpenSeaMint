@@ -539,6 +539,21 @@ export class PricingEngine {
     }
     finalBidEth = roundedBidEth;
 
+    // Top-Priority (#1) after tick rounding: a $0.05 USD bump can round back down to the same 4-decimal
+    // price as the competing top (e.g. 0.0011 + ε → 0.0011). Bump by one Seaport tick when needed.
+    if (competitivePassed && topOfferEth > 0 && finalBidEth <= topOfferEth + 1e-12) {
+      const tickUp = roundToPrecision(Math.floor(topOfferEth * 10000 + 1.0000001) / 10000, 4);
+      if (tickUp <= maxProfitableBidEth + 1e-12 && tickUp > topOfferEth + 1e-12) {
+        finalBidEth = tickUp;
+      } else {
+        competitivePassed = false;
+        competitiveReason =
+          competitiveReason ||
+          `Competition Check Failed: Cannot beat top offer (${topOfferEth} ETH) by one Seaport tick (0.0001) within max profitable bid (${maxProfitableBidEth} ETH).`;
+        finalBidEth = topOfferEth;
+      }
+    }
+
     const bidPriceUsd = roundToPrecision(finalBidEth * ethPriceUsd, 2);
 
     // Formula 2: Total Acquisition and Selling Costs & Expected Net Profit

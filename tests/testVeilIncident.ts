@@ -46,6 +46,8 @@ const OS_FEE = { recipient: '0x0000a26b00c1f0df003000390027140000faa719', fee: 1
   (api as any).getListingContext = async () => ({ openseaFeeBps: 100, royaltyFeeBps: 0, fees: [OS_FEE], ethPriceUsd: ETH_USD, competitorEth });
   const cancelled: string[] = [];
   (api as any).cancelOffer = async (h: string) => { cancelled.push(h); return { success: true }; };
+  (api as any).getTopCompetingCollectionOffer = async () => null;
+  (api as any).invalidateCollectionCache = () => undefined;
   const orderStatus: Record<string, string> = {};
   (api as any).verifyOfferInactive = async (h: string) => {
     const st = orderStatus[h] || (cancelled.includes(h) ? 'CANCELLED' : 'ACTIVE');

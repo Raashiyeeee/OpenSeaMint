@@ -895,21 +895,57 @@ export class OpenSeaApiService {
   /**
    * Per-unit price (ETH) of an OpenSea offer object. price.value covers the whole order quantity,
    * so it is divided by the number of NFTs requested (consideration[0].startAmount) for multi-quantity offers.
+   * Falls back to Seaport offer[0].startAmount (WETH put up by the bidder) when price.* is missing.
    */
   public static perUnitOfferPriceEth(off: any): number {
-    const rawPrice = off?.price?.value ?? off?.price?.current?.value;
-    const decimals = off?.price?.decimals ?? off?.price?.current?.decimals ?? 18;
-    const total = parseFloat(rawPrice) / Math.pow(10, decimals);
-    if (!Number.isFinite(total) || total <= 0) return 0;
     const qtyRaw = off?.protocol_data?.parameters?.consideration?.[0]?.startAmount;
     const qty = qtyRaw !== undefined && Number(qtyRaw) > 0 ? Number(qtyRaw) : 1;
-    return total / qty;
+
+    const rawPrice = off?.price?.value ?? off?.price?.current?.value;
+    const decimals = off?.price?.decimals ?? off?.price?.current?.decimals ?? 18;
+    if (rawPrice !== undefined && rawPrice !== null && rawPrice !== '') {
+      const total = parseFloat(String(rawPrice)) / Math.pow(10, decimals);
+      if (Number.isFinite(total) && total > 0) return total / qty;
+    }
+
+    // Fallback: Seaport offer side is the WETH the bidder escrows for the whole order
+    const offerAmount = off?.protocol_data?.parameters?.offer?.[0]?.startAmount;
+    if (offerAmount !== undefined && offerAmount !== null) {
+      const total = parseFloat(String(offerAmount)) / 1e18;
+      if (Number.isFinite(total) && total > 0) return total / qty;
+    }
+    return 0;
   }
 
   /**
-   * Highest live collection offer that is NOT ours. Used for Cancel-When-Outbid detection.
-   * Intentionally independent of mint / floor / liquidity gates — outbid cancel must still fire
-   * even when the collection is no longer eligible for a new offer.
+   * Fetches collection offers with pagination (follows `next` until exhausted or maxPages).
+   * Uses `/offers/collection/{slug}` (collection offers) — the book the bot competes on.
+   */
+  private async fetchCollectionOffersPages(collectionSlug: string, maxPages: number = 5): Promise<any[]> {
+    const all: any[] = [];
+    let next: string | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const url = next
+        ? `/offers/collection/${collectionSlug}?limit=100&next=${encodeURIComponent(next)}`
+        : `/offers/collection/${collectionSlug}?limit=100`;
+      const data = (await this.client.get(url)).data;
+      const batch: any[] = data?.offers || [];
+      all.push(...batch);
+      next = data?.next;
+      if (!next || batch.length === 0) break;
+    }
+    return all;
+  }
+
+  /**
+   * Highest live collection offer that is NOT ours. Used for Cancel-When-Outbid detection and
+   * Top-Priority bid sizing. Intentionally independent of mint / floor / liquidity gates —
+   * outbid cancel must still fire even when the collection is no longer eligible for a new offer.
+   *
+   * Returns:
+   *  - `{ priceEth, orderHash }` when a competitor exists
+   *  - `null` when the book was read and no competing offers exist
+   *  - `undefined` when the lookup failed (MUST NOT be treated as "we are #1")
    */
   public async getTopCompetingCollectionOffer(
     collectionSlug: string,
@@ -920,7 +956,7 @@ export class OpenSeaApiService {
         this.offersCache,
         collectionSlug,
         this.ttl('offers', 20_000),
-        async () => (await this.client.get(`/offers/collection/${collectionSlug}/all?limit=100`)).data?.offers || [],
+        () => this.fetchCollectionOffersPages(collectionSlug),
         opts.fresh === true
       );
       const excludeHashes = new Set((opts.excludeOrderHashes || []).map((h) => h.toLowerCase()).filter(Boolean));
@@ -929,7 +965,7 @@ export class OpenSeaApiService {
       for (const off of offers) {
         const hash = (off?.order_hash || '').toLowerCase();
         if (hash && excludeHashes.has(hash)) continue;
-        const offerer = (off?.protocol_data?.parameters?.offerer || '').toLowerCase();
+        const offerer = (off?.protocol_data?.parameters?.offerer || off?.maker?.address || '').toLowerCase();
         if (excludeAddr && offerer && offerer === excludeAddr) continue;
         const offerEth = OpenSeaApiService.perUnitOfferPriceEth(off);
         if (offerEth > 0 && (!best || offerEth > best.priceEth)) {

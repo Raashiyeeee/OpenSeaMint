@@ -186,6 +186,23 @@ export class CollectionBidderStrategy {
     }
 
     if (!(bidPriceEth > 0)) return block('Invalid bid price.');
+
+    // Rule 1 (Top-Priority Offers): never post a bid that is already below the live competing top.
+    // Fresh competing book — independent of cached marketData.topOfferEth.
+    const ourAddress = this.seaportService.getWalletAddress();
+    const competing = await this.apiService.getTopCompetingCollectionOffer(collectionSlug, {
+      excludeAddress: ourAddress,
+      fresh: true
+    });
+    if (competing === undefined) {
+      return block('Top-Priority Offer Rule: competing offers could not be verified; refusing to place below #1.');
+    }
+    if (competing && bidPriceEth <= competing.priceEth + 1e-12) {
+      return block(
+        `Top-Priority Offer Rule: bid (${bidPriceEth} ETH) would not be #1 (competing top ${competing.priceEth} ETH). Adjust before placing.`
+      );
+    }
+
     const ethPriceUsd = fresh.ethPriceUsd || 2700;
     const gasUsd = this.config.networks?.[networkKey]?.estimatedGasCostUsd ?? (networkKey === 'mainnet' ? 3.5 : 0.01);
     const gasEth = gasUsd / ethPriceUsd;
@@ -213,6 +230,8 @@ export class CollectionBidderStrategy {
     if (netProfitEth * ethPriceUsd < minNetProfitUsd - 0.005) {
       return block(`Expected net profit ($${(netProfitEth * ethPriceUsd).toFixed(2)}) below minimum ($${minNetProfitUsd.toFixed(2)}).`);
     }
+    // Keep freshData.topOfferEth aligned with the live competing book used for the #1 check
+    if (competing) fresh.topOfferEth = competing.priceEth;
     return { passed: true, reason: 'Final validation passed', freshData: fresh };
   }
 
@@ -294,6 +313,7 @@ export class CollectionBidderStrategy {
       if (verification.isInactive) {
         // Verification confirmed: release capital
         this.inventoryManager.confirmOfferCancellation(orderHash);
+        this.apiService.invalidateCollectionCache(offer.collectionSlug);
         logger.info(
           { orderHash, collection: offer.collectionSlug, network, reason },
           'Automatic Offer Cancellation: Cancellation verified and confirmed ✅ Capital released.'
@@ -367,14 +387,18 @@ export class CollectionBidderStrategy {
 
   /**
    * Highest competing offer price (ETH) for an active offer we hold.
-   * Uses a lightweight offers lookup — never gated by mint / floor / liquidity eligibility.
+   * Uses a FRESH lightweight offers lookup — never gated by mint / floor / liquidity eligibility.
+   *
+   * Returns `undefined` when the competing book cannot be read (caller must NOT treat that as "we are #1").
    */
-  public async getCompetingTopOfferEth(offer: ActiveOffer): Promise<number> {
+  public async getCompetingTopOfferEth(offer: ActiveOffer): Promise<number | undefined> {
     const ourAddress = this.seaportService.getWalletAddress();
     const competing = await this.apiService.getTopCompetingCollectionOffer(offer.collectionSlug, {
       excludeOrderHashes: [offer.orderHash],
-      excludeAddress: ourAddress
+      excludeAddress: ourAddress,
+      fresh: true
     });
+    if (competing === undefined) return undefined;
     let competingTopEth = competing?.priceEth || 0;
     // Single-NFT offers also compete with the best offer on that specific token
     if (offer.tokenId) {
@@ -384,6 +408,27 @@ export class CollectionBidderStrategy {
       }
     }
     return competingTopEth;
+  }
+
+  /**
+   * Rule 2 — One Active Offer Per NFT/collection: if we somehow have multiple live offers on the same
+   * collection, cancel every duplicate except the highest-priced one (then outbid logic can raise/cancel it).
+   */
+  public async cancelDuplicateOffersForCollection(collectionSlug: string, contractAddress?: string): Promise<number> {
+    const live = this.inventoryManager.getLiveOffersForCollection(collectionSlug, contractAddress)
+      .filter((o) => o.status === 'ACTIVE' || o.status === 'CANCELLATION_FAILED');
+    if (live.length <= 1) return 0;
+    const sorted = [...live].sort((a, b) => b.priceEth - a.priceEth);
+    let cancelled = 0;
+    for (const dup of sorted.slice(1)) {
+      logger.warn(
+        { slug: collectionSlug, orderHash: dup.orderHash, priceEth: dup.priceEth, keepHash: sorted[0].orderHash },
+        'One Active Offer Rule: cancelling duplicate simultaneous offer on the same collection'
+      );
+      const res = await this.cancelAndVerifyOffer(dup, 'One Active Offer Per NFT: duplicate simultaneous offer');
+      if (res.success) cancelled++;
+    }
+    return cancelled;
   }
 
   /**
@@ -411,7 +456,18 @@ export class CollectionBidderStrategy {
 
     for (const offer of activeOffers) {
       try {
+        // Rule 2: collapse duplicate simultaneous offers on the same collection first
+        await this.cancelDuplicateOffersForCollection(offer.collectionSlug, offer.contractAddress);
+
         const competingTopEth = await this.getCompetingTopOfferEth(offer);
+        if (competingTopEth === undefined) {
+          logger.warn(
+            { orderHash: offer.orderHash, collection: offer.collectionSlug },
+            'Cancel When Outbid: competing offers unavailable — cannot confirm #1 priority; will retry next cycle (offer left active).'
+          );
+          pending++;
+          continue;
+        }
         if (competingTopEth > offer.priceEth + 1e-12) {
           logger.info(
             {
@@ -428,6 +484,7 @@ export class CollectionBidderStrategy {
             `Outbid by higher offer (${competingTopEth} ETH > ${offer.priceEth} ETH)`
           );
           if (res.success) {
+            this.apiService.invalidateCollectionCache(offer.collectionSlug);
             cancelled++;
           } else {
             const currentOffer = this.inventoryManager.getActiveOffer(offer.orderHash);
@@ -572,7 +629,8 @@ export class CollectionBidderStrategy {
       return;
     }
 
-    // 3.0. Outbid / expiry cancel BEFORE eligibility gates — stale offers must not survive a mint/liquidity SKIP
+    // 3.0. One-offer + outbid / expiry cancel BEFORE eligibility gates — stale offers must not survive a mint/liquidity SKIP
+    await this.cancelDuplicateOffersForCollection(target.slug, target.contractAddress);
     const existingOffer = this.inventoryManager.getActiveOffer(target.slug);
     if (existingOffer) {
       if (
@@ -589,6 +647,13 @@ export class CollectionBidderStrategy {
 
       if (existingOffer.status === 'ACTIVE') {
         const competingTopEth = await this.getCompetingTopOfferEth(existingOffer);
+        if (competingTopEth === undefined) {
+          logger.warn(
+            { slug: target.slug, orderHash: existingOffer.orderHash },
+            'Cannot confirm #1 offer priority (competing book unavailable). Leaving existing offer; will retry next cycle.'
+          );
+          return;
+        }
         const isOutbid = competingTopEth > existingOffer.priceEth + 1e-12;
         const isExpired = Date.now() - existingOffer.createdTimestamp >= this.getOfferMaxAgeMinutes() * 60 * 1000;
 
@@ -610,27 +675,38 @@ export class CollectionBidderStrategy {
             );
             return;
           }
+          this.apiService.invalidateCollectionCache(target.slug);
 
           logger.info(
             { slug: target.slug, cancelReason },
             'Automatic Offer Cancellation: Cancellation verified ✅ Proceeding to recheck all trading criteria for re-entry...'
           );
         } else {
-          // Offer is active, NOT outbid, and within 20-minute expiry window
+          // Offer is active, confirmed #1, and within 20-minute expiry window
           logger.debug(
-            { slug: target.slug, network: targetNetwork, price: existingOffer.priceEth },
-            'Active offer already in place at top price and within 20-minute expiry window.'
+            { slug: target.slug, network: targetNetwork, price: existingOffer.priceEth, competingTopEth },
+            'Active offer already in place at #1 priority and within 20-minute expiry window.'
           );
           return;
         }
       }
     }
 
-    // 3. FETCH LATEST MARKET DATA (eligibility for NEW / re-entry offers only)
+    // 3. FETCH LATEST MARKET DATA (eligibility for NEW / re-entry offers only) + FRESH competing top for #1 sizing
     const marketData = await this.apiService.getCollectionMarketData(target.slug, target.contractAddress, targetNetwork);
     if (this.skipOrEarlyReject(marketData, target.slug, targetNetwork)) {
       return;
     }
+    const liveCompeting = await this.apiService.getTopCompetingCollectionOffer(target.slug, {
+      excludeAddress: this.seaportService.getWalletAddress(),
+      fresh: true
+    });
+    if (liveCompeting === undefined) {
+      logger.warn({ slug: target.slug }, 'OFFER SKIPPED: competing top offer unavailable — refusing to place without #1 confirmation.');
+      return;
+    }
+    // Always size against the live competing book (never stale/cached topOfferEth alone)
+    marketData.topOfferEth = liveCompeting?.priceEth || 0;
 
     // 3.5. NFT RECENT FLOOR SALES REQUIREMENT CHECK
     // The bot must place offers only on NFT collections with at least 10 or more completed
@@ -693,7 +769,7 @@ export class CollectionBidderStrategy {
       target
     );
 
-    // 6. PROFITABILITY CHECK (Check B) & CAPITAL CHECK (Check A)
+    // 6. PROFITABILITY CHECK (Check B) & CAPITAL CHECK (Check A) + Top-Priority (#1) guard
     if (!calculation.isProfitable) {
       logger.info(
         {
@@ -715,13 +791,26 @@ export class CollectionBidderStrategy {
     }
 
     // Ensure bid does not exceed configured ceiling
-    if (calculation.bidPriceEth > target.maxBidEth) {
+    if (target.maxBidEth && calculation.bidPriceEth > target.maxBidEth) {
       logger.debug(
         { slug: target.slug, network: targetNetwork, calculatedBid: calculation.bidPriceEth, maxCap: target.maxBidEth },
         'Calculated bid exceeds configured maxBidEth ceiling. Capping to maxBidEth.'
       );
       calculation.bidPriceEth = target.maxBidEth;
       calculation.bidPriceUsd = roundToPrecision(calculation.bidPriceEth * (marketData.ethPriceUsd || 2700), 2);
+    }
+
+    // Rule 1: after all caps, the posted bid MUST still be strictly above the competing top (or be the first offer)
+    if (marketData.topOfferEth > 0 && calculation.bidPriceEth <= marketData.topOfferEth + 1e-12) {
+      logger.info(
+        {
+          slug: target.slug,
+          bidPriceEth: calculation.bidPriceEth,
+          topOfferEth: marketData.topOfferEth
+        },
+        `TRADE REJECTED ❌ [${targetNetwork.toUpperCase()}]: Top-Priority Offer Rule — cannot place at #1 without violating profitability (bid ${calculation.bidPriceEth} ETH <= competing top ${marketData.topOfferEth} ETH).`
+      );
+      return;
     }
 
     // Final capital allocation check: offers + purchased NFTs within 70% of total capital (30% reserved)
@@ -876,6 +965,7 @@ export class CollectionBidderStrategy {
     };
 
     const res = await this.apiService.postCollectionOffer(postPayload);
+    this.apiService.invalidateCollectionCache(target.slug);
 
     // 9.5. Optional: Target recently minted tokens (Larry's offerSingle idea)
     if (target.singleTokenBids) {
@@ -1020,6 +1110,12 @@ export class CollectionBidderStrategy {
 
       if (existingItemOffer.status === 'ACTIVE') {
         const competingBestEth = await this.getCompetingTopOfferEth(existingItemOffer);
+        if (competingBestEth === undefined) {
+          return {
+            success: false,
+            reason: 'Cannot confirm #1 offer priority (competing book unavailable). Leaving existing item offer.'
+          };
+        }
         const isOutbid = competingBestEth > existingItemOffer.priceEth + 1e-12;
         const isExpired = Date.now() - existingItemOffer.createdTimestamp >= this.getOfferMaxAgeMinutes() * 60 * 1000;
 
@@ -1040,10 +1136,11 @@ export class CollectionBidderStrategy {
               reason: 'Cannot re-offer: Item offer cancellation could not be verified. Capital remains locked.'
             };
           }
+          this.apiService.invalidateCollectionCache(params.collectionSlug);
         } else {
           return {
             success: false,
-            reason: 'Active offer already in place on this item at top price and within 20-minute expiry window.'
+            reason: 'Active offer already in place on this item at #1 priority and within 20-minute expiry window.'
           };
         }
       }
@@ -1054,6 +1151,17 @@ export class CollectionBidderStrategy {
     if (this.skipOrEarlyReject(marketData, params.collectionSlug, targetNetwork)) {
       return { success: false, reason: marketData.dataUnavailableReason || marketData.earlyRejectReason || 'Rejected' };
     }
+    const itemCompeting = await this.apiService.getTopCompetingCollectionOffer(params.collectionSlug, {
+      excludeAddress: this.seaportService.getWalletAddress(),
+      fresh: true
+    });
+    if (itemCompeting === undefined) {
+      return { success: false, reason: 'Competing top offer unavailable — refusing to place without #1 confirmation.' };
+    }
+    let itemTopEth = itemCompeting?.priceEth || 0;
+    const bestOnNft = await this.apiService.getBestNftOffer(params.collectionSlug, params.tokenId);
+    if (bestOnNft && bestOnNft.priceEth > itemTopEth) itemTopEth = bestOnNft.priceEth;
+    marketData.topOfferEth = itemTopEth;
 
     const nftCheck = this.inventoryManager.canPlaceOfferOnNft(params.contractAddress, params.tokenId);
     if (!nftCheck.allowed) {
@@ -1106,6 +1214,13 @@ export class CollectionBidderStrategy {
     if (params.maxBidEth && calculation.bidPriceEth > params.maxBidEth) {
       calculation.bidPriceEth = params.maxBidEth;
       calculation.bidPriceUsd = roundToPrecision(calculation.bidPriceEth * (marketData.ethPriceUsd || 2700), 2);
+    }
+
+    if (marketData.topOfferEth > 0 && calculation.bidPriceEth <= marketData.topOfferEth + 1e-12) {
+      return {
+        success: false,
+        reason: `Top-Priority Offer Rule: cannot place at #1 without violating profitability (bid ${calculation.bidPriceEth} ETH <= competing top ${marketData.topOfferEth} ETH).`
+      };
     }
 
     // 3. Comply with the 70% capital allocation limit (30% reserved) and offer-cycle pause
@@ -1216,6 +1331,7 @@ export class CollectionBidderStrategy {
     };
 
     const res = await this.apiService.postSingleOffer(targetNetwork, singlePayload);
+    this.apiService.invalidateCollectionCache(params.collectionSlug);
     const orderHash = res?.order_hash || `sim_single_${params.tokenId}_${Date.now()}`;
 
     // 6. Register Active Offer & Independently Track NFT
@@ -1234,7 +1350,7 @@ export class CollectionBidderStrategy {
       signature
     });
 
-    logger.info({ contractAddress: params.contractAddress, tokenId: params.tokenId, orderHash }, 'Item offer placed successfully and tracked independently');
+    logger.info({ contractAddress: params.contractAddress, tokenId: params.tokenId, orderHash, priceEth: calculation.bidPriceEth }, 'Item offer placed at #1 priority and tracked independently');
     return { success: true };
   }
 }
