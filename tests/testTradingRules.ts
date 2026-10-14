@@ -510,7 +510,7 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   // C5. Single-NFT outbid uses best offer on that NFT (and collection offers)
   const c5Inv = new InventoryManager(config);
   const c5Api = new OpenSeaApiService(config);
-  (c5Api as any).getCollectionMarketData = async () => baseMarketData({ topOfferEth: 0.0005 });
+  (c5Api as any).getTopCompetingCollectionOffer = async () => ({ priceEth: 0.0005 });
   (c5Api as any).getBestNftOffer = async () => ({ priceEth: 0.0012, orderHash: 'someone_else' });
   let c5Cancelled = 0;
   (c5Api as any).cancelOffer = async () => { c5Cancelled++; return { success: true }; };
@@ -522,10 +522,31 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   assert.strictEqual(c5Cancelled, 1);
   // own best offer must not count as outbid
   const c5bInv = new InventoryManager(config);
+  (c5Api as any).getTopCompetingCollectionOffer = async () => null;
   (c5Api as any).getBestNftOffer = async () => ({ priceEth: 0.001, orderHash: 'item_offer2' });
   const { bidder: c5bBidder } = makeBidder(c5Api, c5bInv);
   c5bInv.registerActiveOffer({ ...mkOffer(), orderHash: 'item_offer2', tokenId: '43', createdTimestamp: Date.now(), expiresTimestamp: Date.now() + 600000 });
   assert.strictEqual((await c5bBidder.processOutbidOfferCancellations()).cancelled, 0, 'Our own best offer is not an outbid');
+  // C5c. Outbid cancel MUST fire even when full market data would early-reject (e.g. mint gate)
+  const c5cInv = new InventoryManager(config);
+  const c5cApi = new OpenSeaApiService(config);
+  (c5cApi as any).getCollectionMarketData = async () => ({
+    ...baseMarketData(),
+    topOfferEth: 0,
+    earlyRejectReason: 'Mint not 100% complete',
+    mintCompleted: false,
+    mintStatusVerified: false
+  });
+  (c5cApi as any).getTopCompetingCollectionOffer = async () => ({ priceEth: 0.0015, orderHash: 'higher_bidder' });
+  let c5cCancelled = 0;
+  (c5cApi as any).cancelOffer = async () => { c5cCancelled++; return { success: true }; };
+  (c5cApi as any).verifyOfferInactive = async () => ({ isInactive: true, status: 'CANCELLED' });
+  const { bidder: c5cBidder } = makeBidder(c5cApi, c5cInv);
+  c5cInv.registerActiveOffer({ ...mkOffer(), orderHash: 'stale_outbid', priceEth: 0.001, createdTimestamp: Date.now(), expiresTimestamp: Date.now() + 600000 });
+  const c5cRes = await c5cBidder.processOutbidOfferCancellations();
+  assert.strictEqual(c5cRes.cancelled, 1, 'Outbid cancel must work even when getCollectionMarketData early-rejects');
+  assert.strictEqual(c5cCancelled, 1);
+  assert.strictEqual(c5cInv.getActiveOffer('stale_outbid'), undefined, 'Stale outbid offer must be removed');
   // C6. Multi-quantity offers are compared per unit
   assert.strictEqual(
     OpenSeaApiService.perUnitOfferPriceEth({ price: { value: '3000000000000000', decimals: 18 }, protocol_data: { parameters: { consideration: [{ startAmount: '3' }] } } }),
@@ -577,7 +598,7 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   const cfgRaw = fs.readFileSync(path.resolve(__dirname, '../config/default.json'), 'utf8');
   const envRaw = fs.readFileSync(path.resolve(__dirname, '../.env.example'), 'utf8');
   assert(!/alch_[A-Za-z0-9]+/.test(cfgRaw) && !/alch_[A-Za-z0-9]+/.test(envRaw), 'No Alchemy key may be committed');
-  console.log('Case C1-C8 PASSED: OpenSea chain/status/cancel semantics, per-NFT outbid, per-unit offers, sale-vs-transfer, no committed RPC keys ✅\n');
+  console.log('Case C1-C8 PASSED: OpenSea chain/status/cancel semantics, per-NFT outbid (incl. when market-data early-rejects), per-unit offers, sale-vs-transfer, no committed RPC keys ✅\n');
 
   // ------------------------------------------------------------------------
   // RULES A-E: 40% net margin, minimum acceptable floor, creator fee, final validation, auto-listing

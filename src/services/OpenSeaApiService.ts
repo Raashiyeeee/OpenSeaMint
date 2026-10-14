@@ -485,15 +485,17 @@ export class OpenSeaApiService {
       return unavailable('floor price (no ETH floor reported)', undefined, { ...feeFields, ...mintFields });
     }
 
-    // STAGE 5 (cached ~20s): best collection offers (competitiveness / outbid detection)
+    // STAGE 5 (cached ~20s): best competing collection offers (excludes our own wallet / for bid sizing)
     let topOfferEth = 0; // Default 0 (never default to dummy 0.04 ETH)
     try {
-      const offers: any[] = await this.cached(this.offersCache, collectionSlug, this.ttl('offers', 20_000), async () => (await this.client.get(`/offers/collection/${collectionSlug}/all?limit=100`)).data?.offers || [], fresh);
-      for (const off of offers) {
-        const offerEth = OpenSeaApiService.perUnitOfferPriceEth(off);
-        // Only compete with valid collection offers that are strictly below floor price
-        if (offerEth > 0 && offerEth < floorPriceEth && offerEth > topOfferEth) {
-          topOfferEth = offerEth;
+      const competing = await this.getTopCompetingCollectionOffer(collectionSlug, {
+        excludeAddress: this.ownWalletAddress,
+        fresh
+      });
+      if (competing && competing.priceEth > 0) {
+        // Only use offers strictly below floor for competitive bid sizing
+        if (competing.priceEth < floorPriceEth) {
+          topOfferEth = competing.priceEth;
         }
       }
     } catch (err: any) {
@@ -902,6 +904,43 @@ export class OpenSeaApiService {
     const qtyRaw = off?.protocol_data?.parameters?.consideration?.[0]?.startAmount;
     const qty = qtyRaw !== undefined && Number(qtyRaw) > 0 ? Number(qtyRaw) : 1;
     return total / qty;
+  }
+
+  /**
+   * Highest live collection offer that is NOT ours. Used for Cancel-When-Outbid detection.
+   * Intentionally independent of mint / floor / liquidity gates — outbid cancel must still fire
+   * even when the collection is no longer eligible for a new offer.
+   */
+  public async getTopCompetingCollectionOffer(
+    collectionSlug: string,
+    opts: { excludeOrderHashes?: string[]; excludeAddress?: string; fresh?: boolean } = {}
+  ): Promise<{ priceEth: number; orderHash?: string } | null | undefined> {
+    try {
+      const offers: any[] = await this.cached(
+        this.offersCache,
+        collectionSlug,
+        this.ttl('offers', 20_000),
+        async () => (await this.client.get(`/offers/collection/${collectionSlug}/all?limit=100`)).data?.offers || [],
+        opts.fresh === true
+      );
+      const excludeHashes = new Set((opts.excludeOrderHashes || []).map((h) => h.toLowerCase()).filter(Boolean));
+      const excludeAddr = (opts.excludeAddress || this.ownWalletAddress || '').toLowerCase();
+      let best: { priceEth: number; orderHash?: string } | null = null;
+      for (const off of offers) {
+        const hash = (off?.order_hash || '').toLowerCase();
+        if (hash && excludeHashes.has(hash)) continue;
+        const offerer = (off?.protocol_data?.parameters?.offerer || '').toLowerCase();
+        if (excludeAddr && offerer && offerer === excludeAddr) continue;
+        const offerEth = OpenSeaApiService.perUnitOfferPriceEth(off);
+        if (offerEth > 0 && (!best || offerEth > best.priceEth)) {
+          best = { priceEth: offerEth, orderHash: off?.order_hash };
+        }
+      }
+      return best;
+    } catch (err: any) {
+      logger.warn({ slug: collectionSlug, err: err.message }, 'Failed to fetch competing collection offers for outbid check');
+      return undefined;
+    }
   }
 
   /**
