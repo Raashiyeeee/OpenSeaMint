@@ -62,6 +62,13 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   (seaport as any).createSignedCollectionOffer = async () => ({ orderComponents: {}, signature: '0xsig' });
   (seaport as any).createSignedItemOffer = async () => ({ orderComponents: {}, signature: '0xsig' });
   (seaport as any).isOrderCancelledOnChain = async () => false; // never touch a live RPC in tests
+  // Default: no competing offers (tests that exercise #1 / outbid stub this explicitly). Never hit the live API.
+  if (!(api as any).getTopCompetingCollectionOffer || (api as any).getTopCompetingCollectionOffer === OpenSeaApiService.prototype.getTopCompetingCollectionOffer) {
+    (api as any).getTopCompetingCollectionOffer = async () => null;
+  }
+  if (!(api as any).invalidateCollectionCache) {
+    (api as any).invalidateCollectionCache = () => undefined;
+  }
   const bidder = new CollectionBidderStrategy(config, api, pricingEngine, seaport, inv, new CircuitBreaker(config));
   return { bidder, seaport };
 }
@@ -547,11 +554,33 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   assert.strictEqual(c5cRes.cancelled, 1, 'Outbid cancel must work even when getCollectionMarketData early-rejects');
   assert.strictEqual(c5cCancelled, 1);
   assert.strictEqual(c5cInv.getActiveOffer('stale_outbid'), undefined, 'Stale outbid offer must be removed');
-  // C6. Multi-quantity offers are compared per unit
+  // C6. Multi-quantity offers are compared per unit (price.* and Seaport offer[0] fallback)
   assert.strictEqual(
     OpenSeaApiService.perUnitOfferPriceEth({ price: { value: '3000000000000000', decimals: 18 }, protocol_data: { parameters: { consideration: [{ startAmount: '3' }] } } }),
     0.001
   );
+  assert.strictEqual(
+    OpenSeaApiService.perUnitOfferPriceEth({
+      protocol_data: { parameters: { offer: [{ startAmount: '2000000000000000' }], consideration: [{ startAmount: '2' }] } }
+    }),
+    0.001,
+    'Seaport offer[0].startAmount fallback must yield per-unit ETH'
+  );
+  // C6b. Duplicate simultaneous offers on one collection are collapsed to a single live offer
+  const c6Inv = new InventoryManager(config);
+  const c6Api = new OpenSeaApiService(config);
+  (c6Api as any).getTopCompetingCollectionOffer = async () => null;
+  let c6Cancelled = 0;
+  (c6Api as any).cancelOffer = async () => { c6Cancelled++; return { success: true }; };
+  (c6Api as any).verifyOfferInactive = async () => ({ isInactive: true, status: 'CANCELLED' });
+  (c6Api as any).invalidateCollectionCache = () => undefined;
+  const { bidder: c6Bidder } = makeBidder(c6Api, c6Inv);
+  c6Inv.registerActiveOffer({ ...mkOffer(), orderHash: 'dup_a', priceEth: 0.001, createdTimestamp: Date.now(), expiresTimestamp: Date.now() + 600000 });
+  c6Inv.registerActiveOffer({ ...mkOffer(), orderHash: 'dup_b', priceEth: 0.0008, createdTimestamp: Date.now(), expiresTimestamp: Date.now() + 600000 });
+  assert.strictEqual(await c6Bidder.cancelDuplicateOffersForCollection('c2', ZERO), 1, 'Lower duplicate must be cancelled');
+  assert.strictEqual(c6Cancelled, 1);
+  assert.strictEqual(c6Inv.getLiveOffersForCollection('c2').length, 1, 'Exactly one live offer remains');
+  assert.strictEqual(c6Inv.getLiveOffersForCollection('c2')[0].orderHash, 'dup_a', 'Highest-priced offer is kept');
   // C7. Transfers vs sales: only a confirmed sale event marks SOLD and triggers a wrap
   const c7Inv = new InventoryManager(config);
   const c7Api = new OpenSeaApiService(config);
@@ -627,7 +656,9 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   // C + D. Final pre-offer validation on FRESH data at the exact bid
   const dApi = new OpenSeaApiService(config);
   let freshData = baseMarketData();
+  let dCompeting: { priceEth: number; orderHash?: string } | null | undefined = null;
   (dApi as any).getCollectionMarketData = async () => freshData;
+  (dApi as any).getTopCompetingCollectionOffer = async () => dCompeting;
   const { bidder: dBidder } = makeBidder(dApi, new InventoryManager(config));
   const fv = (bid: number) => dBidder.finalPreOfferValidation({ collectionSlug: 'rules-collection', contractAddress: ZERO, networkKey: 'robinhood', bidPriceEth: bid });
   // floor 0.0014 >= 1.30 * 0.001 but < min acceptable floor (~0.00141) -> reject
@@ -637,6 +668,18 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   assert(/minimum acceptable floor/.test(dRes.reason), dRes.reason);
   freshData = baseMarketData({ floorPriceEth: 0.0016, referenceFloorEth: 0.0016 });
   assert.strictEqual((await fv(0.001)).passed, true, 'Floor above min acceptable floor passes');
+  // Top-Priority: bid at/below live competing top must be rejected before posting
+  dCompeting = { priceEth: 0.0012, orderHash: 'higher_bidder' };
+  dRes = await fv(0.001);
+  assert.strictEqual(dRes.passed, false, 'Bid below competing top must fail final validation');
+  assert(/Top-Priority Offer Rule/.test(dRes.reason), dRes.reason);
+  dCompeting = { priceEth: 0.0009, orderHash: 'lower_bidder' };
+  assert.strictEqual((await fv(0.001)).passed, true, 'Bid strictly above competing top passes #1 check');
+  dCompeting = undefined;
+  dRes = await fv(0.001);
+  assert.strictEqual(dRes.passed, false, 'Unavailable competing book must fail closed');
+  assert(/competing offers could not be verified/.test(dRes.reason), dRes.reason);
+  dCompeting = null;
   // mandatory 5% creator fee included -> 0.0016 floor at 0.00108 offer no longer reaches 40%
   freshData = baseMarketData({ floorPriceEth: 0.0016, referenceFloorEth: 0.0016, royaltyFeeBps: 500 });
   assert.strictEqual((await fv(0.00108)).passed, false, 'Non-disableable creator fee counted in net profit');
@@ -659,7 +702,7 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   assert.strictEqual((await fv(0.001)).passed, false, 'Recent sales re-checked in final validation');
   (dApi as any).getCollectionMarketData = async () => { throw new Error('down'); };
   assert.strictEqual((await fv(0.001)).passed, false, 'Unfetchable fresh data rejects');
-  console.log('Case C/D PASSED: Final validation (fresh data) checks mint, sales, dump, creator-fee status, 1.30x and 40% min floor ✅');
+  console.log('Case C/D PASSED: Final validation (fresh data) checks mint, sales, dump, creator-fee status, 1.30x, 40% min floor, and Top-Priority #1 ✅');
 
   // E. Auto-listing & competitive repricing
   const eApi = new OpenSeaApiService(config);

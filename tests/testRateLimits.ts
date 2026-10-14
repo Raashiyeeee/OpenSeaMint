@@ -219,6 +219,8 @@ const err = (status: number, headers: any = {}) => Object.assign(new Error(`Requ
   let posted = 0;
   (sApi as any).postCollectionOffer = async () => { posted++; return {}; };
   (sApi as any).getCollectionMarketData = async () => mdFail;
+  (sApi as any).getTopCompetingCollectionOffer = async () => null;
+  (sApi as any).invalidateCollectionCache = () => undefined;
   const bidder = new CollectionBidderStrategy(cfg, sApi, pe, seaport, inv, new CircuitBreaker(cfg));
   assert.strictEqual(bidder.skipOrEarlyReject(mdFail, 'stage-col', 'robinhood'), true);
   await (bidder as any).processCollectionBid({ slug: 'stage-col', contractAddress: ZERO, enabled: true, maxInventory: 5 }, 'robinhood');
