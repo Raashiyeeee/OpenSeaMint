@@ -78,6 +78,44 @@ export class CollectionBidderStrategy {
    *     fee, applicable creator fee and gas) AND net profit >= configured minimum
    */
   /**
+   * One of our offers filled on this collection: cancel EVERY other live offer of ours on it immediately and verify
+   * each cancellation (a collection offer can fill again on any token).
+   */
+  public async cancelAllOffersForCollection(collectionSlug: string, contractAddress: string, reason: string = 'Offer filled on collection'): Promise<{ cancelled: number; failed: number }> {
+    const live = this.inventoryManager.getLiveOffersForCollection(collectionSlug, contractAddress);
+    let cancelled = 0;
+    let failed = 0;
+    for (const offer of live) {
+      const res = await this.cancelAndVerifyOffer(offer, reason);
+      if (res.success) cancelled++;
+      else failed++;
+    }
+    if (live.length > 0) {
+      logger.warn({ slug: collectionSlug, cancelled, failed }, `Offer filled on ${collectionSlug}: cancelled ${cancelled}/${live.length} remaining offers (verified)`);
+    }
+    return { cancelled, failed };
+  }
+
+  /**
+   * Fast purchase detection independent of the stream: checks each live offer's OpenSea order status.
+   * FULFILLED -> invokes onFilled (which finds the bought token in the wallet and lists it immediately).
+   */
+  public async checkOffersForFills(onFilled: (offer: ActiveOffer) => Promise<void>): Promise<number> {
+    let fills = 0;
+    for (const offer of this.inventoryManager.getAllActiveOffers()) {
+      if (offer.status !== 'ACTIVE' && offer.status !== 'CANCELLATION_PENDING') continue;
+      if (!offer.orderHash || offer.orderHash.startsWith('sim_')) continue;
+      const st = await this.apiService.verifyOfferInactive(offer.orderHash, offer.network || 'robinhood');
+      if ((st.status || '').toUpperCase() === 'FULFILLED') {
+        this.inventoryManager.markOfferFulfilled(offer.orderHash);
+        fills++;
+        await onFilled(offer);
+      }
+    }
+    return fills;
+  }
+
+  /**
    * Returns true (and logs) when the collection must not be evaluated further this cycle:
    *  - data unavailable after retries -> "SKIPPED (data unavailable, will retry)" (NOT a 0/10 rejection; never offers)
    *  - rejected by a cheap check (mint-out / creator fee) before sales were fetched
@@ -105,9 +143,16 @@ export class CollectionBidderStrategy {
     targetConfig?: any;
   }): Promise<{ passed: boolean; reason: string; freshData?: CollectionMarketData }> {
     const { collectionSlug, contractAddress, networkKey, bidPriceEth, targetConfig } = params;
+    // Collection Re-Offer Rule (covers collection, single-token and item offers and every re-offer)
+    const collectionCheck = this.inventoryManager.canOfferOnCollection(collectionSlug, contractAddress);
+    if (!collectionCheck.allowed) {
+      logger.error({ slug: collectionSlug, reason: collectionCheck.reason }, `FINAL OFFER-EXECUTION BLOCKED 🛑: ${collectionCheck.reason}`);
+      return { passed: false, reason: collectionCheck.reason! };
+    }
     let fresh: CollectionMarketData;
     try {
-      fresh = await this.apiService.getCollectionMarketData(collectionSlug, contractAddress, networkKey);
+      // fresh: floor / offers re-read now (no cache) so a falling floor or our own new listing is never used stale
+      fresh = await this.apiService.getCollectionMarketData(collectionSlug, contractAddress, networkKey, { fresh: true });
     } catch (err: any) {
       return { passed: false, reason: `Final validation could not fetch fresh market data (${err.message}).` };
     }
@@ -494,6 +539,13 @@ export class CollectionBidderStrategy {
 
     const canBid = this.inventoryManager.canBidOnCollection(target.slug, target.maxInventory ?? 5);
     if (!canBid) return;
+
+    // Collection Re-Offer Rule: no new offers while we hold any unsold NFT from this collection
+    const collectionCheck = this.inventoryManager.canOfferOnCollection(target.slug, target.contractAddress);
+    if (!collectionCheck.allowed) {
+      logger.info({ slug: target.slug, network: targetNetwork, reason: collectionCheck.reason }, `OFFER BLOCKED: ${collectionCheck.reason}`);
+      return;
+    }
 
     // 2. CHECK AVAILABLE CAPITAL
     const availableCapitalUsd = this.inventoryManager.getAvailableCapitalUsd();

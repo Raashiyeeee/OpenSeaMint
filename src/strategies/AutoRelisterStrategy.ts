@@ -5,6 +5,9 @@ import { SeaportService } from '../services/SeaportService';
 import { InventoryManager } from '../services/InventoryManager';
 import { CircuitBreaker } from '../security/CircuitBreaker';
 import { logger } from '../utils/logger';
+import { runHighPriority } from '../utils/OpenSeaRateLimiter';
+
+export type ListingAttemptResult = { outcome: 'LISTED' | 'HOLD' | 'UNAVAILABLE' | 'SKIPPED' | 'ERROR'; reason: string };
 
 export class AutoRelisterStrategy {
   private config: BotConfig;
@@ -13,6 +16,13 @@ export class AutoRelisterStrategy {
   private seaportService: SeaportService;
   private inventoryManager: InventoryManager;
   private circuitBreaker: CircuitBreaker;
+  /** Called when one of our offers fills on a collection (cancel all other offers there). */
+  private collectionFillHandler?: (collectionSlug: string, contractAddress: string) => Promise<void>;
+  /** NFTs with a listing attempt in progress (dedupes stream + order-status + wallet-scan detections). */
+  private listingInFlight = new Set<string>();
+  /** Retry delays for the instant-listing path (not the 15s cycle / 10-min reprice cooldown). */
+  public static readonly HOLD_RETRY_MS = 20_000;
+  public static readonly UNAVAILABLE_RETRY_MS = 5_000;
 
   constructor(
     config: BotConfig,
@@ -30,6 +40,130 @@ export class AutoRelisterStrategy {
     this.circuitBreaker = circuitBreaker;
   }
 
+  public setCollectionFillHandler(handler: (collectionSlug: string, contractAddress: string) => Promise<void>): void {
+    this.collectionFillHandler = handler;
+  }
+
+  /**
+   * SINGLE ENTRY POINT for every purchase detection (stream item_sold/item_transferred, our order FULFILLED,
+   * wallet scan). Idempotent. Records the NFT at the price of OUR offer that filled, cancels every other offer
+   * of ours on that collection, then lists immediately (high priority, fresh data, no cooldown/cache).
+   */
+  public async onPurchaseDetected(p: {
+    collectionSlug: string;
+    contractAddress: string;
+    tokenId: string;
+    network?: string;
+    orderHash?: string;
+    eventPriceEth?: number;
+    source: string;
+  }): Promise<ListingAttemptResult> {
+    const identifier = `${p.contractAddress.toLowerCase()}:${p.tokenId}`;
+    const existing = this.inventoryManager.getInventoryItem(identifier);
+    if (existing && existing.status !== 'SOLD' && existing.status !== 'TRANSFERRED') {
+      if (existing.status === 'LISTED') return { outcome: 'LISTED', reason: 'already listed' };
+      return this.attemptListing(existing, p.source);
+    }
+
+    const offer = this.inventoryManager.findOfferForPurchase(p.collectionSlug, p.contractAddress, p.tokenId, p.orderHash);
+    let acquiredPriceEth = offer?.priceEth ?? 0;
+    let costBasisNote = offer ? `our offer ${offer.orderHash}` : '';
+    if (!(acquiredPriceEth > 0) && p.eventPriceEth && p.eventPriceEth > 0) {
+      acquiredPriceEth = p.eventPriceEth;
+      costBasisNote = 'sale event price';
+    }
+    if (offer) this.inventoryManager.markOfferFulfilled(offer.orderHash);
+
+    const item: InventoryItem = {
+      identifier,
+      collectionSlug: p.collectionSlug || offer?.collectionSlug || '',
+      contractAddress: p.contractAddress,
+      tokenId: p.tokenId,
+      network: p.network || offer?.network,
+      acquiredPriceEth,
+      acquiredPriceUsd: offer?.priceUsd,
+      acquiredAtTimestamp: Date.now(),
+      status: 'PENDING_LISTING',
+      isExternalWalletItem: !offer
+    };
+    if (offer) this.inventoryManager.consumeFulfilledOffer(p.contractAddress, p.tokenId);
+    this.inventoryManager.addInventoryItem(item);
+    logger.info(
+      { identifier, slug: item.collectionSlug, source: p.source, acquiredPriceEth, costBasis: costBasisNote || 'UNKNOWN' },
+      `PURCHASE DETECTED (${p.source}): ${item.collectionSlug} #${p.tokenId}. Listing immediately.`
+    );
+
+    // Our offer filled -> cancel EVERY other live offer of ours on this collection now (verified)
+    if (this.collectionFillHandler) {
+      try {
+        await runHighPriority(() => this.collectionFillHandler!(item.collectionSlug, item.contractAddress));
+      } catch (err: any) {
+        logger.error({ slug: item.collectionSlug, err: err.message }, 'Failed to cancel remaining offers after fill (will retry via cancellation pass)');
+      }
+    }
+    return this.attemptListing(item, p.source);
+  }
+
+  /**
+   * Instant listing attempt with fresh data at high limiter priority. On HOLD / data unavailable, schedules a quick
+   * retry (processPendingListings) instead of waiting for the main cycle. Logs the reason every time.
+   */
+  public async attemptListing(item: InventoryItem, source: string = 'retry'): Promise<ListingAttemptResult> {
+    if (this.listingInFlight.has(item.identifier)) return { outcome: 'SKIPPED', reason: 'listing already in progress' };
+    this.listingInFlight.add(item.identifier);
+    const started = Date.now();
+    try {
+      const res = await runHighPriority(() => this.relistItem(item));
+      const now = Date.now();
+      if (res.outcome === 'LISTED') {
+        item.nextListingAttemptAt = undefined;
+        logger.info({ identifier: item.identifier, source, latencyMs: now - item.acquiredAtTimestamp, attemptMs: now - started }, 'INSTANT LISTING ✅');
+      } else if (res.outcome === 'HOLD' || res.outcome === 'UNAVAILABLE' || res.outcome === 'ERROR') {
+        const delay = res.outcome === 'HOLD' ? AutoRelisterStrategy.HOLD_RETRY_MS : AutoRelisterStrategy.UNAVAILABLE_RETRY_MS;
+        item.nextListingAttemptAt = now + delay;
+        logger.warn(
+          { identifier: item.identifier, slug: item.collectionSlug, tokenId: item.tokenId, outcome: res.outcome, reason: res.reason, retryInMs: delay },
+          `NOT LISTED (${res.outcome}): ${item.collectionSlug} #${item.tokenId} — ${res.reason}. Retrying in ${Math.round(delay / 1000)}s.`
+        );
+      }
+      return res;
+    } catch (err: any) {
+      item.nextListingAttemptAt = Date.now() + AutoRelisterStrategy.UNAVAILABLE_RETRY_MS;
+      logger.error({ identifier: item.identifier, err: err.message }, `NOT LISTED (ERROR): ${err.message}. Retrying soon.`);
+      return { outcome: 'ERROR', reason: err.message };
+    } finally {
+      this.listingInFlight.delete(item.identifier);
+    }
+  }
+
+  /**
+   * Finds NFTs of a collection in our wallet that we don't track yet (e.g. after our offer's order turned
+   * FULFILLED) and runs the purchase path for each. Returns how many were found.
+   */
+  public async detectNewHoldings(walletAddress: string, collectionSlug: string, network: string, source: string): Promise<number> {
+    const owned = await runHighPriority(() => this.apiService.getAccountNfts(walletAddress, collectionSlug, network));
+    if (!owned) return 0;
+    let found = 0;
+    for (const nft of owned) {
+      if (!nft.contract || !nft.identifier) continue;
+      const existing = this.inventoryManager.getInventoryItem(`${nft.contract.toLowerCase()}:${nft.identifier}`);
+      if (existing && existing.status !== 'SOLD' && existing.status !== 'TRANSFERRED') continue;
+      found++;
+      await this.onPurchaseDetected({ collectionSlug: nft.collection || collectionSlug, contractAddress: nft.contract, tokenId: String(nft.identifier), network, source });
+    }
+    return found;
+  }
+
+  /** Fast path (every ~2s, independent of the main cycle): retries due PENDING_LISTING / HOLDING items. */
+  public async processPendingListings(now: number = Date.now()): Promise<void> {
+    const due = this.inventoryManager
+      .getAllInventory()
+      .filter((i) => (i.status === 'PENDING_LISTING' || i.status === 'HOLDING') && (i.nextListingAttemptAt === undefined || i.nextListingAttemptAt <= now));
+    for (const item of due) {
+      await this.attemptListing(item, 'retry');
+    }
+  }
+
   /**
    * Called immediately when a new NFT is received in the trading wallet
    */
@@ -40,28 +174,7 @@ export class AutoRelisterStrategy {
     acquiredPriceEth: number,
     network?: string
   ): Promise<void> {
-    const identifier = `${contractAddress.toLowerCase()}:${tokenId}`;
-    logger.info({ identifier, acquiredPriceEth }, 'Triggering automated relist routine for newly acquired NFT');
-
-    const item: InventoryItem = {
-      identifier,
-      collectionSlug,
-      contractAddress,
-      tokenId,
-      network,
-      acquiredPriceEth,
-      acquiredAtTimestamp: Date.now(),
-      status: 'PENDING_LISTING'
-    };
-
-    this.inventoryManager.addInventoryItem(item);
-
-    try {
-      await this.relistItem(item);
-    } catch (err: any) {
-      logger.error({ identifier, error: err.message }, 'Failed to automatically relist item');
-      this.circuitBreaker.registerError(`Relist ${identifier}`, err);
-    }
+    await this.onPurchaseDetected({ collectionSlug, contractAddress, tokenId, network, eventPriceEth: acquiredPriceEth, source: 'acquired' });
   }
 
   /**
@@ -74,6 +187,7 @@ export class AutoRelisterStrategy {
     const ethPriceUsd = await this.apiService.getEthPriceUsd();
     // If holdings could not be fully read on ANY network, ownership is unknown: skip reconciliation this cycle
     let holdingsComplete = true;
+    const discovered: Array<{ collectionSlug: string; contractAddress: string; tokenId: string; network: string }> = [];
 
     for (const net of activeNetworks) {
       try {
@@ -98,33 +212,7 @@ export class AutoRelisterStrategy {
 
           const existing = this.inventoryManager.getInventoryItem(identifier);
           if (!existing) {
-            logger.info({ identifier, slug, net }, 'Discovered unlisted NFT in wallet during scan. Adding to relist queue!');
-            let acquiredPriceEth = 0.0004;
-            // A FULFILLED bot offer matching this NFT means the bot bought it: track as bot-acquired (counts toward capital)
-            const fulfilledOffer = this.inventoryManager.consumeFulfilledOffer(contractAddress, tokenId);
-            const matchingOffer = fulfilledOffer || this.inventoryManager.getActiveOffer(slug);
-            if (matchingOffer && matchingOffer.priceEth > 0) {
-              acquiredPriceEth = matchingOffer.priceEth;
-            } else {
-              try {
-                const marketData = await this.apiService.getCollectionMarketData(slug, contractAddress);
-                acquiredPriceEth = marketData.topOfferEth > 0 ? marketData.topOfferEth : (marketData.floorPriceEth * 0.85);
-              } catch {}
-            }
-
-            const newItem: InventoryItem = {
-              identifier,
-              collectionSlug: slug,
-              contractAddress,
-              tokenId,
-              network: net,
-              acquiredPriceEth,
-              acquiredPriceUsd: fulfilledOffer ? fulfilledOffer.priceUsd : undefined,
-              acquiredAtTimestamp: Date.now(),
-              status: 'PENDING_LISTING',
-              isExternalWalletItem: !fulfilledOffer
-            };
-            this.inventoryManager.addInventoryItem(newItem);
+            discovered.push({ collectionSlug: slug, contractAddress, tokenId, network: net });
           } else if (existing.status === 'HOLDING' && existing.acquiredPriceEth >= 0.003 && net === 'robinhood') {
             // Sanitize previously corrupted fallback prices
             const matchingOffer = this.inventoryManager.getActiveOffer(slug);
@@ -176,18 +264,13 @@ export class AutoRelisterStrategy {
       }
     }
 
-    // 2. Relist all unlisted or held items in inventory
-    const unlisted = this.inventoryManager
-      .getAllInventory()
-      .filter((i) => i.status === 'PENDING_LISTING' || i.status === 'HOLDING');
-
-    for (const item of unlisted) {
-      try {
-        await this.relistItem(item);
-      } catch (err: any) {
-        logger.error({ identifier: item.identifier, error: err.message }, 'Error during unlisted inventory relist scan');
-      }
+    // 1.5 NFTs found in the wallet that we don't track yet -> same purchase path as stream / order-status detection
+    for (const d of discovered) {
+      await this.onPurchaseDetected({ ...d, source: 'wallet-scan' });
     }
+
+    // 2. Retry listing of unlisted / held items that are due (same fast path as the 2s listing loop)
+    await this.processPendingListings();
 
     // 3. Continuous competitive monitoring of our ACTIVE listings
     await this.monitorListedInventory();
@@ -230,28 +313,30 @@ export class AutoRelisterStrategy {
     }
   }
 
-  private async relistItem(item: InventoryItem, knownCompetitorEth?: number): Promise<void> {
+  private async relistItem(item: InventoryItem, knownCompetitorEth?: number): Promise<ListingAttemptResult> {
     const ignored = this.config.general.ignoredCollections || ['robin-owls', 'robin-owls-269031093'];
     if (ignored.some((i) => item.collectionSlug.toLowerCase().includes(i.toLowerCase()) || item.contractAddress.toLowerCase().includes(i.toLowerCase()))) {
       item.status = 'ERROR';
       item.holdReason = 'Skipped: Collection configured in ignoredCollections';
       logger.info({ identifier: item.identifier, slug: item.collectionSlug }, 'Skipping excluded collection from relisting');
-      return;
+      return { outcome: 'SKIPPED', reason: item.holdReason };
     }
 
-    // 1. Fetch current collection floor & fees
+    // 1. Listing context: fees + lowest COMPETING listing, fetched fresh (never the offer pipeline's cached /
+    //    staged market data, whose mint-out / sales SKIPPED paths have nothing to do with selling what we own)
     const networkKey = item.network || this.config.general.network || 'robinhood';
-    const marketData = await this.apiService.getCollectionMarketData(
-      item.collectionSlug,
-      item.contractAddress,
-      networkKey
-    );
-    const wasListed = item.status === 'LISTED' && !!item.listingOrderId;
-    let competitorEth = knownCompetitorEth;
-    if (competitorEth === undefined) {
-      const comp = await this.apiService.getLowestCompetingListing(item.collectionSlug, this.seaportService.getWalletAddress());
-      if (comp) competitorEth = comp.priceEth;
+    const ctx = await this.apiService.getListingContext(item.collectionSlug, this.seaportService.getWalletAddress());
+    if (ctx.unavailableReason) {
+      return { outcome: 'UNAVAILABLE', reason: `market data unavailable (${ctx.unavailableReason})` };
     }
+    if (!(item.acquiredPriceEth > 0)) {
+      const reason = 'purchase price (cost basis) unknown: refusing to price a listing that could sell at a loss';
+      this.inventoryManager.updateHoldStatus(item.identifier, reason);
+      return { outcome: 'HOLD', reason };
+    }
+    const wasListed = item.status === 'LISTED' && !!item.listingOrderId;
+    const competitorEth = knownCompetitorEth ?? (ctx.competitorEth ?? undefined);
+    const marketData = { openseaFeeBps: ctx.openseaFeeBps, royaltyFeeBps: ctx.royaltyFeeBps, ethPriceUsd: ctx.ethPriceUsd, fees: ctx.fees };
 
     // 2. Find target collection configuration if exists
     const targetConfig = this.config.targetCollections.find(
@@ -259,10 +344,10 @@ export class AutoRelisterStrategy {
     );
     const targetProfitUsd = targetConfig?.targetNetProfitUsd || this.config.profitTargets.defaultMinNetProfitUsd;
 
-    // 3. Evaluate listing vs holding (Rule 8: Floor Dump Protection & Rule 6: No Loss Selling)
+    // 3. Price at the top competitive position that still meets the 40% net margin; HOLD only if impossible
     const listingEval = this.pricingEngine.evaluateListingOrHold(
       item.acquiredPriceEth,
-      marketData.floorPriceEth,
+      competitorEth ?? 0,
       {
         openseaFeeBps: marketData.openseaFeeBps,
         royaltyFeeBps: marketData.royaltyFeeBps,
@@ -274,24 +359,25 @@ export class AutoRelisterStrategy {
     );
 
     if (listingEval.action === 'HOLD') {
+      const usd = (eth?: number) => (eth !== undefined ? `${eth.toFixed(6)} ETH ($${(eth * marketData.ethPriceUsd).toFixed(2)})` : 'n/a');
+      const reason =
+        `market below profitable price: lowest competing listing ${usd(competitorEth)} vs minimum 40%-margin price ` +
+        `${usd(listingEval.minProfitablePriceEth)} for cost ${usd(item.acquiredPriceEth)} ` +
+        `(fees: marketplace ${marketData.openseaFeeBps} bps, creator ${marketData.royaltyFeeBps} bps)`;
       if (wasListed) {
         // Keep the existing listing: it is already priced at/above the 40%-margin price (never a loss).
-        item.holdReason = `Competitor below profitable price; keeping current listing at ${item.currentListingPriceEth} ETH. ${listingEval.reason}`;
+        item.holdReason = `Competitor below profitable price; keeping current listing at ${item.currentListingPriceEth} ETH. ${reason}`;
         item.lastListingUpdateAt = Date.now();
-        logger.warn({ identifier: item.identifier, reason: listingEval.reason }, 'Undercut not profitable: holding current listing (no loss sale)');
-        return;
+        logger.warn({ identifier: item.identifier, reason }, 'Undercut not profitable: holding current listing (no loss sale)');
+        return { outcome: 'SKIPPED', reason: item.holdReason };
       }
-      logger.warn(
-        { identifier: item.identifier, reason: listingEval.reason },
-        'Floor Dump Protection active: Holding NFT to prevent loss sale'
-      );
-      this.inventoryManager.updateHoldStatus(item.identifier, listingEval.reason);
-      return;
+      this.inventoryManager.updateHoldStatus(item.identifier, reason);
+      return { outcome: 'HOLD', reason };
     }
 
     const listPriceEth = listingEval.recommendedListPriceEth!;
     if (wasListed && item.currentListingPriceEth && listPriceEth >= item.currentListingPriceEth) {
-      return; // no improvement: avoid churn
+      return { outcome: 'SKIPPED', reason: 'no price improvement' }; // avoid churn
     }
     const expectedNetProfitUsd = listingEval.expectedNetProfitUsd!;
 
@@ -365,17 +451,20 @@ export class AutoRelisterStrategy {
       );
 
       this.circuitBreaker.registerSuccess();
+      return { outcome: 'LISTED', reason: `listed at ${listPriceEth} ETH` };
     } catch (err: any) {
-      if (err.message?.includes('enforcement restrictions') || err.message?.includes('Validation error')) {
+      if (err.message?.includes('enforcement restrictions')) {
         item.status = 'ERROR';
         item.holdReason = 'Listing restricted by OpenSea (enforcement restrictions)';
         logger.warn(
           { identifier: item.identifier, slug: item.collectionSlug, error: err.message },
           'OpenSea has active enforcement restrictions on this collection. Item marked as ERROR and excluded from relist queue.'
         );
-        return;
+        return { outcome: 'SKIPPED', reason: item.holdReason };
       }
-      throw err;
+      // Any other rejection (incl. generic "Validation error") is NOT permanent: retried quickly with the reason logged.
+      // Previously it marked the NFT ERROR and it was never listed again.
+      return { outcome: 'ERROR', reason: `listing post rejected: ${err.message}` };
     }
   }
 }

@@ -70,12 +70,46 @@ export class OpenSeaApiService {
   }
 
   /** Cache successful results only (errors propagate and are never cached). */
-  private async cached<V>(cache: TtlCache<V>, key: string, ttlMs: number, fetcher: () => Promise<V>): Promise<V> {
-    const hit = cache.get(key);
+  private async cached<V>(cache: TtlCache<V>, key: string, ttlMs: number, fetcher: () => Promise<V>, bypass: boolean = false): Promise<V> {
+    const hit = bypass ? undefined : cache.get(key);
     if (hit !== undefined) return hit;
     const value = await fetcher();
     cache.set(key, value, ttlMs);
     return value;
+  }
+
+  private ownWalletAddress?: string;
+  /** Our trading wallet: our own listings are never counted as the market floor. */
+  public setOwnWalletAddress(address: string): void {
+    this.ownWalletAddress = address;
+  }
+
+  /**
+   * Everything needed to price a listing RIGHT NOW (instant-listing path): fees (cached, rarely change) and the
+   * lowest competing listing (never cached, excludes our own listings). unavailableReason set when it can't be read.
+   */
+  public async getListingContext(collectionSlug: string, ownAddress: string): Promise<{
+    openseaFeeBps: number;
+    royaltyFeeBps: number;
+    fees: FeeRecipient[];
+    ethPriceUsd: number;
+    competitorEth: number | null;
+    unavailableReason?: string;
+  }> {
+    const ethPriceUsd = await this.getEthPriceUsd();
+    const empty = { openseaFeeBps: this.config.fees.openseaFeeBps, royaltyFeeBps: this.config.fees.defaultRoyaltyBps, fees: [] as FeeRecipient[], ethPriceUsd, competitorEth: null };
+    let collectionData: any;
+    try {
+      collectionData = await this.cached(this.collectionCache, collectionSlug, this.ttl('collection', 10 * 60_000), async () => (await this.client.get(`/collections/${collectionSlug}`)).data);
+    } catch (err: any) {
+      return { ...empty, unavailableReason: `collection fees unavailable (${err?.response?.status ?? ''} ${err.message})` };
+    }
+    const f = this.parseCollectionFees(collectionSlug, collectionData);
+    const competitor = await this.getLowestCompetingListing(collectionSlug, ownAddress);
+    if (competitor === undefined) {
+      return { ...empty, openseaFeeBps: f.openseaFeeBps, royaltyFeeBps: f.royaltyFeeBps, fees: f.rawFees, unavailableReason: 'competing listings unavailable' };
+    }
+    return { openseaFeeBps: f.openseaFeeBps, royaltyFeeBps: f.royaltyFeeBps, fees: f.rawFees, ethPriceUsd, competitorEth: competitor ? competitor.priceEth : null };
   }
 
   /** Clears every per-collection cache. */
@@ -229,44 +263,8 @@ export class OpenSeaApiService {
   /**
    * Fetches collection stats and floor price from OpenSea v2 API
    */
-  public async getCollectionMarketData(collectionSlug: string, contractAddress: string, networkKey?: string): Promise<CollectionMarketData> {
-    const ethPriceUsd = await this.getEthPriceUsd();
-    const net = networkKey || this.config.general.network || 'robinhood';
-    const base = (): CollectionMarketData => ({
-      slug: collectionSlug,
-      contractAddress,
-      floorPriceEth: 0,
-      topOfferEth: 0,
-      numListings: 0,
-      openseaFeeBps: this.config.fees.openseaFeeBps,
-      royaltyFeeBps: this.config.fees.defaultRoyaltyBps,
-      ethPriceUsd,
-      timestamp: Date.now(),
-      sales1Hour: 0,
-      uniqueWallets1Hour: 0,
-      sales3Hours: 0,
-      uniqueWallets3Hours: 0,
-      liquidityPassed: false,
-      isMinting: false,
-      mintCompleted: false,
-      mintStatusVerified: false,
-      mintDemandPassed: false
-    });
-    // Data could not be fetched (rate limited / API down even after retries): SKIP, never offer, retry next cycle
-    const unavailable = (stage: string, err?: any, partial: Partial<CollectionMarketData> = {}): CollectionMarketData => {
-      const reason = `SKIPPED (data unavailable, will retry): ${stage}${err ? ` (${err?.response?.status ?? ''} ${err?.message ?? err})` : ''}`;
-      logger.warn({ slug: collectionSlug, network: net, stage }, reason);
-      return { ...base(), ...partial, dataUnavailable: true, dataUnavailableReason: reason, liquidityReason: reason, mintDemandReason: reason };
-    };
-
-    // STAGE 1 (cheap, cached): collection metadata & fees
-    let collectionData: any;
-    try {
-      collectionData = await this.cached(this.collectionCache, collectionSlug, this.ttl('collection', 10 * 60_000), async () => (await this.client.get(`/collections/${collectionSlug}`)).data);
-    } catch (err: any) {
-      return unavailable('collection metadata/fees', err);
-    }
-
+  /** Parses OpenSea collection fees into marketplace / mandatory / optional creator fee bps. */
+  public parseCollectionFees(collectionSlug: string, collectionData: any) {
     // Fees in basis points and full fee recipients array
     let openseaFeeBps = this.config.fees.openseaFeeBps;
     let mandatoryRoyaltyFeeBps = 0;
@@ -336,6 +334,54 @@ export class OpenSeaApiService {
     const royaltyFeeBps = mandatoryRoyaltyFeeBps;
 
 
+    return { openseaFeeBps, royaltyFeeBps, mandatoryRoyaltyFeeBps, optionalRoyaltyFeeBps, creatorFeeDisabled, rawFees };
+  }
+
+  public async getCollectionMarketData(
+    collectionSlug: string,
+    contractAddress: string,
+    networkKey?: string,
+    opts: { fresh?: boolean } = {}
+  ): Promise<CollectionMarketData> {
+    const fresh = opts.fresh === true;
+    const ethPriceUsd = await this.getEthPriceUsd();
+    const net = networkKey || this.config.general.network || 'robinhood';
+    const base = (): CollectionMarketData => ({
+      slug: collectionSlug,
+      contractAddress,
+      floorPriceEth: 0,
+      topOfferEth: 0,
+      numListings: 0,
+      openseaFeeBps: this.config.fees.openseaFeeBps,
+      royaltyFeeBps: this.config.fees.defaultRoyaltyBps,
+      ethPriceUsd,
+      timestamp: Date.now(),
+      sales1Hour: 0,
+      uniqueWallets1Hour: 0,
+      sales3Hours: 0,
+      uniqueWallets3Hours: 0,
+      liquidityPassed: false,
+      isMinting: false,
+      mintCompleted: false,
+      mintStatusVerified: false,
+      mintDemandPassed: false
+    });
+    // Data could not be fetched (rate limited / API down even after retries): SKIP, never offer, retry next cycle
+    const unavailable = (stage: string, err?: any, partial: Partial<CollectionMarketData> = {}): CollectionMarketData => {
+      const reason = `SKIPPED (data unavailable, will retry): ${stage}${err ? ` (${err?.response?.status ?? ''} ${err?.message ?? err})` : ''}`;
+      logger.warn({ slug: collectionSlug, network: net, stage }, reason);
+      return { ...base(), ...partial, dataUnavailable: true, dataUnavailableReason: reason, liquidityReason: reason, mintDemandReason: reason };
+    };
+
+    // STAGE 1 (cheap, cached): collection metadata & fees
+    let collectionData: any;
+    try {
+      collectionData = await this.cached(this.collectionCache, collectionSlug, this.ttl('collection', 10 * 60_000), async () => (await this.client.get(`/collections/${collectionSlug}`)).data);
+    } catch (err: any) {
+      return unavailable('collection metadata/fees', err);
+    }
+
+    const { openseaFeeBps, royaltyFeeBps, mandatoryRoyaltyFeeBps, optionalRoyaltyFeeBps, creatorFeeDisabled, rawFees } = this.parseCollectionFees(collectionSlug, collectionData);
     const feeFields = { openseaFeeBps, royaltyFeeBps, mandatoryRoyaltyFeeBps, optionalRoyaltyFeeBps, creatorFeeDisabled, fees: rawFees };
 
     // STAGE 2 (cheap, cached; long TTL once fully minted): 100% mint-out
@@ -414,11 +460,26 @@ export class OpenSeaApiService {
           }
         }
         return { floor, sales24Hours: intervalSales ?? 0 };
-      });
+      }, fresh);
       floorPriceEth = stats.floor;
       sales24Hours = stats.sales24Hours;
     } catch (err: any) {
       return unavailable('floor price / stats', err, { ...feeFields, ...mintFields });
+    }
+    // OWN LISTINGS NEVER COUNT AS THE FLOOR: the stats floor includes our own listings (e.g. the NFT we just bought
+    // and listed), which would let the bot justify new offers against its own asking price. Use the lowest
+    // COMPETING listing instead, fetched fresh.
+    const statsFloorEth = floorPriceEth;
+    if (this.ownWalletAddress) {
+      const competitor = await this.getLowestCompetingListing(collectionSlug, this.ownWalletAddress);
+      if (competitor === undefined) {
+        return unavailable('competing listings (floor excluding our own listings)', undefined, { ...feeFields, ...mintFields });
+      }
+      if (competitor === null) {
+        const reason = 'No competing listings: the only floor is our own listing, so a real market floor cannot be established.';
+        return { ...base(), ...feeFields, ...mintFields, mintDemandPassed: true, earlyRejectReason: reason, liquidityReason: `Not evaluated: ${reason}` };
+      }
+      floorPriceEth = competitor.priceEth;
     }
     if (!(floorPriceEth > 0)) {
       return unavailable('floor price (no ETH floor reported)', undefined, { ...feeFields, ...mintFields });
@@ -427,7 +488,7 @@ export class OpenSeaApiService {
     // STAGE 5 (cached ~20s): best collection offers (competitiveness / outbid detection)
     let topOfferEth = 0; // Default 0 (never default to dummy 0.04 ETH)
     try {
-      const offers: any[] = await this.cached(this.offersCache, collectionSlug, this.ttl('offers', 20_000), async () => (await this.client.get(`/offers/collection/${collectionSlug}/all?limit=100`)).data?.offers || []);
+      const offers: any[] = await this.cached(this.offersCache, collectionSlug, this.ttl('offers', 20_000), async () => (await this.client.get(`/offers/collection/${collectionSlug}/all?limit=100`)).data?.offers || [], fresh);
       for (const off of offers) {
         const offerEth = OpenSeaApiService.perUnitOfferPriceEth(off);
         // Only compete with valid collection offers that are strictly below floor price
@@ -445,6 +506,15 @@ export class OpenSeaApiService {
       return unavailable('recent sales events', liquidity.liquidityReason, { ...feeFields, ...mintFields, floorPriceEth, topOfferEth });
     }
 
+    // EXPECTED SALE PRICE SANITY: in a falling market the listing floor lags real sale prices. Profitability uses
+    // the LOWER of the competing floor and the median recent native-ETH floor sale (last hour if >= 3 sales, else 3h).
+    const listingFloorEth = floorPriceEth;
+    const recentMedian = liquidity.medianSalePrice1hEth ?? liquidity.medianSalePriceEth;
+    if (recentMedian !== undefined && recentMedian > 0 && recentMedian < floorPriceEth) {
+      logger.info({ slug: collectionSlug, listingFloorEth, recentMedianSaleEth: recentMedian }, 'Recent sales below listing floor: using median recent sale price as expected sale price');
+      floorPriceEth = recentMedian;
+    }
+
     let mintDemandPassed = true;
     let mintDemandReason: string | undefined;
     if (!liquidity.liquidityPassed) {
@@ -456,6 +526,8 @@ export class OpenSeaApiService {
       slug: collectionSlug,
       contractAddress,
       floorPriceEth,
+      listingFloorEth,
+      statsFloorEth,
       topOfferEth,
       numListings: 10,
       ...feeFields,
@@ -494,6 +566,8 @@ export class OpenSeaApiService {
     liquidityPassed: boolean;
     liquidityReason?: string;
     dataUnavailable?: boolean;
+    medianSalePriceEth?: number;
+    medianSalePrice1hEth?: number;
   }> {
     const minSales = this.config.liquidity?.minSales3Hours ?? 10;
     const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 5;
@@ -601,6 +675,7 @@ export class OpenSeaApiService {
           continue;
         }
 
+        sale.__priceEth = salePriceEth;
         qualifiedSales.push(sale);
         if (sale.buyer) wallets3Hours.add(sale.buyer.toLowerCase());
         if (sale.seller) wallets3Hours.add(sale.seller.toLowerCase());
@@ -627,7 +702,15 @@ export class OpenSeaApiService {
         }
       }
 
+      const median = (xs: number[]) => {
+        if (xs.length === 0) return undefined;
+        const a = [...xs].sort((x, y) => x - y);
+        const m = Math.floor(a.length / 2);
+        return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+      };
       return {
+        medianSalePriceEth: median(qualifiedSales.map((q) => q.__priceEth)),
+        medianSalePrice1hEth: sales1HourList.length >= 3 ? median(sales1HourList.map((q) => q.__priceEth)) : undefined,
         sales3Hours,
         uniqueWallets3Hours,
         sales1Hour: sales1HourList.length,

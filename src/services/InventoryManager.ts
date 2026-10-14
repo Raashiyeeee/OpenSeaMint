@@ -23,6 +23,15 @@ export class InventoryManager {
     this.totalCapitalUsd = config.capital?.totalTradingCapitalUsd ?? 10.0;
     this.statePath = statePath;
     this.loadState();
+    // Persist every offer-state transition (active offers are part of the persisted state)
+    for (const name of ['registerActiveOffer', 'initiateOfferCancellation', 'confirmOfferCancellation', 'failOfferCancellation', 'cancelActiveOffer'] as const) {
+      const original = (this as any)[name].bind(this);
+      (this as any)[name] = (...args: any[]) => {
+        const result = original(...args);
+        this.saveState();
+        return result;
+      };
+    }
   }
 
   /**
@@ -41,6 +50,13 @@ export class InventoryManager {
       }
       this.cumulativeProfitUsd = typeof raw.cumulativeProfitUsd === 'number' ? raw.cumulativeProfitUsd : 0;
       if (raw.offerCyclePause) this.offerCyclePause = raw.offerCyclePause;
+      // Live offers survive restarts: an offer still on OpenSea can fill, so it must stay monitored/cancellable
+      // and a purchase must still be matched to the offer price (cost basis).
+      for (const offer of raw.activeOffers || []) {
+        if (['ACTIVE', 'CANCELLATION_PENDING', 'CANCELLATION_FAILED', 'FULFILLED'].includes(offer.status)) {
+          this.activeOffers.set(offer.orderHash || offer.collectionSlug, offer);
+        }
+      }
       logger.info(
         { statePath: this.statePath, inventory: this.inventory.size, trackedNfts: this.trackedNfts.size, paused: this.offerCyclePause.paused },
         'Restored persisted inventory / re-offer / capital pause state'
@@ -60,7 +76,10 @@ export class InventoryManager {
         inventory: Array.from(this.inventory.values()),
         trackedNfts: Array.from(this.trackedNfts.values()).map((t) => ({ ...t, activeOffers: [] })),
         cumulativeProfitUsd: this.cumulativeProfitUsd,
-        offerCyclePause: this.offerCyclePause
+        offerCyclePause: this.offerCyclePause,
+        activeOffers: Array.from(this.activeOffers.values())
+          .filter((o) => ['ACTIVE', 'CANCELLATION_PENDING', 'CANCELLATION_FAILED', 'FULFILLED'].includes(o.status))
+          .map((o) => ({ ...o, orderComponents: undefined }))
       };
       fs.mkdirSync(path.dirname(this.statePath), { recursive: true });
       const tmp = `${this.statePath}.tmp`;
@@ -386,6 +405,7 @@ export class InventoryManager {
       offer.status = 'FULFILLED';
       logger.info({ orderHash, collection: offer.collectionSlug }, 'Offer was ACCEPTED (order FULFILLED) — NFT purchase pending inventory sync.');
     }
+    this.saveState();
   }
 
   /**
@@ -400,6 +420,7 @@ export class InventoryManager {
         (!offer.tokenId || offer.tokenId === tokenId)
       ) {
         this.activeOffers.delete(key);
+        this.saveState();
         return offer;
       }
     }
@@ -1073,6 +1094,63 @@ export class InventoryManager {
       }
     }
   }
+
+  private static isUnsold(item: InventoryItem): boolean {
+    return item.status === 'PENDING_LISTING' || item.status === 'LISTED' || item.status === 'HOLDING' || item.status === 'ERROR';
+  }
+
+  /**
+   * Collection Re-Offer Rule: while we hold ANY unsold NFT from a collection, no new offers may be placed on that
+   * collection (a collection offer can fill on any token, incl. more of the same falling collection).
+   * Derived from the persisted inventory, so it survives restarts. Lifted only once every held NFT is confirmed SOLD.
+   */
+  public getUnsoldHoldingsInCollection(collectionSlug: string, contractAddress?: string): InventoryItem[] {
+    const slug = (collectionSlug || '').toLowerCase();
+    const contract = (contractAddress || '').toLowerCase();
+    return Array.from(this.inventory.values()).filter(
+      (i) =>
+        InventoryManager.isUnsold(i) &&
+        ((slug && i.collectionSlug.toLowerCase() === slug) || (contract && i.contractAddress.toLowerCase() === contract))
+    );
+  }
+
+  public canOfferOnCollection(collectionSlug: string, contractAddress?: string): { allowed: boolean; reason?: string } {
+    const held = this.getUnsoldHoldingsInCollection(collectionSlug, contractAddress);
+    if (held.length > 0) {
+      return {
+        allowed: false,
+        reason: `Holding ${held.length} unsold NFT(s) from ${collectionSlug} (${held.map((h) => `#${h.tokenId} ${h.status}`).join(', ')}). No new offers on this collection until they are confirmed sold.`
+      };
+    }
+    return { allowed: true };
+  }
+
+  /** Every live (not yet verified-cancelled) offer of ours on a collection. */
+  public getLiveOffersForCollection(collectionSlug: string, contractAddress?: string): ActiveOffer[] {
+    const slug = (collectionSlug || '').toLowerCase();
+    const contract = (contractAddress || '').toLowerCase();
+    return Array.from(this.activeOffers.values()).filter(
+      (o) =>
+        (o.status === 'ACTIVE' || o.status === 'CANCELLATION_PENDING' || o.status === 'CANCELLATION_FAILED') &&
+        ((slug && o.collectionSlug.toLowerCase() === slug) || (contract && o.contractAddress.toLowerCase() === contract))
+    );
+  }
+
+  /** Finds the offer of ours that a purchase came from: by order hash, then token offer, then collection offer. */
+  public findOfferForPurchase(collectionSlug: string, contractAddress: string, tokenId: string, orderHash?: string): ActiveOffer | undefined {
+    if (orderHash) {
+      const byHash = this.activeOffers.get(orderHash);
+      if (byHash) return byHash;
+    }
+    const candidates = Array.from(this.activeOffers.values()).filter(
+      (o) =>
+        ['ACTIVE', 'FULFILLED', 'CANCELLATION_PENDING', 'CANCELLATION_FAILED'].includes(o.status) &&
+        (o.contractAddress.toLowerCase() === contractAddress.toLowerCase() || o.collectionSlug.toLowerCase() === collectionSlug.toLowerCase())
+    );
+    return (
+      candidates.find((o) => o.tokenId === tokenId) ||
+      candidates.find((o) => !o.tokenId && o.status === 'FULFILLED') ||
+      candidates.find((o) => !o.tokenId)
+    );
+  }
 }
-
-
