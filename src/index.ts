@@ -220,7 +220,9 @@ async function main() {
   // Connect WebSocket stream
   streamService.connect();
 
-  // FAST PURCHASE / LISTING LOOP (every 3s, independent of the long main cycle and its caches):
+  // FAST LOOP (every 3s, independent of the long main cycle and its caches):
+  //  - Cancel When Outbid + 20-Minute Expiry (must not wait for the slow bidding cycle)
+  //  - Continuous top-priority listing monitor (reprice when a competitor undercuts, if still profitable)
   //  - subscribe the stream to every collection we have offers on or hold NFTs from
   //  - poll our live offers' order status; FULFILLED -> find the token in the wallet -> list immediately
   //  - retry due PENDING_LISTING / HOLDING NFTs (HOLD retried every 20s, data-unavailable every 5s)
@@ -231,6 +233,11 @@ async function main() {
     try {
       for (const o of inventoryManager.getAllActiveOffers()) streamService.subscribeCollection(o.collectionSlug);
       for (const i of inventoryManager.getAllInventory()) streamService.subscribeCollection(i.collectionSlug);
+      // Outbid → Cancel and 20-min expiry run continuously (re-entry criteria checked in the main bidding cycle)
+      await bidderStrategy.processAutomaticOfferCancellations(bidderStrategy.getOfferMaxAgeMinutes());
+      await bidderStrategy.processOutbidOfferCancellations();
+      // Top selling priority: continuously undercut competitors when the new price still meets margin
+      await relisterStrategy.monitorListedInventory();
       await bidderStrategy.checkOffersForFills(async (offer) => {
         await relisterStrategy.detectNewHoldings(tradingWallet.address, offer.collectionSlug, offer.network || 'robinhood', 'order:FULFILLED');
       });

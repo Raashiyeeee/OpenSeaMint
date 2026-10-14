@@ -7,6 +7,7 @@
     "loopIntervalMs": 15000,
     "offerExpirationMinutes": 20,
     "listingExpirationDays": 7,
+    "relistCooldownMinutes": 0.25,
     "ignoredCollections": ["robin-owls-269031093", "robin-owls"],
     "postSaleWethConvertPercent": 90.0,
     "postSaleGasReservePercent": 10.0

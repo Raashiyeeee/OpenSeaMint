@@ -1544,6 +1544,8 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     maxSupply: 10000,
     referenceFloorEth: 0.0020
   });
+  // Outbid detection uses the lightweight competing-offers lookup (not full market-data gates)
+  (test19Api as any).getTopCompetingCollectionOffer = async () => ({ priceEth: 0.0011, orderHash: 'competitor_higher' });
 
   (test19Api as any).cancelOffer = async () => ({ success: true });
   (test19Api as any).verifyOfferInactive = async () => ({ isInactive: true });
@@ -1592,6 +1594,7 @@ console.log('Test 13 PASSED: Wallet reconciliation immediately detects sold NFT,
     maxSupply: 10000,
     referenceFloorEth: 0.0020
   });
+  (test19Api as any).getTopCompetingCollectionOffer = async () => ({ priceEth: 0.0018, orderHash: 'competitor_too_high' });
 
   // Execute processCollectionBid: should detect outbid -> cancel existing offer -> recheck criteria -> REJECT re-entry!
   await (test19Bidder as any).processCollectionBid({

@@ -276,9 +276,9 @@ export class AutoRelisterStrategy {
     await this.monitorListedInventory();
   }
 
-  /** Minimum time between two price updates of the same listing (anti relist churn). */
+  /** Minimum time between two price updates of the same listing (anti relist churn). Default ~15s for near-continuous top priority. */
   private getRepriceCooldownMs(): number {
-    return (this.config.general.relistCooldownMinutes ?? 10) * 60 * 1000;
+    return (this.config.general.relistCooldownMinutes ?? 0.25) * 60 * 1000;
   }
 
   /** Minimum relative price change that justifies a relist (anti churn). */

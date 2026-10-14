@@ -48,7 +48,7 @@ export interface BotConfig {
     loopIntervalMs: number;
     offerExpirationMinutes: number;
     listingExpirationDays: number;
-    relistCooldownMinutes?: number; // min minutes between competitive reprices of one listing (anti-churn)
+    relistCooldownMinutes?: number; // min minutes between competitive reprices (default 0.25 = ~15s for near-continuous top priority)
     ignoredCollections?: string[];
     postSaleWethConvertPercent?: number;
     postSaleGasReservePercent?: number;

@@ -366,10 +366,34 @@ export class CollectionBidderStrategy {
   }
 
   /**
+   * Highest competing offer price (ETH) for an active offer we hold.
+   * Uses a lightweight offers lookup — never gated by mint / floor / liquidity eligibility.
+   */
+  public async getCompetingTopOfferEth(offer: ActiveOffer): Promise<number> {
+    const ourAddress = this.seaportService.getWalletAddress();
+    const competing = await this.apiService.getTopCompetingCollectionOffer(offer.collectionSlug, {
+      excludeOrderHashes: [offer.orderHash],
+      excludeAddress: ourAddress
+    });
+    let competingTopEth = competing?.priceEth || 0;
+    // Single-NFT offers also compete with the best offer on that specific token
+    if (offer.tokenId) {
+      const bestNft = await this.apiService.getBestNftOffer(offer.collectionSlug, offer.tokenId);
+      if (bestNft && bestNft.orderHash !== offer.orderHash && bestNft.priceEth > competingTopEth) {
+        competingTopEth = bestNft.priceEth;
+      }
+    }
+    return competingTopEth;
+  }
+
+  /**
    * Automatic Offer Cancellation — Outbid Rule:
    * 1. Cancel When Outbid: If another buyer places a higher offer on an NFT,
    *    the bot must automatically cancel its existing offer.
    * 2. No Stale Offers: The bot must not leave outdated offers active after being outbid.
+   *
+   * Outbid detection MUST NOT depend on full market-data eligibility (mint/liquidity/fees).
+   * Those gates apply only when deciding whether to place a NEW offer after cancel.
    */
   public async processOutbidOfferCancellations(): Promise<{
     cancelled: number;
@@ -387,30 +411,21 @@ export class CollectionBidderStrategy {
 
     for (const offer of activeOffers) {
       try {
-        const marketData = await this.apiService.getCollectionMarketData(offer.collectionSlug, offer.contractAddress, offer.network);
-        // Single-NFT offers compete with offers on that specific NFT AND with collection offers
-        let competingTopEth = marketData.topOfferEth || 0;
-        if (offer.tokenId) {
-          const bestNft = await this.apiService.getBestNftOffer(offer.collectionSlug, offer.tokenId);
-          if (bestNft && bestNft.orderHash !== offer.orderHash && bestNft.priceEth > competingTopEth) {
-            competingTopEth = bestNft.priceEth;
-          }
-        }
-        marketData.topOfferEth = competingTopEth;
-        if (marketData.topOfferEth && marketData.topOfferEth > offer.priceEth) {
+        const competingTopEth = await this.getCompetingTopOfferEth(offer);
+        if (competingTopEth > offer.priceEth + 1e-12) {
           logger.info(
             {
               orderHash: offer.orderHash,
               collection: offer.collectionSlug,
               ourPriceEth: offer.priceEth,
-              topOfferEth: marketData.topOfferEth
+              topOfferEth: competingTopEth
             },
-            `Cancel When Outbid Rule: Another buyer placed a higher offer (${marketData.topOfferEth} ETH > ${offer.priceEth} ETH). Automatically cancelling existing offer...`
+            `Cancel When Outbid Rule: Another buyer placed a higher offer (${competingTopEth} ETH > ${offer.priceEth} ETH). Automatically cancelling existing offer...`
           );
 
           const res = await this.cancelAndVerifyOffer(
             offer,
-            `Outbid by higher offer (${marketData.topOfferEth} ETH > ${offer.priceEth} ETH)`
+            `Outbid by higher offer (${competingTopEth} ETH > ${offer.priceEth} ETH)`
           );
           if (res.success) {
             cancelled++;
@@ -424,7 +439,7 @@ export class CollectionBidderStrategy {
           }
         }
       } catch (err: any) {
-        logger.debug({ orderHash: offer.orderHash, error: err.message }, 'Note checking market data for outbid offer');
+        logger.debug({ orderHash: offer.orderHash, error: err.message }, 'Error checking competing offers for outbid');
       }
     }
 
@@ -557,13 +572,7 @@ export class CollectionBidderStrategy {
       return;
     }
 
-    // 3. FETCH LATEST MARKET DATA
-    const marketData = await this.apiService.getCollectionMarketData(target.slug, target.contractAddress, targetNetwork);
-    if (this.skipOrEarlyReject(marketData, target.slug, targetNetwork)) {
-      return; // stale offers are still cancelled by the global 20-minute expiry pass
-    }
-
-    // 3.1. AUTOMATIC OFFER CANCELLATION & RE-ENTRY CHECK (Outbid & 20-Minute Expiry Rules)
+    // 3.0. Outbid / expiry cancel BEFORE eligibility gates — stale offers must not survive a mint/liquidity SKIP
     const existingOffer = this.inventoryManager.getActiveOffer(target.slug);
     if (existingOffer) {
       if (
@@ -579,16 +588,17 @@ export class CollectionBidderStrategy {
       }
 
       if (existingOffer.status === 'ACTIVE') {
-        const isOutbid = marketData.topOfferEth > existingOffer.priceEth;
+        const competingTopEth = await this.getCompetingTopOfferEth(existingOffer);
+        const isOutbid = competingTopEth > existingOffer.priceEth + 1e-12;
         const isExpired = Date.now() - existingOffer.createdTimestamp >= this.getOfferMaxAgeMinutes() * 60 * 1000;
 
         if (isOutbid || isExpired) {
           const cancelReason = isOutbid
-            ? `Outbid by higher offer (${marketData.topOfferEth} ETH > ${existingOffer.priceEth} ETH)`
+            ? `Outbid by higher offer (${competingTopEth} ETH > ${existingOffer.priceEth} ETH)`
             : '20-Minute Expiry (Unaccepted within 20 minutes)';
 
           logger.info(
-            { slug: target.slug, orderHash: existingOffer.orderHash, ourPrice: existingOffer.priceEth, topOfferEth: marketData.topOfferEth, cancelReason },
+            { slug: target.slug, orderHash: existingOffer.orderHash, ourPrice: existingOffer.priceEth, topOfferEth: competingTopEth, cancelReason },
             `Automatic Offer Cancellation Rule: Cancelling outdated offer (${cancelReason})...`
           );
 
@@ -614,6 +624,12 @@ export class CollectionBidderStrategy {
           return;
         }
       }
+    }
+
+    // 3. FETCH LATEST MARKET DATA (eligibility for NEW / re-entry offers only)
+    const marketData = await this.apiService.getCollectionMarketData(target.slug, target.contractAddress, targetNetwork);
+    if (this.skipOrEarlyReject(marketData, target.slug, targetNetwork)) {
+      return;
     }
 
     // 3.5. NFT RECENT FLOOR SALES REQUIREMENT CHECK
@@ -987,13 +1003,7 @@ export class CollectionBidderStrategy {
       return { success: false, reason: nftCheck.reason };
     }
 
-    // 3. Market Data & Pre-Checks
-    const marketData = await this.apiService.getCollectionMarketData(params.collectionSlug, params.contractAddress, targetNetwork);
-    if (this.skipOrEarlyReject(marketData, params.collectionSlug, targetNetwork)) {
-      return { success: false, reason: marketData.dataUnavailableReason || marketData.earlyRejectReason || 'Rejected' };
-    }
-
-    // 3.0. Automatic Offer Cancellation & Re-entry Check for Item (Outbid & 20-Minute Expiry)
+    // 3.0. Outbid / expiry cancel BEFORE eligibility gates (same rule as collection offers)
     const itemKey = `${params.contractAddress.toLowerCase()}:${params.tokenId}`;
     const existingItemOffer = this.inventoryManager.getActiveOffer(itemKey);
     if (existingItemOffer) {
@@ -1009,19 +1019,13 @@ export class CollectionBidderStrategy {
       }
 
       if (existingItemOffer.status === 'ACTIVE') {
-        // Compare against the best offer on THIS NFT as well as collection offers
-        const bestNftOffer = await this.apiService.getBestNftOffer(params.collectionSlug, params.tokenId);
-        const competingBestEth = Math.max(
-          marketData.topOfferEth || 0,
-          bestNftOffer && bestNftOffer.orderHash !== existingItemOffer.orderHash ? bestNftOffer.priceEth : 0
-        );
-        marketData.topOfferEth = competingBestEth;
-        const isOutbid = marketData.topOfferEth > existingItemOffer.priceEth;
+        const competingBestEth = await this.getCompetingTopOfferEth(existingItemOffer);
+        const isOutbid = competingBestEth > existingItemOffer.priceEth + 1e-12;
         const isExpired = Date.now() - existingItemOffer.createdTimestamp >= this.getOfferMaxAgeMinutes() * 60 * 1000;
 
         if (isOutbid || isExpired) {
           const cancelReason = isOutbid
-            ? `Outbid by higher offer (${marketData.topOfferEth} ETH > ${existingItemOffer.priceEth} ETH)`
+            ? `Outbid by higher offer (${competingBestEth} ETH > ${existingItemOffer.priceEth} ETH)`
             : '20-Minute Expiry (Unaccepted within 20 minutes)';
 
           logger.info(
@@ -1043,6 +1047,12 @@ export class CollectionBidderStrategy {
           };
         }
       }
+    }
+
+    // 3. Market Data & Pre-Checks (eligibility for NEW / re-entry item offers only)
+    const marketData = await this.apiService.getCollectionMarketData(params.collectionSlug, params.contractAddress, targetNetwork);
+    if (this.skipOrEarlyReject(marketData, params.collectionSlug, targetNetwork)) {
+      return { success: false, reason: marketData.dataUnavailableReason || marketData.earlyRejectReason || 'Rejected' };
     }
 
     const nftCheck = this.inventoryManager.canPlaceOfferOnNft(params.contractAddress, params.tokenId);
