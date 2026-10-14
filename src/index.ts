@@ -83,6 +83,8 @@ async function main() {
 
   // 5. Initialize core services
   const apiService = new OpenSeaApiService(config);
+  // Our own listings must never be counted as the market floor
+  apiService.setOwnWalletAddress(tradingWallet.address);
   const streamService = new OpenSeaStreamService(config, tradingWallet.address);
   const seaportService = new SeaportService(config, tradingWallet);
   const pricingEngine = new PricingEngine(config);
@@ -110,36 +112,54 @@ async function main() {
   );
 
   // 7. Setup Real-time Stream Event Handlers
+  // When one of our offers fills, cancel every other live offer on that collection (verified)
+  relisterStrategy.setCollectionFillHandler(async (slug, contract) => {
+    await bidderStrategy.cancelAllOffersForCollection(slug, contract, 'Offer filled on this collection');
+  });
+
+  const parseNftId = (eventData: any) => {
+    const parts = String(eventData.item?.nft_id || '').split('/');
+    const chainPart = parts[0] || '';
+    return {
+      slug: eventData.collection?.slug || '',
+      contract: parts[1] || '',
+      tokenId: parts[2] || '',
+      network: chainPart === 'ethereum' ? 'mainnet' : chainPart || undefined
+    };
+  };
+
+  // PURCHASE PATH (stream): transfer into our wallet -> instant listing
   streamService.on('nft_received', async (eventData: any) => {
     try {
-      const slug = eventData.collection?.slug || '';
-      const contract = eventData.item?.nft_id?.split('/')?.[1] || '';
-      const tokenId = eventData.item?.nft_id?.split('/')?.[2] || '';
-      const chainPart = eventData.item?.nft_id?.split('/')?.[0] || '';
-      const network = chainPart === 'ethereum' ? 'mainnet' : chainPart || undefined;
-      // Cost basis = the price of OUR offer that was accepted. Only if unknown, fall back conservatively to the
-      // higher of floor / top offer (overstating cost keeps the 40%-margin listing price on the safe side).
-      let priceEth = 0;
-      const activeOffer = inventoryManager.getActiveOffer(slug);
-      if (activeOffer && activeOffer.priceEth > 0) {
-        priceEth = activeOffer.priceEth;
-      } else {
-        try {
-          const marketData = await apiService.getCollectionMarketData(slug, contract, network);
-          priceEth = Math.max(marketData.topOfferEth || 0, marketData.floorPriceEth || 0);
-        } catch {
-          priceEth = 0;
-        }
-      }
-      if (!(priceEth > 0)) {
-        logger.error({ slug, tokenId }, 'Cost basis of received NFT unknown; not auto-listing (wallet scan will retry).');
-        return;
-      }
-
-      logger.info({ slug, tokenId, priceEth }, 'Incoming transfer received! Triggering automatic relist.');
-      await relisterStrategy.handleItemAcquired(slug, contract, tokenId, priceEth, network);
+      const { slug, contract, tokenId, network } = parseNftId(eventData);
+      if (!contract || !tokenId) return;
+      await relisterStrategy.onPurchaseDetected({ collectionSlug: slug, contractAddress: contract, tokenId, network, source: 'stream:item_transferred' });
     } catch (err: any) {
       logger.error({ err }, 'Error processing nft_received event');
+    }
+  });
+
+  // item_sold involving our wallet: purchase (we don't hold it unsold) or sale (we do)
+  streamService.on('nft_trade', async (eventData: any) => {
+    try {
+      const { slug, contract, tokenId, network } = parseNftId(eventData);
+      if (!contract || !tokenId) return;
+      const held = inventoryManager.getInventoryItem(`${contract.toLowerCase()}:${tokenId}`);
+      const isUnsoldHolding = held && ['PENDING_LISTING', 'LISTED', 'HOLDING', 'ERROR'].includes(held.status);
+      if (isUnsoldHolding) {
+        streamService.emit('nft_sold', eventData);
+        return;
+      }
+      const decimals = Number(eventData.payment_token?.decimals ?? 18);
+      const tokenEthPrice = parseFloat(eventData.payment_token?.eth_price || '1') || 1;
+      const qty = Number(eventData.quantity || 1) || 1;
+      const eventPriceEth = eventData.sale_price ? (parseFloat(eventData.sale_price) / Math.pow(10, decimals)) * tokenEthPrice / qty : undefined;
+      await relisterStrategy.onPurchaseDetected({
+        collectionSlug: slug, contractAddress: contract, tokenId, network,
+        orderHash: eventData.order_hash, eventPriceEth, source: 'stream:item_sold'
+      });
+    } catch (err: any) {
+      logger.error({ err }, 'Error processing nft_trade event');
     }
   });
 
@@ -200,6 +220,33 @@ async function main() {
   // Connect WebSocket stream
   streamService.connect();
 
+  // FAST PURCHASE / LISTING LOOP (every 3s, independent of the long main cycle and its caches):
+  //  - subscribe the stream to every collection we have offers on or hold NFTs from
+  //  - poll our live offers' order status; FULFILLED -> find the token in the wallet -> list immediately
+  //  - retry due PENDING_LISTING / HOLDING NFTs (HOLD retried every 20s, data-unavailable every 5s)
+  let fastRunning = false;
+  const fastLoop = async () => {
+    if (fastRunning) return;
+    fastRunning = true;
+    try {
+      for (const o of inventoryManager.getAllActiveOffers()) streamService.subscribeCollection(o.collectionSlug);
+      for (const i of inventoryManager.getAllInventory()) streamService.subscribeCollection(i.collectionSlug);
+      await bidderStrategy.checkOffersForFills(async (offer) => {
+        await relisterStrategy.detectNewHoldings(tradingWallet.address, offer.collectionSlug, offer.network || 'robinhood', 'order:FULFILLED');
+      });
+      // FULFILLED offers whose NFT hasn't been matched yet (e.g. detected during cancellation verification)
+      for (const o of inventoryManager.getAllActiveOffers().filter((x) => x.status === 'FULFILLED')) {
+        await relisterStrategy.detectNewHoldings(tradingWallet.address, o.collectionSlug, o.network || 'robinhood', 'order:FULFILLED');
+      }
+      await relisterStrategy.processPendingListings();
+    } catch (err: any) {
+      logger.error({ err: err.message }, 'Error in fast purchase/listing loop');
+    } finally {
+      fastRunning = false;
+    }
+  };
+  const fastInterval = setInterval(fastLoop, 3000);
+
   // 8. Start Bidding Loop
   logger.info(`Entering main strategy loop (Interval: ${config.general.loopIntervalMs / 1000}s)`);
 
@@ -233,6 +280,7 @@ async function main() {
   const shutdown = () => {
     logger.info('Shutting down trading bot gracefully...');
     clearInterval(interval);
+    clearInterval(fastInterval);
     streamService.disconnect();
     process.exit(0);
   };

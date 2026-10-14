@@ -1,4 +1,14 @@
+import { AsyncLocalStorage } from 'async_hooks';
 import { logger } from './logger';
+
+/** Requests made inside runHighPriority() jump ahead of queued normal-priority requests (e.g. instant listing). */
+const priorityContext = new AsyncLocalStorage<boolean>();
+export function runHighPriority<T>(fn: () => Promise<T>): Promise<T> {
+  return priorityContext.run(true, fn);
+}
+export function isHighPriority(): boolean {
+  return priorityContext.getStore() === true;
+}
 
 export interface RateLimiterOptions {
   requestsPerSecond: number;
@@ -23,6 +33,7 @@ export class OpenSeaRateLimiter {
   private pausedUntil = 0;
   private active = 0;
   private waiters: Array<() => void> = [];
+  private priorityWaiters: Array<() => void> = [];
 
   constructor(public options: RateLimiterOptions, private sleep: SleepFn = defaultSleep, private now: () => number = Date.now) {}
 
@@ -41,7 +52,8 @@ export class OpenSeaRateLimiter {
 
   private async acquireSlot(): Promise<void> {
     while (this.active >= Math.max(1, this.options.maxConcurrent)) {
-      await new Promise<void>((resolve) => this.waiters.push(resolve));
+      const high = isHighPriority();
+      await new Promise<void>((resolve) => (high ? this.priorityWaiters : this.waiters).push(resolve));
     }
     this.active++;
     const interval = 1000 / Math.max(0.01, this.options.requestsPerSecond);
@@ -53,7 +65,7 @@ export class OpenSeaRateLimiter {
 
   private release(): void {
     this.active--;
-    const next = this.waiters.shift();
+    const next = this.priorityWaiters.shift() || this.waiters.shift();
     if (next) next();
   }
 
