@@ -9,7 +9,7 @@
     "dev": "ts-node src/index.ts",
     "dry-run": "ts-node src/dryRun.ts",
     "prepare-wallet": "ts-node scripts/prepareWallet.ts",
-    "test": "echo \"Running test suite...\" && ts-node tests/testPricing.ts && ts-node tests/testTradingRules.ts && ts-node tests/testRateLimits.ts"
+    "test": "echo \"Running test suite...\" && ts-node tests/testPricing.ts && ts-node tests/testTradingRules.ts && ts-node tests/testRateLimits.ts && ts-node tests/testVeilIncident.ts"
   },
   "dependencies": {
     "@opensea/stream-js": "^0.1.3",
