@@ -143,6 +143,10 @@ export interface CollectionMarketData {
   dataUnavailableReason?: string;
   /** Rejected by a cheap check (mint-out / creator fee) before expensive fetches; sales were not fetched. */
   earlyRejectReason?: string;
+  /** Lowest COMPETING listing (excludes our own listings). */
+  listingFloorEth?: number;
+  /** Raw OpenSea stats floor (may include our own listings). */
+  statsFloorEth?: number;
   referenceFloorEth?: number;
   referenceFloorUsd?: number;
   floorDeclinePercent?: number;
@@ -246,6 +250,8 @@ export interface InventoryItem {
   realizedProfitUsd?: number;
   isExternalWalletItem?: boolean;
   lastListingUpdateAt?: number;
+  /** Instant-listing retry time (ms) after a HOLD / data-unavailable attempt. */
+  nextListingAttemptAt?: number;
 }
 
 export type OfferStatus = 'ACTIVE' | 'EXPIRED' | 'FULFILLED' | 'CANCELLED' | 'CANCELLATION_PENDING' | 'CANCELLATION_FAILED';

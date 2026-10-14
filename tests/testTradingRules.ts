@@ -646,6 +646,7 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   (eApi as any).getCollectionMarketData = async () => eData;
   let competitor: any = null;
   (eApi as any).getLowestCompetingListing = async () => competitor;
+  (eApi as any).getListingContext = async () => ({ openseaFeeBps: 50, royaltyFeeBps: 0, fees: [], ethPriceUsd: 2700, competitorEth: competitor ? competitor.priceEth : 0.003 });
   const ePosted: number[] = [];
   const cancelled: string[] = [];
   (eApi as any).postListing = async () => ({ order_hash: `0xlist${ePosted.length}` });
