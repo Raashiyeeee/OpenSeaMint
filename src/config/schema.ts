@@ -27,7 +27,7 @@ const CapitalSchema = z.object({
   maxActiveTrades: z.number().int().positive().default(999),
   minNetProfitUsd: z.number().nonnegative().default(0.20),
   minOfferPriceUsd: z.number().positive().default(1.00),
-  maxBuyPriceUsd: z.number().positive().default(5.0),
+  maxBuyPriceUsd: z.number().positive().default(9.0),
   maxOfferCapitalPercent: z.number().positive().max(70).default(70.0)
 });
 
@@ -96,7 +96,7 @@ const BotConfigSchema = z.object({
   }),
   profitTargets: z.object({
     defaultMinNetProfitUsd: z.number().positive(),
-    defaultMinMarginPercent: z.number().positive().default(40.0),
+    defaultMinMarginPercent: z.number().positive().default(12.0),
     undercutFloorByPercent: z.number().nonnegative(),
     bidUnderFloorPercent: z.number().positive(),
     bidIncrementUsd: z.number().positive().default(0.05)

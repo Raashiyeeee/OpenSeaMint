@@ -101,7 +101,7 @@ const OS_FEE = { recipient: '0x0000a26b00c1f0df003000390027140000faa719', fee: 1
   assert(elapsed < 10_000, `Listed within 10s (took ${elapsed}ms)`);
   assert(Math.abs(item991.acquiredPriceEth - usd(2.76)) < 1e-12, 'Cost basis = our accepted offer price');
   const min991 = pricing.evaluateListingOrHold(usd(2.76), 0, { openseaFeeBps: 100, royaltyFeeBps: 0, ethPriceUsd: ETH_USD }, undefined, 'robinhood').minProfitablePriceEth!;
-  assert(item991.currentListingPriceEth! >= min991 && item991.currentListingPriceEth! < usd(4.07), 'Top competitive price that keeps 40% margin');
+  assert(item991.currentListingPriceEth! >= min991 && item991.currentListingPriceEth! < usd(4.07), 'Top competitive price that keeps 12% margin');
   assert(cancelled.includes('0xoffer_item'), 'Every other live offer on Veil cancelled when one filled');
   assert.strictEqual(inv.getLiveOffersForCollection(VEIL, VEIL_CONTRACT).length, 0, 'No live Veil offers remain');
   console.log(`Case V1 PASSED: #991 listed in ${elapsed}ms at ${item991.currentListingPriceEth} ETH (min ${min991}); other Veil offers cancelled+verified ✅`);
@@ -118,9 +118,9 @@ const OS_FEE = { recipient: '0x0000a26b00c1f0df003000390027140000faa719', fee: 1
   console.log('Case V2 PASSED: no new Veil offer while #991 is unsold (persisted) ✅');
 
   // Reproduce #924 anyway (e.g. an offer that was already live): bought at $2.00 while the market fell below the
-  // 40%-margin price -> HOLD with an explicit reason and a FAST retry, then listed as soon as profitable.
+  // 12%-margin price -> HOLD with an explicit reason and a FAST retry, then listed as soon as profitable.
   inv.registerActiveOffer(mkOffer('0xoffer200', 2.0));
-  competitorEth = usd(2.40); // min 40% price for $2.00 cost is ~$2.83
+  competitorEth = usd(2.10); // min 12% price for $2.00 cost is ~$2.25+ (with fees); $2.10 stays below
   orderStatus['0xoffer200'] = 'FULFILLED';
   walletNfts = [{ contract: VEIL_CONTRACT, identifier: '924', collection: VEIL }, { contract: VEIL_CONTRACT, identifier: '991', collection: VEIL }];
   let fills = 0;

@@ -112,9 +112,11 @@ async function main() {
   );
 
   // 7. Setup Real-time Stream Event Handlers
-  // When one of our offers fills, cancel every other live offer on that collection (verified)
+  // When one of our offers fills: cancel remaining offers on that collection, then cancel any
+  // other active offers that remaining capital / WETH can no longer fund (verified).
   relisterStrategy.setCollectionFillHandler(async (slug, contract) => {
     await bidderStrategy.cancelAllOffersForCollection(slug, contract, 'Offer filled on this collection');
+    await bidderStrategy.cancelUnfundedOffersAfterCapitalChange('Insufficient capital after purchase');
   });
 
   const parseNftId = (eventData: any) => {
@@ -266,6 +268,14 @@ async function main() {
     }
     loopRunning = true;
     try {
+      // 0. Deposit → WETH: if ETH was deposited (or is sitting unwrapped), convert 90% to WETH (10% gas reserve)
+      for (const netKey of activeNetworks) {
+        try {
+          await seaportService.syncNativeEthAndWrapDeposits(netKey);
+        } catch (wrapErr: any) {
+          logger.warn({ network: netKey, err: wrapErr.message }, 'Deposit ETH→WETH sync failed this cycle');
+        }
+      }
       // 1. Reconcile on-chain wallet inventory (clear sold NFTs, list new ones)
       await relisterStrategy.scanAndRelistUnlistedInventory(tradingWallet.address);
       // 2. Evaluate market and place simultaneous offers across qualifying NFTs

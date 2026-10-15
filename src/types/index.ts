@@ -15,7 +15,7 @@ export interface CapitalConfig {
   maxActiveTrades?: number;       // e.g. 999 (Unlimited by count, constrained by capital)
   minNetProfitUsd: number;        // e.g. $0.20
   minOfferPriceUsd?: number;      // Strict floor: minimum $1.00 offer price per NFT
-  maxBuyPriceUsd?: number;        // Strict ceiling: maximum $5.00 buy price
+  maxBuyPriceUsd?: number;        // Strict ceiling / monitor max: maximum $9.00 NFT price
   maxOfferCapitalPercent?: number; // e.g. 70.0 (Max share of total capital committed to offers + purchased NFTs; capped at 70%, 30% reserved)
 }
 
@@ -63,7 +63,7 @@ export interface BotConfig {
   };
   profitTargets: {
     defaultMinNetProfitUsd: number;
-    defaultMinMarginPercent: number; // 40% default and hard minimum (net profit / offer after all fees)
+    defaultMinMarginPercent: number; // 12% default and hard minimum (margin excludes creator fees; actual net profit still counts them)
     undercutFloorByPercent: number;
     bidUnderFloorPercent: number;
     bidIncrementUsd?: number;

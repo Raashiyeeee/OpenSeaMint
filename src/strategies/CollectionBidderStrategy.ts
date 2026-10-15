@@ -74,8 +74,8 @@ export class CollectionBidderStrategy {
    *  2. Recent native-ETH floor sales requirement
    *  3. Market dump protection (< 40% floor decline)
    *  4. Creator fee status: optional fees disabled (0 bps in costs & order), mandatory fee within ceiling and counted
-   *  5. Profitability: floor >= Offer * 1.30 AND floor >= minimum acceptable floor (40% net margin after marketplace
-   *     fee, applicable creator fee and gas) AND net profit >= configured minimum
+   *  5. Profitability: floor >= Offer * 1.30 AND floor >= minimum acceptable floor (12% margin after marketplace
+   *     fee and gas; creator fees excluded from that margin) AND actual net profit (creator included) >= minimum
    */
   /**
    * One of our offers filled on this collection: cancel EVERY other live offer of ours on it immediately and verify
@@ -92,6 +92,78 @@ export class CollectionBidderStrategy {
     }
     if (live.length > 0) {
       logger.warn({ slug: collectionSlug, cancelled, failed }, `Offer filled on ${collectionSlug}: cancelled ${cancelled}/${live.length} remaining offers (verified)`);
+    }
+    return { cancelled, failed };
+  }
+
+  /**
+   * Automatic Offer Cancellation When Capital Is Insufficient:
+   * After one offer is accepted, check whether remaining WETH / capital allocation can still fund
+   * other active offers. Cancel (and verify) any offers that can no longer be funded.
+   * Cancelled offers are never recreated without a full criteria recheck in a later bidding cycle.
+   */
+  public async cancelUnfundedOffersAfterCapitalChange(reason: string = 'Insufficient capital after purchase'): Promise<{ cancelled: number; failed: number }> {
+    const ethPriceUsd = await this.apiService.getEthPriceUsd();
+    const live = this.inventoryManager.getAllActiveOffers().filter((o) => o.status === 'ACTIVE');
+    if (live.length === 0) return { cancelled: 0, failed: 0 };
+
+    // Group by network so WETH balance is checked per chain
+    const byNetwork = new Map<string, typeof live>();
+    for (const offer of live) {
+      const net = offer.network || 'robinhood';
+      const list = byNetwork.get(net) || [];
+      list.push(offer);
+      byNetwork.set(net, list);
+    }
+
+    let cancelled = 0;
+    let failed = 0;
+    const offerAllocLimitUsd = this.inventoryManager.getOfferAllocationLimitUsd();
+    const purchasedUsd = this.inventoryManager.getPurchasedNftCapitalUsd(ethPriceUsd);
+    const remainingOfferBudgetUsd = Math.max(0, offerAllocLimitUsd - purchasedUsd);
+
+    for (const [network, offers] of byNetwork) {
+      let wethBal = 0;
+      try {
+        wethBal = await this.seaportService.getWethBalance(network);
+      } catch {
+        wethBal = 0;
+      }
+
+      // Sort most expensive first — cancel those first until remaining offers are fundable
+      const sorted = [...offers].sort((a, b) => b.priceEth - a.priceEth);
+      let remainingEth = sorted.reduce((s, o) => s + o.priceEth, 0);
+      let remainingUsd = sorted.reduce((s, o) => s + (o.priceUsd || o.priceEth * ethPriceUsd), 0);
+
+      for (const offer of sorted) {
+        const offerUsd = offer.priceUsd || offer.priceEth * ethPriceUsd;
+        const wethOk = remainingEth <= wethBal + 1e-9;
+        const capitalOk = remainingUsd <= remainingOfferBudgetUsd + 0.000001;
+        if (wethOk && capitalOk) break;
+
+        logger.warn(
+          {
+            orderHash: offer.orderHash,
+            slug: offer.collectionSlug,
+            priceEth: offer.priceEth,
+            wethBal,
+            remainingEth,
+            remainingUsd,
+            remainingOfferBudgetUsd,
+            reason
+          },
+          'Insufficient capital for active offer after purchase — cancelling unfunded offer'
+        );
+        const res = await this.cancelAndVerifyOffer(offer, reason);
+        if (res.success) cancelled++;
+        else failed++;
+        remainingEth -= offer.priceEth;
+        remainingUsd -= offerUsd;
+      }
+    }
+
+    if (cancelled + failed > 0) {
+      logger.warn({ cancelled, failed }, `Capital insufficient after purchase: cancelled ${cancelled} unfunded offer(s), ${failed} failed verification`);
     }
     return { cancelled, failed };
   }
@@ -220,15 +292,23 @@ export class CollectionBidderStrategy {
     });
     if (fresh.floorPriceEth < minFloorEth - 1e-12) {
       return block(
-        `Floor (${fresh.floorPriceEth} ETH) is below minimum acceptable floor (${roundToPrecision(minFloorEth, 8)} ETH) for a ${marginPercent}% net margin after marketplace fee (${fresh.openseaFeeBps} bps), creator fee (${creatorFeeBps} bps) and gas.`
+        `Floor (${fresh.floorPriceEth} ETH) is below minimum acceptable floor (${roundToPrecision(minFloorEth, 8)} ETH) for a ${marginPercent}% margin after marketplace fee (${fresh.openseaFeeBps} bps) and gas (creator fees excluded from this margin floor).`
       );
     }
     const undercut = (this.config.profitTargets?.undercutFloorByPercent ?? 0) / 100;
     const expectedSaleEth = fresh.floorPriceEth * (1 - undercut);
+    // 12% margin check excludes creator fees; actual net profit still includes mandatory creator fees
+    const profitExclCreatorEth = expectedSaleEth * (1 - fresh.openseaFeeBps / 10000) - bidPriceEth - gasEth;
+    const marginExclCreator = bidPriceEth > 0 ? (profitExclCreatorEth / bidPriceEth) * 100 : 0;
+    if (marginExclCreator < marginPercent - 1e-9) {
+      return block(
+        `Expected margin (${marginExclCreator.toFixed(1)}%, creator fees excluded) is below minimum (${marginPercent}%).`
+      );
+    }
     const netProfitEth = expectedSaleEth * (1 - (fresh.openseaFeeBps + creatorFeeBps) / 10000) - bidPriceEth - gasEth;
     const minNetProfitUsd = targetConfig?.targetNetProfitUsd ?? this.config.capital?.minNetProfitUsd ?? 0.20;
     if (netProfitEth * ethPriceUsd < minNetProfitUsd - 0.005) {
-      return block(`Expected net profit ($${(netProfitEth * ethPriceUsd).toFixed(2)}) below minimum ($${minNetProfitUsd.toFixed(2)}).`);
+      return block(`Expected net profit ($${(netProfitEth * ethPriceUsd).toFixed(2)}) below minimum ($${minNetProfitUsd.toFixed(2)}) after creator fees and all costs.`);
     }
     // Keep freshData.topOfferEth aligned with the live competing book used for the #1 check
     if (competing) fresh.topOfferEth = competing.priceEth;
@@ -541,10 +621,10 @@ export class CollectionBidderStrategy {
       `Starting bidding cycle: Simultaneous offers enabled across all qualifying NFTs (up to ${offerLimitPercent}% capital allocation).`
     );
 
+    // NFT Monitoring & Tracking Price Range: monitor floors from $1 to $9 USD
     const minOfferPriceUsd = this.config.capital?.minOfferPriceUsd ?? 1.00;
-    const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30;
-    const minFloorUsd = roundToPrecision(minOfferPriceUsd * minFloorMultiplier, 2); // $1.30 minimum floor
-    const maxFloorUsd = 8.00; // Expanded to include high-volume collections like Hex-lings ($4.57) and Project Shiesty ($5.12)
+    const minFloorUsd = minOfferPriceUsd;
+    const maxFloorUsd = this.config.capital?.maxBuyPriceUsd ?? 9.00;
 
     const processedThisCycle = new Set<string>();
 
