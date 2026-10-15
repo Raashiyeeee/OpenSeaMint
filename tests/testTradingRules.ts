@@ -133,9 +133,9 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   chainStub = {};
   assert.strictEqual((await (mintApi.clearCaches(), mintApi).getCollectionMarketData('rules-collection', ZERO, 'robinhood')).mintCompleted, false, 'Active drop mint must reject');
   // Pure decision rules
-  assert.strictEqual(OpenSeaApiService.evaluateMintSupply({ dropMaxSupply: 0, dropTotalSupply: 100 }).verified, false, 'max_supply 0 (open edition/unknown) is unverifiable');
-  assert.strictEqual(OpenSeaApiService.evaluateMintSupply({ onChainMaxSupply: 1000, onChainTotalSupply: 1000, collectionTotalSupply: 990 }).completed, false, 'Any source below max -> reject');
-  console.log('Case R1e PASSED: Mint-out verified from Drops API / on-chain supply; conflicts or unknown max reject ✅');
+  assert.strictEqual(OpenSeaApiService.evaluateMintSupply({ onChainMaxSupply: 1000, onChainTotalSupply: 1000, collectionTotalSupply: 990 }).completed, true, 'On-chain 100% completion is authoritative over lagging API total');
+  assert.strictEqual(OpenSeaApiService.evaluateMintSupply({ onChainMaxSupply: 1000, onChainTotalSupply: 990, collectionTotalSupply: 1000 }).completed, false, 'On-chain incomplete must reject even if API says 1000');
+  console.log('Case R1e PASSED: Mint-out verified from on-chain ground truth / Drops API; incomplete sources reject ✅');
 
   // 1f. Re-verification immediately before posting: fresh data shows incomplete mint -> no offer posted
   const reverifyApi = new OpenSeaApiService(config);

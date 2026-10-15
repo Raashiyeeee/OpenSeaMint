@@ -162,6 +162,32 @@ export class OpenSeaApiService {
     if (isMinting) {
       return { verified: true, completed: false, isMinting, totalSupply, maxSupply, source, reason: 'Public mint is currently active (is_minting: true).' };
     }
+
+    // 1. Authoritative On-Chain Truth: If on-chain contract supply is verified, EVM state is ground truth
+    // (OpenSea centralized metadata API frequently lags behind on newly minted collections)
+    if (src.onChainTotalSupply !== undefined && src.onChainMaxSupply !== undefined && src.onChainMaxSupply > 0) {
+      if (src.onChainTotalSupply < src.onChainMaxSupply) {
+        return {
+          verified: true,
+          completed: false,
+          isMinting,
+          totalSupply: src.onChainTotalSupply,
+          maxSupply: src.onChainMaxSupply,
+          source,
+          reason: `Mint has not reached 100% of max supply on-chain (${src.onChainTotalSupply}/${src.onChainMaxSupply}).`
+        };
+      }
+      return {
+        verified: true,
+        completed: true,
+        isMinting,
+        totalSupply: src.onChainTotalSupply,
+        maxSupply: src.onChainMaxSupply,
+        source
+      };
+    }
+
+    // 2. Fallback for non-EVM or unverified on-chain supply: verify via API / drop candidates
     if (maxSupply !== undefined && totalSupply !== undefined) {
       // Every known total must have reached the (largest) known max supply
       const allReached = totalCandidates.every((t) => t >= maxSupply);
