@@ -866,6 +866,8 @@ export class SeaportService {
         'POST-SALE CONVERSION FAILED ❌: 90% WETH wrap was not completed and verified.'
       );
     }
+    // Refresh deposit baseline so the next deposit-sync cycle does not re-wrap sale proceeds / gas reserve
+    await this.refreshNativeEthBaseline(activeNetworkKey);
     return {
       success: verified,
       verified,
@@ -874,6 +876,96 @@ export class SeaportService {
       gasReserveRetainedEth: gasReserveRetained,
       error: swapRes.error || (verified ? undefined : `Wrapped ${swapRes.amountWrappedEth} ETH of required ${amountToWrap} ETH`)
     };
+  }
+
+  /** Updates the per-network native ETH baseline used by deposit detection (best-effort). */
+  private async refreshNativeEthBaseline(networkKey: string): Promise<void> {
+    try {
+      if (process.env.BOT_MODE === 'SIMULATION') return;
+      const networkInfo = this.config.networks?.[networkKey];
+      const provider = this.signer.provider || new ethers.JsonRpcProvider(networkInfo?.rpcUrl);
+      const bal = await provider.getBalance(this.signer.address);
+      this.lastKnownNativeEth[networkKey] = parseFloat(ethers.formatEther(bal));
+    } catch {
+      // non-fatal — next sync cycle will re-read
+    }
+  }
+
+  /** Last observed native ETH balance per network — used to detect fresh deposits. */
+  private lastKnownNativeEth: Record<string, number> = {};
+
+  /**
+   * Automatic ETH Deposit → WETH Conversion Rule:
+   * When ETH is deposited into the wallet, automatically convert 90% to WETH and hold 10% as gas reserve.
+   * Also catches unwrapped ETH left in the wallet after a restart (above a small dust threshold).
+   * Post-sale conversion remains handled separately by handlePostSaleEthConversion.
+   */
+  public async syncNativeEthAndWrapDeposits(networkKey?: string): Promise<{
+    success: boolean;
+    verified?: boolean;
+    txHash?: string;
+    amountWrappedEth: number;
+    gasReserveRetainedEth: number;
+    depositedEth?: number;
+    error?: string;
+  }> {
+    const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
+    const networkInfo = this.config.networks?.[activeNetworkKey];
+    const minReserveEth = this.config.general.minBalanceReserveEth ?? 0.0001;
+    // Treat balances above this as an unwrapped deposit that should be converted (not just gas dust)
+    const catchUpThresholdEth = Math.max(minReserveEth * 5, 0.001);
+
+    try {
+      if (process.env.BOT_MODE === 'SIMULATION') {
+        return { success: true, verified: true, amountWrappedEth: 0, gasReserveRetainedEth: 0 };
+      }
+
+      const provider = this.signer.provider || new ethers.JsonRpcProvider(networkInfo?.rpcUrl);
+      const nativeBalWei = await provider.getBalance(this.signer.address);
+      const nativeBalEth = parseFloat(ethers.formatEther(nativeBalWei));
+      const last = this.lastKnownNativeEth[activeNetworkKey];
+
+      let amountToConvert = 0;
+      if (last === undefined) {
+        // First observation: convert sizable unwrapped ETH (likely a deposit while bot was down)
+        if (nativeBalEth >= catchUpThresholdEth) {
+          amountToConvert = nativeBalEth;
+          logger.info(
+            { network: activeNetworkKey, nativeBalEth },
+            'DEPOSIT WETH SYNC: Unwrapped ETH detected on startup — converting 90% to WETH (10% gas reserve)...'
+          );
+        }
+      } else if (nativeBalEth > last + 0.00001) {
+        amountToConvert = nativeBalEth - last;
+        logger.info(
+          { network: activeNetworkKey, depositedEth: amountToConvert, previousBal: last, currentBal: nativeBalEth },
+          'DEPOSIT DETECTED: Automatically converting 90% of deposited ETH into WETH (10% held for gas reserve)...'
+        );
+      }
+
+      if (amountToConvert <= 0.000005) {
+        this.lastKnownNativeEth[activeNetworkKey] = nativeBalEth;
+        return { success: true, verified: true, amountWrappedEth: 0, gasReserveRetainedEth: 0, depositedEth: 0 };
+      }
+
+      const conversion = await this.handlePostSaleEthConversion(amountToConvert, activeNetworkKey);
+      // Refresh baseline after wrap (and any gas spent)
+      const afterWei = await provider.getBalance(this.signer.address);
+      this.lastKnownNativeEth[activeNetworkKey] = parseFloat(ethers.formatEther(afterWei));
+      return {
+        ...conversion,
+        depositedEth: amountToConvert
+      };
+    } catch (err: any) {
+      logger.error({ network: activeNetworkKey, error: err.message }, 'DEPOSIT WETH SYNC FAILED ❌');
+      return {
+        success: false,
+        verified: false,
+        amountWrappedEth: 0,
+        gasReserveRetainedEth: 0,
+        error: err.message
+      };
+    }
   }
 
   /**

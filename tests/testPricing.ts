@@ -165,7 +165,7 @@ console.log('Test 5 PASSED: Simultaneous offers and 70% capital allocation verif
 console.log('--- Test 6: Network Gas Comparison on $10 Trade ---');
 const rhTrade = pricingEngine.evaluateOfferScenario({
   offerPriceUsd: 10.0,
-  floorPriceUsd: 15.0, // 40% net margin rule: floor 13 (~23% margin) no longer qualifies
+  floorPriceUsd: 15.0, // 12% margin rule (creator fees excluded from margin %); actual net profit still counts fees
   royaltyPercent: 5.0,
   marketplaceFeePercent: 0.5,
   networkGasUsd: 0.01, // Robinhood Chain low gas
@@ -273,7 +273,7 @@ console.log('Case 7c PASSED: Genuine liquid collection passed Check L!\n');
 // TEST 8: Minimum 13% Price Advantage & Profit Percentage Rule
 // Expected resale must be >= 13% above offer price and yield >= $2 profit.
 // --------------------------------------------------------------------------
-console.log('--- Test 8: Minimum 40% Net Profit Margin Rule ($3 Max NFT Profile) ---');
+console.log('--- Test 8: Minimum 12% Profit Margin Rule (creator fees excluded from margin %) ---');
 const highMarginData: CollectionMarketData = {
   slug: 'high-margin-nft',
   contractAddress: '0x4444444444444444444444444444444444444444',
@@ -295,20 +295,20 @@ const highMarginData: CollectionMarketData = {
 };
 const highMarginCalc = pricingEngine.calculateMaxBid(highMarginData, 0.20, 10.0, 'robinhood');
 assert.strictEqual(highMarginCalc.decision, 'ACCEPT', 'High margin liquid trade must be accepted');
-assert(highMarginCalc.marginPercent >= 40.0, 'Profit margin must be >= 40%');
+assert(highMarginCalc.marginPercent >= 12.0, 'Profit margin (creator excluded) must be >= 12%');
 assert(highMarginCalc.netProfitUsd > 0, 'Net profit must be positive');
-assert(highMarginCalc.bidPriceUsd <= 3.0, 'Bid price must be <= $3.00');
-console.log('Test 8 PASSED: Margin is ' + highMarginCalc.marginPercent + '% (>= 40%) and net profit is $' + highMarginCalc.netProfitUsd, '\n');
+assert(highMarginCalc.bidPriceUsd <= 9.0, 'Bid price must be within $1–$9 monitoring/buy range');
+console.log('Test 8 PASSED: Margin is ' + highMarginCalc.marginPercent + '% (>= 12%) and net profit is $' + highMarginCalc.netProfitUsd, '\n');
 
 // --------------------------------------------------------------------------
-// TEST 9: Strict $5.00 Maximum Buy Price Ceiling
+// TEST 9: Strict $9.00 Maximum Buy / Monitoring Price Ceiling
 // --------------------------------------------------------------------------
-console.log('--- Test 9: Strict $5.00 Maximum Buy Price Ceiling ---');
+console.log('--- Test 9: Strict $9.00 Maximum Buy Price Ceiling ---');
 const expensiveData: CollectionMarketData = {
   slug: 'expensive-nft',
   contractAddress: '0x5555555555555555555555555555555555555555',
   floorPriceEth: 0.008, // ~$21.60
-  topOfferEth: 0.003,   // ~$8.10
+  topOfferEth: 0.0035,  // ~$9.45 — above $9 max; cannot become #1 within buy ceiling
   numListings: 10,
   openseaFeeBps: 100,
   royaltyFeeBps: 50,
@@ -324,8 +324,8 @@ const expensiveData: CollectionMarketData = {
   liquidityPassed: true
 };
 const expensiveCalc = pricingEngine.calculateMaxBid(expensiveData, 0.20, 10.0, 'robinhood');
-assert.strictEqual(expensiveCalc.decision, 'REJECT', 'Expensive trade (> $5 buy price) must be rejected');
-console.log('Test 9 PASSED: Trade above $5 correctly rejected:', expensiveCalc.reason, '\n');
+assert.strictEqual(expensiveCalc.decision, 'REJECT', 'Trade requiring bid above $9 max buy price must be rejected');
+console.log('Test 9 PASSED: Trade above $9 correctly rejected:', expensiveCalc.reason, '\n');
 
 // --------------------------------------------------------------------------
 // TEST 10: Floor Dump Protection & Relist/Hold Evaluation (Rule 6, 7, 8)

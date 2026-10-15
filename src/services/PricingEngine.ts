@@ -9,12 +9,13 @@ export class PricingEngine {
     this.config = config;
   }
 
-  /** Hard minimum net profit margin (net profit / offer price) required for every offer and listing. */
-  public static readonly MIN_NET_MARGIN_PERCENT = 40.0;
+  /** Hard minimum profit margin (excludes creator fees) required for every offer and listing. */
+  public static readonly MIN_NET_MARGIN_PERCENT = 12.0;
 
   /**
-   * Effective minimum net margin: the configured value (per-target minMarginPercent, else
-   * profitTargets.defaultMinMarginPercent, default 40%), but never below the 40% rule.
+   * Effective minimum margin: the configured value (per-target minMarginPercent, else
+   * profitTargets.defaultMinMarginPercent, default 12%), but never below the 12% rule.
+   * Creator fees are excluded from this specific margin percentage.
    */
   public getMinMarginPercent(targetConfig?: { minMarginPercent?: number }): number {
     const configured = targetConfig?.minMarginPercent ?? this.config.profitTargets?.defaultMinMarginPercent ?? PricingEngine.MIN_NET_MARGIN_PERCENT;
@@ -22,17 +23,16 @@ export class PricingEngine {
   }
 
   /**
-   * Minimum Acceptable Floor Price (Rule B):
-   * the floor at which the expected sale (floor less the listing undercut) yields exactly the required net margin
-   * after marketplace fee, the applicable (non-disableable) creator fee, gas and other costs:
-   *   floor * (1 - undercut) * (1 - marketplaceFee - creatorFee) - offer - gas - other = margin * offer
-   *   => minFloor = (offer * (1 + margin) + gas + other) / ((1 - undercut) * (1 - marketplaceFee - creatorFee))
-   * Returns Infinity when fees make any profit impossible.
+   * Minimum Acceptable Floor Price for the 12% margin rule (creator fees excluded from this calculation):
+   *   floor * (1 - undercut) * (1 - marketplaceFee) - offer - gas - other = margin * offer
+   *   => minFloor = (offer * (1 + margin) + gas + other) / ((1 - undercut) * (1 - marketplaceFee))
+   * Mandatory creator fees are evaluated separately via actual net-profit checks.
+   * Returns Infinity when marketplace fees make any margin impossible.
    */
   public computeMinAcceptableFloorEth(params: {
     offerEth: number;
     openseaFeeBps: number;
-    creatorFeeBps: number;
+    creatorFeeBps: number; // retained for call-site compat; excluded from this margin floor formula
     gasEth: number;
     otherCostsEth?: number;
     undercutPercent?: number;
@@ -40,7 +40,8 @@ export class PricingEngine {
   }): number {
     const margin = (params.marginPercent ?? this.getMinMarginPercent()) / 100;
     const undercut = (params.undercutPercent ?? this.config.profitTargets?.undercutFloorByPercent ?? 0) / 100;
-    const feeRate = (params.openseaFeeBps + params.creatorFeeBps) / 10000;
+    // NFT Offer Profitability Rule: exclude creator fees from this specific margin-floor calculation
+    const feeRate = params.openseaFeeBps / 10000;
     const denom = (1 - undercut) * (1 - feeRate);
     if (denom <= 0) return Infinity;
     return (params.offerEth * (1 + margin) + params.gasEth + (params.otherCostsEth ?? 0)) / denom;
@@ -128,21 +129,22 @@ export class PricingEngine {
     const gasUsd = roundToPrecision(networkGasUsd, 2);
     const extraCostsUsd = roundToPrecision(otherCostsUsd, 2);
 
-    // Formula 2: Total Acquisition and Selling Costs
-    // Total costs must include purchase price, creator fees, marketplace fees, gas fees, and other applicable costs.
+    // Actual net profit (includes creator fees when mandatory) — used for trade viability
     const totalCostsUsd = roundToPrecision(
       purchasePriceUsd + creatorFeeUsd + marketplaceFeeUsd + gasUsd + extraCostsUsd,
       2
     );
-
-    // Formula 2: Net Profit = Expected Sale Revenue - Total Acquisition and Selling Costs
     const expectedNetProfitUsd = roundToPrecision(expectedSaleRevenueUsd - totalCostsUsd, 2);
 
     // Net proceeds from sale after royalty & marketplace fees (for backward compatibility)
     const netProceedsUsd = roundToPrecision(realisticSalePriceUsd - royaltyUsd - marketplaceFeeUsd, 2);
 
-    // Profit margin percentage relative to acquisition cost
-    const marginPercent = offerPriceUsd > 0 ? roundToPrecision((expectedNetProfitUsd / offerPriceUsd) * 100, 2) : 0;
+    // 12% margin rule: exclude creator fees from this specific profit-margin calculation
+    const profitExcludingCreatorUsd = roundToPrecision(
+      expectedSaleRevenueUsd - purchasePriceUsd - marketplaceFeeUsd - gasUsd - extraCostsUsd,
+      2
+    );
+    const marginPercent = offerPriceUsd > 0 ? roundToPrecision((profitExcludingCreatorUsd / offerPriceUsd) * 100, 2) : 0;
 
     // Check A: Capital check
     const checkACapitalPassed = offerPriceUsd <= availableCapitalUsd && offerPriceUsd > 0;
@@ -150,7 +152,7 @@ export class PricingEngine {
     // Check A2: Minimum Offer Price Rule ($1.00 minimum offer per NFT)
     const checkMinOfferPassed = offerPriceUsd >= minOfferPriceUsd;
 
-    // Check B: Profitability check (including creator fees and all costs)
+    // Check B: 12%+ margin (creator excluded) AND actual net profit after creator fees meets minimum
     const marginCheckPassed = marginPercent >= minMarginPercent;
     const checkBProfitPassed = expectedNetProfitUsd >= minNetProfitUsd && expectedNetProfitUsd > 0 && marginCheckPassed;
 
@@ -317,7 +319,12 @@ export class PricingEngine {
     );
 
     const expectedNetProfitUsd = roundToPrecision(expectedSaleRevenueUsd - totalAcquisitionAndSellingCostsUsd, 2);
-    const marginPercent = proposedOfferUsd > 0 ? roundToPrecision((expectedNetProfitUsd / proposedOfferUsd) * 100, 2) : 0;
+    // 12% margin rule: exclude creator fees from this specific profit-margin calculation
+    const profitExcludingCreatorUsd = roundToPrecision(
+      expectedSaleRevenueUsd - purchasePriceUsd - marketplaceFeeUsd - gasFeeUsd - extraCostsUsd,
+      2
+    );
+    const marginPercent = proposedOfferUsd > 0 ? roundToPrecision((profitExcludingCreatorUsd / proposedOfferUsd) * 100, 2) : 0;
 
     const netProfitabilityPassed =
       expectedNetProfitUsd >= minNetProfitUsd &&
@@ -466,8 +473,10 @@ export class PricingEngine {
     const totalFeesEth = openseaFeeEth + royaltyFeeEth;
     const totalFeesUsd = totalFeesEth * ethPriceUsd;
 
-    // Net proceeds from sale before gas
+    // Net proceeds from sale before gas (includes mandatory creator fee for actual profitability)
     const netProceedsEth = targetListPriceEth - totalFeesEth;
+    // Proceeds excluding creator fee — used only for the 12% margin bid ceiling
+    const netProceedsExclCreatorEth = targetListPriceEth - openseaFeeEth;
 
     // Network Gas Cost estimation based on specific network
     const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
@@ -475,14 +484,15 @@ export class PricingEngine {
     const estimatedGasCostUsd = networkInfo?.estimatedGasCostUsd ?? (activeNetworkKey === 'mainnet' ? 3.50 : 0.01);
     const estimatedGasCostEth = estimatedGasCostUsd / ethPriceUsd;
 
-    // Net proceeds after all fees AND gas
+    // Net proceeds after all fees AND gas (actual profitability, creator included)
     const netProceedsAfterGasEth = netProceedsEth - estimatedGasCostEth;
+    const netProceedsExclCreatorAfterGasEth = netProceedsExclCreatorEth - estimatedGasCostEth;
 
     // 1. Calculate Maximum Profitable Bid Price
-    // 40% Net Margin Rule: net profit / offer >= 40% after marketplace fee, applicable creator fee and gas
+    // 12% Margin Rule: (sale - marketplace fee - gas - offer) / offer >= 12% — creator fees excluded from this calc
     const minMarginPercent = this.getMinMarginPercent(targetConfig);
-    const maxMarginBidEth = netProceedsAfterGasEth / (1 + (minMarginPercent / 100));
-    // Minimum required net profit (USD) ceiling: bid + all costs + minNetProfit <= expected revenue
+    const maxMarginBidEth = netProceedsExclCreatorAfterGasEth / (1 + (minMarginPercent / 100));
+    // Minimum required net profit (USD) ceiling: bid + all costs (incl. creator) + minNetProfit <= expected revenue
     const maxNetProfitBidEth = netProceedsAfterGasEth - targetProfitEth;
     
     // Floor ratio ceiling (Floor Price >= Offer Price * 1.30, excluding creator fees from this comparison)
@@ -492,7 +502,7 @@ export class PricingEngine {
     // Larry's strategy: floor price multiple (e.g. 0.85 = 15% discount)
     const floorMultiple = targetConfig?.floorPriceMultiple ?? (1 - (this.config.profitTargets.bidUnderFloorPercent / 100));
     const floorDiscountLimit = floor * floorMultiple;
-    const maxBuyPriceUsd = this.config.capital?.maxBuyPriceUsd ?? 5.00;
+    const maxBuyPriceUsd = this.config.capital?.maxBuyPriceUsd ?? 9.00;
     const maxBuyPriceEth = maxBuyPriceUsd / ethPriceUsd;
 
     let maxProfitableBidEth = Math.min(
@@ -575,7 +585,9 @@ export class PricingEngine {
     const grossProfitUsd = roundToPrecision(grossProfitEth * ethPriceUsd, 2);
     const netProfitEth = expectedSaleRevenueEth - totalCostsEth;
     const netProfitUsd = roundToPrecision(netProfitEth * ethPriceUsd, 2);
-    const marginPercent = finalBidEth > 0 ? (netProfitEth / finalBidEth) * 100 : 0;
+    // 12% margin rule: exclude creator fees from this specific profit-margin calculation
+    const profitExcludingCreatorEth = expectedSaleRevenueEth - purchasePriceEth - openseaFeeEth - estimatedGasCostEth;
+    const marginPercent = finalBidEth > 0 ? (profitExcludingCreatorEth / finalBidEth) * 100 : 0;
 
     // Final Buy Filter (NFT Offer Eligibility Rules & Protections):
     // Rule 1: 10+ completed sales within 3 hours in native ETH (WETH strictly excluded)
@@ -599,7 +611,7 @@ export class PricingEngine {
     const checkFFloorRatioPassed = finalBidEth > 0 && floor >= (finalBidEth * minFloorMultiplier - 0.000001);
     const checkACapitalPassed = finalBidEth <= maxCapitalEth && finalBidEth > 0 && bidPriceUsd <= maxBuyPriceUsd;
 
-    // Rule B: Minimum Acceptable Floor Price (40% net margin after ALL fees incl. non-disableable creator fee)
+    // Rule B: Minimum Acceptable Floor Price (12% margin; creator fees excluded from this specific calc)
     const minAcceptableFloorEth = this.computeMinAcceptableFloorEth({
       offerEth: finalBidEth,
       openseaFeeBps: marketData.openseaFeeBps,
@@ -658,13 +670,13 @@ export class PricingEngine {
     } else if (netProfitUsd <= 0) {
       reason = `Check B Failed: Net profit ($${netProfitUsd.toFixed(2)}) is negative or zero after royalties, fees, and gas`;
     } else if (!checkMinFloorPassed) {
-      reason = `Check B Failed: Floor (${floor} ETH) is below the minimum acceptable floor (${roundToPrecision(minAcceptableFloorEth, 8)} ETH) required for a ${minMarginPercent}% net margin after marketplace fee, creator fee and gas.`;
+      reason = `Check B Failed: Floor (${floor} ETH) is below the minimum acceptable floor (${roundToPrecision(minAcceptableFloorEth, 8)} ETH) required for a ${minMarginPercent}% margin after marketplace fee and gas (creator fees excluded from this margin floor).`;
     } else if (!royaltyWithinCeiling) {
       reason = `Check B Failed: Mandatory creator fee (${marketData.royaltyFeeBps} bps) exceeds maximum acceptable creator fee (${this.config.fees.maxAcceptableRoyaltyBps} bps).`;
     } else if (netProfitEth < targetProfitEth - 1e-12) {
       reason = `Check B Failed: Net profit ($${netProfitUsd.toFixed(2)}) is below minimum required net profit ($${minNetProfit.toFixed(2)}) after creator fees, marketplace fees, and gas.`;
     } else if (marginPercent < minMarginPercent) {
-      reason = `Check B Failed: Margin (${marginPercent.toFixed(1)}%) is below minimum net profit threshold (${minMarginPercent}%).`;
+      reason = `Check B Failed: Margin (${marginPercent.toFixed(1)}%, creator fees excluded) is below minimum threshold (${minMarginPercent}%).`;
     }
 
     return {
@@ -813,15 +825,15 @@ export class PricingEngine {
     const totalFeeRate = openseaFeeRate + royaltyFeeRate;
 
     // Hard rule: List price must NEVER be below acquiredPriceEth (Rule 6)
-    // No-loss selling: proceeds after fees & gas must cover cost + profit (Rule 7)
-    // 40% Net Margin Rule: proceeds after marketplace fee, creator fee and gas must be >= cost * 1.40.
+    // No-loss selling: proceeds after ALL fees (incl. creator) & gas must cover cost + min net profit
+    // 12% Margin Rule: margin floor excludes creator fees; actual profitability still includes them.
     // Rounded UP so rounding can never push the price below the required margin.
     const margin = this.getMinMarginPercent() / 100;
     const ceil6 = (v: number) => Math.ceil(v * 1e6 - 1e-9) / 1e6;
     const minProfitablePriceEth = Math.max(
       acquiredPriceEth,
       ceil6((acquiredPriceEth + profitGoalEth + estimatedGasCostEth) / (1 - totalFeeRate)),
-      ceil6((acquiredPriceEth * (1 + margin) + estimatedGasCostEth) / (1 - totalFeeRate))
+      ceil6((acquiredPriceEth * (1 + margin) + estimatedGasCostEth) / (1 - openseaFeeRate))
     );
 
     const hardBreakevenPriceEth = Math.max(
