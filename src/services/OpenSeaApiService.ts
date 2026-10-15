@@ -1159,70 +1159,104 @@ export class OpenSeaApiService {
   }
 
   /**
-   * Dynamically discovers active collections with floor prices between minFloorUsd and maxFloorUsd on a given network
+   * Dynamically discovers active collections with floor prices between minFloorUsd and maxFloorUsd on a given network.
+   * Includes cursor-based pagination (up to 300-500 collections) and controlled batching (5 at a time) with 30s timeout.
    */
   public async discoverCollectionsByChain(
     networkKey: string,
     minFloorUsd: number = 0.50,
-    maxFloorUsd: number = 3.50
+    maxFloorUsd: number = 3.50,
+    maxPages: number = 4
   ): Promise<any[]> {
     const chainSlug = OpenSeaApiService.toOpenSeaChain(networkKey);
     const ethPriceUsd = await this.getEthPriceUsd();
     const discovered: any[] = [];
 
     try {
-      // Query top collections sorted by 1-day trading volume
-      const res = await this.client.get(`/collections?chain=${chainSlug}&limit=100&order_by=one_day_volume`);
-      const collections = (res.data?.collections || []).filter(
-        (col: any) => col.collection_offers_enabled && !col.is_disabled
-      );
+      // 1. Paginated collection discovery (follows OpenSea `next` cursor up to maxPages)
+      const allCollections: any[] = [];
+      const seenSlugs = new Set<string>();
+      let nextCursor: string | undefined;
 
-      // Concurrent stats fetch in parallel batches for low latency
-      const statsPromises = collections.map(async (col: any) => {
-        const contract = col.contracts?.find((c: any) => c.chain === chainSlug)?.address || col.contracts?.[0]?.address;
-        if (!contract) return null;
-        try {
-          const statsRes = await this.client.get(`/collections/${col.collection}/stats`, { timeout: 4000 });
-          const floor = statsRes.data?.total?.floor_price;
-          const symbol = statsRes.data?.total?.floor_price_symbol || 'ETH';
-          const oneDaySales = statsRes.data?.intervals?.find((i: any) => i.interval === 'one_day')?.sales || 0;
-
-          if (floor !== undefined && floor !== null && floor > 0 && (symbol === 'ETH' || symbol === 'WETH')) {
-            const floorUsd = floor * ethPriceUsd;
-            // Floor within target range AND has verified trading activity (>= 1 sale, prioritized >= 5)
-            if (floorUsd >= minFloorUsd && floorUsd <= maxFloorUsd && oneDaySales >= 1) {
-              return {
-                name: col.name,
-                slug: col.collection,
-                contractAddress: contract,
-                network: networkKey,
-                floorEth: floor,
-                floorUsd,
-                oneDaySales
-              };
-            }
-          }
-        } catch {
-          // Skip on error
-        }
-        return null;
-      });
-
-      const results = await Promise.all(statsPromises);
-      for (const item of results) {
-        if (!item) continue;
-        logger.info(
-          {
-            name: item.name,
-            slug: item.slug,
-            network: networkKey,
-            floorEth: item.floorEth,
-            floorUsd: `$${item.floorUsd.toFixed(2)}`,
-            oneDaySales: item.oneDaySales
-          },
-          `Dynamic Discovery: Found active ${networkKey.toUpperCase()} volume collection ($${minFloorUsd}-$${maxFloorUsd})`
+      for (let page = 0; page < maxPages; page++) {
+        const url =
+          `/collections?chain=${chainSlug}&limit=100&order_by=one_day_volume` +
+          (nextCursor ? `&next=${encodeURIComponent(nextCursor)}` : '');
+        const res = await this.client.get(url);
+        const batch = (res.data?.collections || []).filter(
+          (col: any) => col.collection_offers_enabled && !col.is_disabled
         );
-        discovered.push(item);
+
+        for (const col of batch) {
+          const slug = col.collection;
+          if (slug && !seenSlugs.has(slug)) {
+            seenSlugs.add(slug);
+            allCollections.push(col);
+          }
+        }
+
+        nextCursor = res.data?.next;
+        if (!nextCursor || (res.data?.collections || []).length === 0) {
+          break;
+        }
+      }
+
+      // 2. Controlled batch processing (5 at a time) with 30s timeout to prevent rate-limiter queue aborts
+      const batchSize = 5;
+      for (let i = 0; i < allCollections.length; i += batchSize) {
+        const chunk = allCollections.slice(i, i + batchSize);
+        const chunkPromises = chunk.map(async (col: any) => {
+          const contract =
+            col.contracts?.find((c: any) => c.chain === chainSlug)?.address || col.contracts?.[0]?.address;
+          if (!contract) return null;
+          try {
+            const statsRes = await this.cached(
+              this.statsCache,
+              col.collection,
+              this.ttl('stats', 60_000),
+              async () => (await this.client.get(`/collections/${col.collection}/stats`, { timeout: 30000 })).data
+            );
+            const floor = statsRes?.total?.floor_price;
+            const symbol = statsRes?.total?.floor_price_symbol || 'ETH';
+            const oneDaySales = statsRes?.intervals?.find((intervalItem: any) => intervalItem.interval === 'one_day')?.sales || 0;
+
+            if (floor !== undefined && floor !== null && floor > 0 && (symbol === 'ETH' || symbol === 'WETH')) {
+              const floorUsd = floor * ethPriceUsd;
+              // Floor within target range AND has verified trading activity (>= 1 sale, prioritized >= 5)
+              if (floorUsd >= minFloorUsd && floorUsd <= maxFloorUsd && oneDaySales >= 1) {
+                return {
+                  name: col.name,
+                  slug: col.collection,
+                  contractAddress: contract,
+                  network: networkKey,
+                  floorEth: floor,
+                  floorUsd,
+                  oneDaySales
+                };
+              }
+            }
+          } catch {
+            // Skip on error
+          }
+          return null;
+        });
+
+        const chunkResults = await Promise.all(chunkPromises);
+        for (const item of chunkResults) {
+          if (!item) continue;
+          logger.info(
+            {
+              name: item.name,
+              slug: item.slug,
+              network: networkKey,
+              floorEth: item.floorEth,
+              floorUsd: `$${item.floorUsd.toFixed(2)}`,
+              oneDaySales: item.oneDaySales
+            },
+            `Dynamic Discovery: Found active ${networkKey.toUpperCase()} volume collection ($${minFloorUsd}-$${maxFloorUsd})`
+          );
+          discovered.push(item);
+        }
       }
     } catch (err: any) {
       logger.debug({ network: networkKey, err: err.message }, 'Dynamic collection discovery routine failed');
