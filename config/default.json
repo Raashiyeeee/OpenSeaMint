@@ -81,34 +81,7 @@
     "maxAllowedFloorDeclinePercent": 40.0,
     "extremeFloorDeclinePercent": 90.0
   },
-  "targetCollections": [
-    {
-      "name": "Hex-lings",
-      "slug": "hex-lings",
-      "contractAddress": "0x3e19865ffbfe89085feee74245cce289c0b11566",
-      "network": "robinhood",
-      "enabled": false,
-      "maxBidEth": 0.0015,
-      "targetNetProfitUsd": 0.20,
-      "maxInventory": 1,
-      "minMarginPercent": 12.0,
-      "minSales24Hours": 10
-    },
-    {
-      "name": "Robinhood Bear",
-      "slug": "robinhoodbear",
-      "contractAddress": "0x0084e3f586dfd424b959e80537208cef4cbcee21",
-      "network": "robinhood",
-      "enabled": false,
-      "maxBidEth": 0.001,
-      "targetNetProfitUsd": 0.15,
-      "maxInventory": 1,
-      "floorPriceMultiple": 0.85,
-      "minMarginPercent": 12.0,
-      "minSales24Hours": 10,
-      "singleTokenBids": true
-    }
-  ],
+  "targetCollections": [],
   "seaport": {
     "version": "1.6",
     "contractAddress": "0x0000000000000068F116a894984e2DB1123eB395",
