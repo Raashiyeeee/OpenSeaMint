@@ -632,17 +632,21 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   // ------------------------------------------------------------------------
   // RULES A-E: 12% margin (creator excluded), minimum acceptable floor, creator fee, final validation, auto-listing
   // ------------------------------------------------------------------------
-  console.log('--- Rules A-E ---');
-  // A. 12% is the minimum margin (configured default 12; lower per-target values are raised to 12)
+  // A. Tiered margins: up to $5 requires 30%, >$5-$9 requires 12% profit after creator fee (e.g. 10% fee -> 22% pre-fee margin)
   assert.strictEqual(pricingEngine.getMinMarginPercent(), 12);
   assert.strictEqual(pricingEngine.getMinMarginPercent({ minMarginPercent: 5 }), 12, 'Per-target 5% cannot weaken the 12% rule');
   assert.strictEqual(pricingEngine.getMinMarginPercent({ minMarginPercent: 15 }), 15, 'Stricter per-target margin is honoured');
+  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 2.50), 30, '$1 to $4 tier must enforce 30% margin');
+  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 4.00), 30, '$4.00 boundary must enforce 30% margin');
+  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 4.01), 12, '>$4 tier with 0% fee must enforce 12% margin');
+  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 6.00, 10), 22, '>$4 tier with 10% creator fee must enforce 22% margin before fee');
+  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 7.50, 5), 17, '>$4 tier with 5% creator fee must enforce 17% margin before fee');
   const aCalc = pricingEngine.calculateMaxBid(baseMarketData({ floorPriceEth: 0.002, royaltyFeeBps: 500 }), undefined, undefined, 'robinhood');
   if (aCalc.decision === 'ACCEPT') {
     assert(aCalc.marginPercent >= 12 - 1e-6, `Accepted bid must yield >= 12% margin excl. creator (got ${aCalc.marginPercent})`);
     assert(aCalc.minAcceptableFloorEth !== undefined && 0.002 >= aCalc.minAcceptableFloorEth, 'Floor must be >= min acceptable floor');
   }
-  console.log('Case A PASSED: 12% minimum margin enforced (and per-target lower values raised) ✅');
+  console.log('Case A PASSED: Tiered margins (up to $5 -> 30%, >$5-$9 -> 12% after creator fee) enforced ✅');
 
   // B. Minimum acceptable floor for 12% margin — creator fees excluded from this specific formula
   // minFloor = offer*1.12 / (1 - marketplaceFee) = 0.00112 / 0.995
@@ -699,10 +703,21 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   freshData = baseMarketData({ floorPriceEth: 0.0016, referenceFloorEth: 0.0016, totalSupply: 900 });
   assert.strictEqual((await fv(0.001)).passed, false, 'Mint-out re-checked in final validation');
   freshData = baseMarketData({ floorPriceEth: 0.0016, referenceFloorEth: 0.0016, sales3Hours: 3 });
-  assert.strictEqual((await fv(0.001)).passed, false, 'Recent sales re-checked in final validation');
+  // Tier 1 pre-offer check: $2.70 offer with 20% margin floor (passes 12% but fails 30%)
+  freshData = baseMarketData({ floorPriceEth: 0.00132, referenceFloorEth: 0.00132, openseaFeeBps: 500 });
+  const tier1Check = await fv(0.001);
+  assert.strictEqual(tier1Check.passed, false, 'Up to $5 offer with <30% margin must be rejected');
+  assert(/30%/.test(tier1Check.reason), tier1Check.reason);
+
+  // Tier 2 pre-offer check: $6.75 offer (0.0025 ETH) with 10% creator fee requiring 22% pre-fee margin and 12% post-creator profit
+  // With 1200 bps creator fee, pre-fee margin required is 24% (12% + 12%)
+  freshData = baseMarketData({ floorPriceEth: 0.0033, referenceFloorEth: 0.0033, openseaFeeBps: 500, royaltyFeeBps: 1200 });
+  const tier2Check = await fv(0.0025);
+  assert.strictEqual(tier2Check.passed, false, '>$5 offer failing 12% post-creator profit must be rejected');
+  assert(/creator fee/.test(tier2Check.reason), tier2Check.reason);
   (dApi as any).getCollectionMarketData = async () => { throw new Error('down'); };
   assert.strictEqual((await fv(0.001)).passed, false, 'Unfetchable fresh data rejects');
-  console.log('Case C/D PASSED: Final validation (fresh data) checks mint, sales, dump, creator-fee status, 1.30x, 12% min floor, and Top-Priority #1 ✅');
+  console.log('Case C/D PASSED: Final validation (fresh data) checks mint, sales, dump, creator-fee status, 1.30x, tiered margin, and Top-Priority #1 ✅');
 
   // E. Auto-listing & competitive repricing
   const eApi = new OpenSeaApiService(config);
@@ -754,14 +769,266 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   eInv.getInventoryItem(eId)!.lastListingUpdateAt = undefined;
   await relister.monitorListedInventory();
   assert(eInv.getInventoryItem(eId)!.currentListingPriceEth! < 0.0020, 'Relisted at top position once profitable');
-  // not-yet-listed NFT with floor below min profitable price -> HOLD (not listed)
+  // not-yet-listed NFT with floor below min profitable price -> LISTED within profit range (never held on floor drop)
   const hId = '0x2222222222222222222222222222222222222222:8';
   competitor = null;
   eData.floorPriceEth = 0.0025;
   await relister.handleItemAcquired('rules-collection', '0x2222222222222222222222222222222222222222', '8', 0.0025, 'robinhood');
-  assert.strictEqual(eInv.getInventoryItem(hId)!.status, 'HOLDING', 'Unprofitable NFT is held, never listed at a loss');
+  assert.strictEqual(eInv.getInventoryItem(hId)!.status, 'LISTED', 'NFT is listed within profit range, never held simply because floor dropped');
+  assert(eInv.getInventoryItem(hId)!.currentListingPriceEth! > 0.0025, 'Listed within profit range');
   assert(firstPrice > 0);
-  console.log('Case E PASSED: Auto-list at >=12% margin, undercut competitors when profitable, hold otherwise, cooldown anti-churn ✅\n');
+  // F. USDG Offer, Floor Price & Automatic WETH Swap Rules
+  console.log('--- USDG Offer, Floor Price & Automatic WETH Swap Rules ---');
+  // 1. Accurate Currency and Floor Price Validation: USDG is not assumed to be 1:1 with ETH
+  const usdgOpenSeaApi = new OpenSeaApiService(config);
+  const usdgStatsRes = {
+    total: { floor_price: '4.5', floor_price_symbol: 'USDG' },
+    intervals: [{ interval: 'one_day', sales: 12 }]
+  };
+  (usdgOpenSeaApi as any).client = {
+    get: async (url: string) => {
+      if (url.includes('/collections?')) {
+        return {
+          data: {
+            collections: [
+              {
+                name: 'USDG Col',
+                collection: 'usdg-col',
+                collection_offers_enabled: true,
+                contracts: [{ address: '0x3333333333333333333333333333333333333333' }]
+              }
+            ]
+          }
+        };
+      }
+      if (url.includes('/stats')) return { data: usdgStatsRes };
+      if (url.includes('/listings/collection')) return { data: { listings: [] } };
+      return { data: {} };
+    }
+  };
+  (usdgOpenSeaApi as any).getEthPriceUsd = async () => 2700;
+  const fastFloorRes = await usdgOpenSeaApi.discoverCollectionsByChain('robinhood', 1.0, 9.0, 1);
+  assert(fastFloorRes.length === 1, 'USDG collection discovered in target price range');
+  assert.strictEqual(fastFloorRes[0].currency, 'USDG');
+  assert.strictEqual(fastFloorRes[0].floorUsd, 4.5);
+  // 4.5 USDG at $2700/ETH must be ~0.001667 ETH, never 4.5 ETH!
+  assert(Math.abs(fastFloorRes[0].floorEth - (4.5 / 2700)) < 1e-6, `floorEth must be 4.5/2700, got ${fastFloorRes[0].floorEth}`);
+
+  // 2. Mandatory Profitability Check for USDG
+  const usdgMarketData = baseMarketData({
+    currency: 'USDG',
+    floorPriceUsdg: 4.5,
+    floorPriceEth: 4.5 / 2700,
+    referenceFloorEth: 4.5 / 2700,
+    openseaFeeBps: 50,
+    royaltyFeeBps: 0
+  });
+  const usdgPricing = pricingEngine.calculateMaxBid(usdgMarketData, 0.20, 10.0, 'robinhood');
+  assert.strictEqual(usdgPricing.currency, 'USDG');
+  assert(usdgPricing.bidPriceUsd <= 4.5, 'USDG bid is capped by USDG floor');
+  assert(usdgPricing.marginPercent >= 30.0, `Expected profit margin >= 30% for <=$5 USDG offer (got ${usdgPricing.marginPercent}%)`);
+
+  // 3. Seaport USDG Offer Generation
+  const usdgSeaport = new SeaportService(config, Wallet.createRandom());
+  const usdgContractAddr = '0x595a8910ba11e38ada602430b8b1122644247b0c';
+  const signedUsdgOffer = await usdgSeaport.createSignedCollectionOffer(
+    '0x3333333333333333333333333333333333333333',
+    usdgPricing.bidPriceEth,
+    20,
+    'robinhood',
+    [],
+    { currency: 'USDG', bidPriceUsdg: usdgPricing.bidPriceUsdg }
+  );
+  assert.strictEqual(signedUsdgOffer.orderComponents.offer[0].token.toLowerCase(), usdgContractAddr.toLowerCase(), 'Offer token must be USDG address');
+  // Decimals check: 6 decimals for USDG
+  const expectedUsdgUnits = Math.round(usdgPricing.bidPriceUsd * 1e6);
+  const actualUsdgUnits = Number(signedUsdgOffer.orderComponents.offer[0].startAmount);
+  assert(Math.abs(actualUsdgUnits - expectedUsdgUnits) <= 2, `USDG startAmount formatted with 6 decimals (got ${actualUsdgUnits}, expected ${expectedUsdgUnits})`);
+
+  // 4. Automatic 100% USDG to WETH Post-Sale Swap
+  process.env.BOT_MODE = 'SIMULATION';
+  const swapResult = await usdgSeaport.swapUsdgToWeth(4.45, 'robinhood');
+  assert.strictEqual(swapResult.success, true);
+  assert.strictEqual(swapResult.verified, true);
+  assert.strictEqual(swapResult.amountSwappedUsdg, 4.45, '100% of USDG proceeds swapped');
+  console.log('Case F PASSED: USDG identified & converted accurately, profitability verified, USDG offer generated, 100% swapped to WETH after sale ✅\n');
+
+  // -------------------------------------------------------------------------
+  // Case G: NFT Stop-Loss Auto-Listing & Top-Priority Rules (Part 2)
+  // 1. At 45% Price Drop: list at current floor and maintain top-priority (#1) status.
+  // 2. At 60% Price Drop: update listing to current floor and regain top-priority (#1) status.
+  // 3. At 80% Price Drop: update listing to current floor and regain top-priority (#1) status.
+  // 4. One-Time Trigger Per Threshold: Each threshold must trigger only once per NFT.
+  // -------------------------------------------------------------------------
+  console.log('--- Case G: NFT Stop-Loss Auto-Listing & Top-Priority Rules (Part 2) ---');
+  const acquiredCostEth = 1.0;
+  const mockMarketData = { openseaFeeBps: 50, royaltyFeeBps: 0, ethPriceUsd: 2700 };
+
+  // G1. 30% drop -> No stop-loss triggered
+  assert.strictEqual(
+    pricingEngine.getEligibleStopLossThreshold(acquiredCostEth, 0.70, []),
+    null,
+    '30% drop should not trigger stop loss'
+  );
+
+  // G2. 45% drop -> Triggers 45% stop-loss threshold
+  assert.strictEqual(
+    pricingEngine.getEligibleStopLossThreshold(acquiredCostEth, 0.55, []),
+    45,
+    '45% drop must trigger 45% threshold'
+  );
+  const eval45 = pricingEngine.evaluateListingOrHold(
+    acquiredCostEth,
+    0.55,
+    mockMarketData,
+    0.20,
+    'robinhood',
+    0.55,
+    []
+  );
+  assert.strictEqual(eval45.action, 'LIST');
+  assert.strictEqual(eval45.isStopLoss, true);
+  assert.strictEqual(eval45.stopLossThreshold, 45);
+  // Undercut by 1% from 0.55 -> 0.5445 ETH for #1 priority
+  assert.strictEqual(eval45.recommendedListPriceEth, 0.5445);
+
+  // G3. One-time trigger: subsequent 48% drop with 45 already recorded must NOT trigger
+  assert.strictEqual(
+    pricingEngine.getEligibleStopLossThreshold(acquiredCostEth, 0.52, [45]),
+    null,
+    '45% threshold must not trigger repeatedly'
+  );
+
+  // G4. 60% drop -> Triggers 60% stop-loss threshold
+  assert.strictEqual(
+    pricingEngine.getEligibleStopLossThreshold(acquiredCostEth, 0.40, [45]),
+    60,
+    '60% drop must trigger 60% threshold'
+  );
+  const eval60 = pricingEngine.evaluateListingOrHold(
+    acquiredCostEth,
+    0.40,
+    mockMarketData,
+    0.20,
+    'robinhood',
+    0.40,
+    [45]
+  );
+  assert.strictEqual(eval60.action, 'LIST');
+  assert.strictEqual(eval60.isStopLoss, true);
+  assert.strictEqual(eval60.stopLossThreshold, 60);
+  assert.strictEqual(eval60.recommendedListPriceEth, 0.396);
+
+  // G5. One-time trigger: 65% drop with [45, 60] recorded must NOT trigger
+  assert.strictEqual(
+    pricingEngine.getEligibleStopLossThreshold(acquiredCostEth, 0.35, [45, 60]),
+    null,
+    '60% threshold must not trigger repeatedly'
+  );
+
+  // G6. 80% drop -> Triggers 80% stop-loss threshold
+  assert.strictEqual(
+    pricingEngine.getEligibleStopLossThreshold(acquiredCostEth, 0.20, [45, 60]),
+    80,
+    '80% drop must trigger 80% threshold'
+  );
+  const eval80 = pricingEngine.evaluateListingOrHold(
+    acquiredCostEth,
+    0.20,
+    mockMarketData,
+    0.20,
+    'robinhood',
+    0.20,
+    [45, 60]
+  );
+  assert.strictEqual(eval80.action, 'LIST');
+  assert.strictEqual(eval80.isStopLoss, true);
+  assert.strictEqual(eval80.stopLossThreshold, 80);
+  assert.strictEqual(eval80.recommendedListPriceEth, 0.198);
+
+  // G7. One-time trigger: 85% drop with [45, 60, 80] recorded must NOT trigger
+  assert.strictEqual(
+    pricingEngine.getEligibleStopLossThreshold(acquiredCostEth, 0.15, [45, 60, 80]),
+    null,
+    '80% threshold must not trigger repeatedly'
+  );
+
+  // G8. Strategy-level integration test:
+  // Verifying monitorListedInventory updates listing at each threshold and maintains top priority (#1)
+  const gInv = new InventoryManager(config);
+  const gApi = new OpenSeaApiService(config);
+  const gSeaport = new SeaportService(config, Wallet.createRandom());
+  let gPostedListings: Array<{ priceEth: number }> = [];
+  (gApi as any).getEthPriceUsd = async () => 2700;
+  (gApi as any).getListingContext = async () => ({
+    openseaFeeBps: 50,
+    royaltyFeeBps: 0,
+    ethPriceUsd: 2700,
+    fees: []
+  });
+  (gApi as any).postListing = async (_chain: string, payload: any) => {
+    const totalWei = payload.parameters.consideration.reduce(
+      (sum: bigint, c: any) => sum + BigInt(c.startAmount),
+      0n
+    );
+    const price = Number(totalWei) / 1e18;
+    gPostedListings.push({ priceEth: price });
+    return { order_hash: `0xlisting_${Date.now()}` };
+  };
+  (gApi as any).cancelOffer = async () => ({ success: true });
+  (gSeaport as any).ensureNftConduitApproval = async () => true;
+
+  const gRelister = new AutoRelisterStrategy(config, gApi, pricingEngine, gSeaport, gInv, new CircuitBreaker(config));
+  const gItemIdentifier = `${nftContract}:777`;
+  gInv.addInventoryItem({
+    identifier: gItemIdentifier,
+    collectionSlug: 'stop-loss-col',
+    contractAddress: nftContract,
+    tokenId: '777',
+    acquiredPriceEth: 1.0,
+    acquiredPriceUsd: 2700,
+    acquiredAtTimestamp: Date.now() - 60000,
+    currentListingPriceEth: 1.30,
+    listingOrderId: 'sim_init',
+    status: 'LISTED',
+    listingStatus: 'LISTED'
+  });
+
+  // Step 1: Floor drops 45% (competitor at 0.55 ETH)
+  (gApi as any).getLowestCompetingListing = async () => ({ priceEth: 0.55 });
+  await gRelister.monitorListedInventory();
+  assert.strictEqual(gPostedListings.length, 1, '45% drop must post updated listing');
+  assert.strictEqual(gPostedListings[0].priceEth, 0.5445, 'Listing updated to 0.5445 ETH (#1 priority)');
+  const itemAfter45 = gInv.getInventoryItem(gItemIdentifier)!;
+  assert.deepStrictEqual(itemAfter45.stopLossTriggeredThresholds, [45], '45 threshold recorded');
+  assert.strictEqual(itemAfter45.currentListingPriceEth, 0.5445);
+
+  // Step 2: Competitor at 0.52 ETH (48% drop) -> 45 already triggered, does NOT trigger again
+  gPostedListings = [];
+  (gApi as any).getLowestCompetingListing = async () => ({ priceEth: 0.52 });
+  await gRelister.monitorListedInventory();
+  assert.strictEqual(gPostedListings.length, 0, 'No re-trigger between 45% and 60% drops');
+
+  // Step 3: Floor drops 60% (competitor at 0.40 ETH)
+  (gApi as any).getLowestCompetingListing = async () => ({ priceEth: 0.40 });
+  await gRelister.monitorListedInventory();
+  assert.strictEqual(gPostedListings.length, 1, '60% drop must post updated listing');
+  assert.strictEqual(gPostedListings[0].priceEth, 0.396, 'Listing updated to 0.396 ETH (#1 priority)');
+  const itemAfter60 = gInv.getInventoryItem(gItemIdentifier)!;
+  assert.deepStrictEqual(itemAfter60.stopLossTriggeredThresholds, [45, 60], '60 threshold recorded');
+  assert.strictEqual(itemAfter60.currentListingPriceEth, 0.396);
+
+  // Step 4: Floor drops 80% (competitor at 0.20 ETH)
+  gPostedListings = [];
+  (gApi as any).getLowestCompetingListing = async () => ({ priceEth: 0.20 });
+  await gRelister.monitorListedInventory();
+  assert.strictEqual(gPostedListings.length, 1, '80% drop must post updated listing');
+  assert.strictEqual(gPostedListings[0].priceEth, 0.198, 'Listing updated to 0.198 ETH (#1 priority)');
+  const itemAfter80 = gInv.getInventoryItem(gItemIdentifier)!;
+  assert.deepStrictEqual(itemAfter80.stopLossTriggeredThresholds, [45, 60, 80], '80 threshold recorded');
+  assert.strictEqual(itemAfter80.currentListingPriceEth, 0.198);
+
+  console.log('Case G PASSED: Stop-loss auto-listing at 45%, 60%, 80% with #1 priority & one-time trigger verified ✅\n');
 
   process.env.BOT_MODE = originalBotMode;
   console.log('================================================================');

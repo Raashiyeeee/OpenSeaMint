@@ -37,7 +37,10 @@
       "estimatedGasCostUsd": 0.01,
       "seaportAddress": "0x0000000000000068F116a894984e2DB1123eB395",
       "conduitKey": "0x61159fefdfada89302ed55f8b9e89e2d67d8258712b3a3f89aa88525877f1d5e",
-      "wethAddress": "0x0bd7d308f8e1639fab988df18a8011f41eacad73"
+      "wethAddress": "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+      "usdgAddress": "0x595a8910ba11e38ada602430b8b1122644247b0c",
+      "usdgDecimals": 6,
+      "dexRouterAddress": "0xE592427A0AEce92De3Edee1F18E0157C05861564"
     },
     "mainnet": {
       "name": "Ethereum Mainnet",
@@ -48,7 +51,10 @@
       "estimatedGasCostUsd": 3.50,
       "seaportAddress": "0x0000000000000068F116a894984e2DB1123eB395",
       "conduitKey": "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
-      "wethAddress": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+      "wethAddress": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+      "usdgAddress": "0x595a8910ba11e38ada602430b8b1122644247b0c",
+      "usdgDecimals": 6,
+      "dexRouterAddress": "0xE592427A0AEce92De3Edee1F18E0157C05861564"
     }
   },
   "fees": {
@@ -59,6 +65,9 @@
   "profitTargets": {
     "defaultMinNetProfitUsd": 0.15,
     "defaultMinMarginPercent": 12.0,
+    "tier1MaxPriceUsd": 4.0,
+    "tier1MinMarginPercent": 30.0,
+    "tier2MinMarginPercent": 12.0,
     "undercutFloorByPercent": 1.0,
     "bidUnderFloorPercent": 15.0,
     "bidIncrementUsd": 0.05

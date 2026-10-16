@@ -8,6 +8,9 @@ export interface NetworkInfo {
   seaportAddress?: string;
   conduitKey?: string;
   wethAddress?: string;
+  usdgAddress?: string;
+  usdgDecimals?: number;
+  dexRouterAddress?: string;
 }
 
 export interface CapitalConfig {
@@ -63,7 +66,10 @@ export interface BotConfig {
   };
   profitTargets: {
     defaultMinNetProfitUsd: number;
-    defaultMinMarginPercent: number; // 12% default and hard minimum (margin excludes creator fees; actual net profit still counts them)
+    defaultMinMarginPercent: number; // 12% default and hard minimum for tier 2
+    tier1MaxPriceUsd?: number; // $4.00 ceiling for 30% margin tier
+    tier1MinMarginPercent?: number; // 30% minimum margin for $1 to $4 NFTs
+    tier2MinMarginPercent?: number; // 12% minimum margin after creator fee for >$4-$9 NFTs
     undercutFloorByPercent: number;
     bidUnderFloorPercent: number;
     bidIncrementUsd?: number;
@@ -150,6 +156,8 @@ export interface CollectionMarketData {
   referenceFloorEth?: number;
   referenceFloorUsd?: number;
   floorDeclinePercent?: number;
+  currency?: 'ETH' | 'USDG';
+  floorPriceUsdg?: number;
 }
 
 export interface ProfitCalculationResult {
@@ -175,6 +183,9 @@ export interface ProfitCalculationResult {
   netProfitEth: number;
   netProfitUsd: number;
   marginPercent: number;
+  currency?: 'ETH' | 'USDG';
+  bidPriceUsdg?: number;
+  targetListPriceUsdg?: number;
   sales1Hour?: number;
   uniqueWallets1Hour?: number;
   sales3Hours?: number;
@@ -204,6 +215,9 @@ export interface NftSaleConfirmation {
   realizedProfitUsd?: number;
   transactionHash?: string;
   orderId?: string;
+  currency?: 'ETH' | 'USDG';
+  salePriceUsdg?: number;
+  saleProceedsUsdg?: number;
 }
 
 export interface TrackedNft {
@@ -224,6 +238,8 @@ export interface TrackedNft {
   currentListingPriceUsd?: number;
   listingOrderId?: string;
   holdReason?: string;
+  currency?: 'ETH' | 'USDG';
+  acquiredPriceUsdg?: number;
 }
 
 export interface InventoryItem {
@@ -252,6 +268,10 @@ export interface InventoryItem {
   lastListingUpdateAt?: number;
   /** Instant-listing retry time (ms) after a HOLD / data-unavailable attempt. */
   nextListingAttemptAt?: number;
+  currency?: 'ETH' | 'USDG';
+  acquiredPriceUsdg?: number;
+  saleProceedsUsdg?: number;
+  stopLossTriggeredThresholds?: number[]; // [45, 60, 80]
 }
 
 export type OfferStatus = 'ACTIVE' | 'EXPIRED' | 'FULFILLED' | 'CANCELLED' | 'CANCELLATION_PENDING' | 'CANCELLATION_FAILED';
@@ -270,6 +290,8 @@ export interface ActiveOffer {
   cancellationAttempts?: number;
   cancellationVerified?: boolean;
   cancellationError?: string;
+  currency?: 'ETH' | 'USDG';
+  priceUsdg?: number;
   lastCancellationAttempt?: number;
   flaggedForAttention?: boolean;
   fillableUntil?: number; // offchain-cancelled offer may still be filled until this time (ms)

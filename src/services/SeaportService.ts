@@ -100,27 +100,38 @@ export class SeaportService {
     bidPriceEth: number,
     durationMinutes: number = 60,
     networkKey?: string,
-    fees?: FeeRecipient[]
+    fees?: FeeRecipient[],
+    options?: { currency?: 'ETH' | 'USDG'; bidPriceUsdg?: number }
   ): Promise<{ orderComponents: any; signature: string }> {
     const offerer = this.signer.address;
     const startTime = Math.floor(Date.now() / 1000);
     const endTime = startTime + durationMinutes * 60;
     const salt = '0x' + Buffer.from(ethers.randomBytes(16)).toString('hex');
 
-    const wethToken = (networkKey && this.config.networks[networkKey]?.wethAddress)
-      || this.wethAddress;
+    const isUsdg = options?.currency === 'USDG';
+    const networkInfo = (networkKey && this.config.networks[networkKey]) || undefined;
+    const paymentToken = isUsdg
+      ? (networkInfo?.usdgAddress || this.config.networks?.['robinhood']?.usdgAddress || '0x595a8910ba11e38ada602430b8b1122644247b0c')
+      : (networkInfo?.wethAddress || this.wethAddress);
+    const decimals = isUsdg ? (networkInfo?.usdgDecimals || 6) : 18;
     const conduitKey = (networkKey && this.config.networks[networkKey]?.conduitKey)
       || this.config.seaport.conduitKey;
 
-    const bidWei = toWeiString(bidPriceEth);
+    let bidUnits: string;
+    if (isUsdg) {
+      const usdgVal = options?.bidPriceUsdg ?? (bidPriceEth * 2500);
+      bidUnits = ethers.parseUnits(usdgVal.toFixed(decimals), decimals).toString();
+    } else {
+      bidUnits = toWeiString(bidPriceEth);
+    }
 
     const offer = [
       {
-        itemType: 1, // ERC20 (WETH)
-        token: ethers.getAddress(wethToken),
+        itemType: 1, // ERC20 (WETH or USDG)
+        token: ethers.getAddress(paymentToken),
         identifierOrCriteria: '0',
-        startAmount: bidWei,
-        endAmount: bidWei
+        startAmount: bidUnits,
+        endAmount: bidUnits
       }
     ];
 
@@ -141,10 +152,10 @@ export class SeaportService {
 
     if (effectiveFees.length > 0) {
       for (const f of effectiveFees) {
-        const feeWei = ((BigInt(bidWei) * BigInt(Math.round(f.fee * 100))) / 10000n).toString();
+        const feeWei = ((BigInt(bidUnits) * BigInt(Math.round(f.fee * 100))) / 10000n).toString();
         consideration.push({
-          itemType: 1, // ERC20 (WETH)
-          token: ethers.getAddress(wethToken),
+          itemType: 1, // ERC20 (WETH or USDG)
+          token: ethers.getAddress(paymentToken),
           identifierOrCriteria: '0',
           startAmount: feeWei,
           endAmount: feeWei,
@@ -152,10 +163,10 @@ export class SeaportService {
         });
       }
     } else {
-      const defaultFeeWei = ((BigInt(bidWei) * BigInt(this.config.fees.openseaFeeBps || 100)) / 10000n).toString();
+      const defaultFeeWei = ((BigInt(bidUnits) * BigInt(this.config.fees.openseaFeeBps || 100)) / 10000n).toString();
       consideration.push({
         itemType: 1,
-        token: ethers.getAddress(wethToken),
+        token: ethers.getAddress(paymentToken),
         identifierOrCriteria: '0',
         startAmount: defaultFeeWei,
         endAmount: defaultFeeWei,
@@ -215,27 +226,38 @@ export class SeaportService {
     bidPriceEth: number,
     durationMinutes: number = 60,
     networkKey?: string,
-    fees?: FeeRecipient[]
+    fees?: FeeRecipient[],
+    options?: { currency?: 'ETH' | 'USDG'; bidPriceUsdg?: number }
   ): Promise<{ orderComponents: any; signature: string }> {
     const offerer = this.signer.address;
     const startTime = Math.floor(Date.now() / 1000);
     const endTime = startTime + durationMinutes * 60;
     const salt = '0x' + Buffer.from(ethers.randomBytes(16)).toString('hex');
 
-    const wethToken = (networkKey && this.config.networks[networkKey]?.wethAddress)
-      || this.wethAddress;
+    const isUsdg = options?.currency === 'USDG';
+    const networkInfo = (networkKey && this.config.networks[networkKey]) || undefined;
+    const paymentToken = isUsdg
+      ? (networkInfo?.usdgAddress || this.config.networks?.['robinhood']?.usdgAddress || '0x595a8910ba11e38ada602430b8b1122644247b0c')
+      : (networkInfo?.wethAddress || this.wethAddress);
+    const decimals = isUsdg ? (networkInfo?.usdgDecimals || 6) : 18;
     const conduitKey = (networkKey && this.config.networks[networkKey]?.conduitKey)
       || this.config.seaport.conduitKey;
 
-    const bidWei = toWeiString(bidPriceEth);
+    let bidUnits: string;
+    if (isUsdg) {
+      const usdgVal = options?.bidPriceUsdg ?? (bidPriceEth * 2500);
+      bidUnits = ethers.parseUnits(usdgVal.toFixed(decimals), decimals).toString();
+    } else {
+      bidUnits = toWeiString(bidPriceEth);
+    }
 
     const offer = [
       {
-        itemType: 1, // ERC20 (WETH)
-        token: ethers.getAddress(wethToken),
+        itemType: 1, // ERC20 (WETH or USDG)
+        token: ethers.getAddress(paymentToken),
         identifierOrCriteria: '0',
-        startAmount: bidWei,
-        endAmount: bidWei
+        startAmount: bidUnits,
+        endAmount: bidUnits
       }
     ];
 
@@ -255,10 +277,10 @@ export class SeaportService {
 
     if (effectiveFees.length > 0) {
       for (const f of effectiveFees) {
-        const feeWei = ((BigInt(bidWei) * BigInt(Math.round(f.fee * 100))) / 10000n).toString();
+        const feeWei = ((BigInt(bidUnits) * BigInt(Math.round(f.fee * 100))) / 10000n).toString();
         consideration.push({
-          itemType: 1, // ERC20 (WETH)
-          token: ethers.getAddress(wethToken),
+          itemType: 1, // ERC20 (WETH or USDG)
+          token: ethers.getAddress(paymentToken),
           identifierOrCriteria: '0',
           startAmount: feeWei,
           endAmount: feeWei,
@@ -266,10 +288,10 @@ export class SeaportService {
         });
       }
     } else {
-      const defaultFeeWei = ((BigInt(bidWei) * BigInt(this.config.fees.openseaFeeBps || 100)) / 10000n).toString();
+      const defaultFeeWei = ((BigInt(bidUnits) * BigInt(this.config.fees.openseaFeeBps || 100)) / 10000n).toString();
       consideration.push({
         itemType: 1,
-        token: ethers.getAddress(wethToken),
+        token: ethers.getAddress(paymentToken),
         identifierOrCriteria: '0',
         startAmount: defaultFeeWei,
         endAmount: defaultFeeWei,
@@ -483,6 +505,47 @@ export class SeaportService {
     } catch (err: any) {
       logger.error({ contractAddress, err: err.message }, 'Failed to approve OpenSea conduit for NFT');
       return false;
+    }
+  }
+
+  /**
+   * Pre-approves an ERC20 token (USDG / WETH) for the OpenSea conduit
+   */
+  public async ensureTokenConduitApproval(
+    tokenAddress: string,
+    networkKey?: string
+  ): Promise<void> {
+    if (process.env.BOT_MODE === 'SIMULATION') {
+      logger.info({ tokenAddress }, '[SIMULATION] Token conduit pre-approved ✅');
+      return;
+    }
+    try {
+      const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
+      const networkInfo = this.config.networks?.[activeNetworkKey];
+      const conduitAddress = activeNetworkKey === 'robinhood'
+        ? '0x963F00d3ff000064fFCbA824b800c0000000C300'
+        : '0x1E0049783F008A0085193E00003D00cd54003c71';
+      const provider = this.signer.provider || new ethers.JsonRpcProvider(networkInfo?.rpcUrl);
+      const connectedSigner = this.signer.provider ? this.signer : (this.signer as any).connect(provider);
+
+      const tokenContract = new ethers.Contract(
+        tokenAddress,
+        [
+          'function allowance(address owner, address spender) view returns (uint256)',
+          'function approve(address spender, uint256 amount) returns (bool)'
+        ],
+        connectedSigner
+      );
+
+      const currentAllowance: bigint = await tokenContract.allowance(this.signer.address, conduitAddress);
+      if (currentAllowance > ethers.parseUnits('1000', 6)) {
+        return;
+      }
+      const tx = await tokenContract.approve(conduitAddress, ethers.MaxUint256);
+      await tx.wait(1);
+      logger.info({ tokenAddress, conduitAddress, txHash: tx.hash }, '✅ Token approved for OpenSea conduit!');
+    } catch (err: any) {
+      logger.warn({ tokenAddress, err: err.message }, 'Could not verify/approve token for conduit');
     }
   }
 
@@ -1020,6 +1083,149 @@ export class SeaportService {
     } catch (err: any) {
       logger.error({ err: err.message, network: activeNetworkKey }, 'Failed to auto-wrap native ETH');
       return { success: false, amountWrappedEth: 0 };
+    }
+  }
+
+  /**
+   * Automatic 100% USDG to WETH Post-Sale Swap Rule:
+   * When an NFT purchased through a USDG offer is sold at the floor price and the sale is confirmed,
+   * the bot must automatically swap 100% of the USDG proceeds into WETH.
+   *
+   * @param amountUsdg Exact or total amount of USDG proceeds to swap into WETH
+   * @param networkKey Target network
+   */
+  public async swapUsdgToWeth(
+    amountUsdg: number,
+    networkKey?: string
+  ): Promise<{ success: boolean; verified?: boolean; txHash?: string; amountSwappedUsdg: number; amountReceivedWeth?: number; error?: string }> {
+    const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
+    const networkInfo = this.config.networks?.[activeNetworkKey];
+    const usdgAddress = networkInfo?.usdgAddress || '0x595a8910ba11e38ada602430b8b1122644247b0c';
+    const wethAddress = networkInfo?.wethAddress || this.wethAddress;
+    const dexRouterAddress = networkInfo?.dexRouterAddress || '0xE592427A0AEce92De3Edee1F18E0157C05861564';
+    const usdgDecimals = networkInfo?.usdgDecimals || 6;
+
+    logger.info(
+      {
+        network: activeNetworkKey,
+        amountUsdg,
+        usdgAddress,
+        wethAddress,
+        dexRouterAddress
+      },
+      `AUTOMATIC USDG->WETH SWAP: Swapping 100% (${amountUsdg} USDG) of sale proceeds into WETH...`
+    );
+
+    if (amountUsdg <= 0.001) {
+      logger.warn({ amountUsdg }, 'AUTOMATIC USDG->WETH SWAP: Amount is below dust threshold. Skipping swap.');
+      return { success: true, verified: true, amountSwappedUsdg: 0 };
+    }
+
+    try {
+      // Simulation mode guard
+      if (process.env.BOT_MODE === 'SIMULATION') {
+        const simTxHash = `0xsim_usdg_to_weth_${Date.now()}`;
+        const simWethReceived = amountUsdg / 2500;
+        logger.info(
+          { network: activeNetworkKey, amountSwappedUsdg: amountUsdg, amountReceivedWeth: simWethReceived, txHash: simTxHash },
+          `[SIMULATION] ✅ Swapped 100% (${amountUsdg} USDG) to WETH successfully`
+        );
+        return {
+          success: true,
+          verified: true,
+          txHash: simTxHash,
+          amountSwappedUsdg: amountUsdg,
+          amountReceivedWeth: simWethReceived
+        };
+      }
+
+      const provider = this.signer.provider || new ethers.JsonRpcProvider(networkInfo?.rpcUrl);
+      const connectedSigner = this.signer.provider ? this.signer : (this.signer as any).connect(provider);
+
+      const usdgContract = new ethers.Contract(
+        usdgAddress,
+        [
+          'function balanceOf(address account) view returns (uint256)',
+          'function allowance(address owner, address spender) view returns (uint256)',
+          'function approve(address spender, uint256 amount) returns (bool)'
+        ],
+        connectedSigner
+      );
+
+      const balanceWei: bigint = await usdgContract.balanceOf(this.signer.address);
+      const amountInWei = ethers.parseUnits(amountUsdg.toFixed(usdgDecimals), usdgDecimals);
+      const swapWei = balanceWei < amountInWei ? balanceWei : amountInWei;
+
+      if (swapWei <= 0n) {
+        logger.warn('AUTOMATIC USDG->WETH SWAP: Wallet USDG balance is 0. Skipping swap.');
+        return { success: true, verified: true, amountSwappedUsdg: 0 };
+      }
+
+      // Check allowance & approve DEX Router
+      const allowance: bigint = await usdgContract.allowance(this.signer.address, dexRouterAddress);
+      if (allowance < swapWei) {
+        logger.info({ dexRouterAddress }, 'Approving DEX Router to spend USDG...');
+        const approveTx = await usdgContract.approve(dexRouterAddress, ethers.MaxUint256);
+        await approveTx.wait(1);
+      }
+
+      // Execute Swap: Uniswap V2 / V3 compatible SwapRouter
+      const routerContract = new ethers.Contract(
+        dexRouterAddress,
+        [
+          'function exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum, uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)',
+          'function swapExactTokensForTokens(uint amountIn, uint amountOutMin, address[] calldata path, address to, uint deadline) external returns (uint[] memory amounts)'
+        ],
+        connectedSigner
+      );
+
+      const deadline = Math.floor(Date.now() / 1000) + 600;
+      let tx: any;
+      try {
+        tx = await routerContract.exactInputSingle({
+          tokenIn: usdgAddress,
+          tokenOut: wethAddress,
+          fee: 3000,
+          recipient: this.signer.address,
+          deadline,
+          amountIn: swapWei,
+          amountOutMinimum: 0,
+          sqrtPriceLimitX96: 0
+        });
+      } catch {
+        tx = await routerContract.swapExactTokensForTokens(
+          swapWei,
+          0,
+          [usdgAddress, wethAddress],
+          this.signer.address,
+          deadline
+        );
+      }
+
+      const receipt = await tx.wait(1);
+      const swappedUsdg = parseFloat(ethers.formatUnits(swapWei, usdgDecimals));
+      logger.info(
+        { network: activeNetworkKey, amountSwappedUsdg: swappedUsdg, txHash: receipt.hash },
+        `✅ AUTOMATIC USDG->WETH SWAP COMPLETE: Swapped 100% (${swappedUsdg} USDG) to WETH!`
+      );
+
+      return {
+        success: true,
+        verified: true,
+        txHash: receipt.hash,
+        amountSwappedUsdg: swappedUsdg
+      };
+    } catch (err: any) {
+      logger.error(
+        { network: activeNetworkKey, error: err.message, amountUsdg },
+        '❌ AUTOMATIC USDG->WETH SWAP FAILED: Could not swap USDG to WETH'
+      );
+      return {
+        success: false,
+        verified: false,
+        amountSwappedUsdg: 0,
+        error: err.message
+      };
     }
   }
 }

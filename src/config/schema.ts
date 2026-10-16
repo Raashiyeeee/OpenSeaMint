@@ -51,7 +51,10 @@ const NetworkInfoSchema = z.object({
   estimatedGasCostUsd: z.number().nonnegative().default(0.01),
   seaportAddress: z.string().optional(),
   conduitKey: z.string().optional(),
-  wethAddress: z.string().optional()
+  wethAddress: z.string().optional(),
+  usdgAddress: z.string().optional(),
+  usdgDecimals: z.number().int().positive().default(6).optional(),
+  dexRouterAddress: z.string().optional()
 });
 
 const OpenSeaApiSchema = z.object({
@@ -97,6 +100,9 @@ const BotConfigSchema = z.object({
   profitTargets: z.object({
     defaultMinNetProfitUsd: z.number().positive(),
     defaultMinMarginPercent: z.number().positive().default(12.0),
+    tier1MaxPriceUsd: z.number().positive().default(4.0),
+    tier1MinMarginPercent: z.number().positive().default(30.0),
+    tier2MinMarginPercent: z.number().positive().default(12.0),
     undercutFloorByPercent: z.number().nonnegative(),
     bidUnderFloorPercent: z.number().positive(),
     bidIncrementUsd: z.number().positive().default(0.05)
@@ -135,6 +141,16 @@ export function loadConfig(configPath?: string): BotConfig {
 
     if (process.env.ACTIVE_NETWORKS) {
       parsed.general.activeNetworks = process.env.ACTIVE_NETWORKS.split(',').map((s: string) => s.trim()).filter(Boolean);
+    }
+
+    // Environment overrides for USDG token address & DEX router
+    const usdgOverride = process.env.USDG_TOKEN_ADDRESS || process.env.USDG_ADDRESS;
+    const dexRouterOverride = process.env.DEX_ROUTER_ADDRESS || process.env.ROUTER_ADDRESS;
+    if (parsed.networks) {
+      for (const netKey of Object.keys(parsed.networks)) {
+        if (usdgOverride) parsed.networks[netKey].usdgAddress = usdgOverride;
+        if (dexRouterOverride) parsed.networks[netKey].dexRouterAddress = dexRouterOverride;
+      }
     }
 
     if (!parsed.general.activeNetworks || parsed.general.activeNetworks.length === 0) {

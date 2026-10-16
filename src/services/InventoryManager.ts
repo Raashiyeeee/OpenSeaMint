@@ -568,7 +568,7 @@ export class InventoryManager {
       offerBySlug.status = 'FULFILLED';
     }
 
-    // Also fulfill active offer matching this token
+    // Also fulfill active offer matching this token and inherit currency
     for (const off of this.activeOffers.values()) {
       if (
         off.status === 'ACTIVE' &&
@@ -576,7 +576,15 @@ export class InventoryManager {
         (!off.tokenId || off.tokenId === item.tokenId)
       ) {
         off.status = 'FULFILLED';
+        if (off.currency === 'USDG') {
+          item.currency = 'USDG';
+          item.acquiredPriceUsdg = off.priceUsdg;
+        }
       }
+    }
+    if (offerBySlug && offerBySlug.currency === 'USDG') {
+      item.currency = 'USDG';
+      item.acquiredPriceUsdg = offerBySlug.priceUsdg;
     }
 
     item.ownershipStatus = 'OWNED';
@@ -593,6 +601,8 @@ export class InventoryManager {
         collectionSlug: item.collectionSlug,
         contractAddress: item.contractAddress,
         network: item.network,
+        currency: item.currency,
+        acquiredPriceUsdg: item.acquiredPriceUsdg,
         name: item.name,
         ownershipStatus: 'OWNED',
         listingStatus: 'PENDING_LISTING',
@@ -606,6 +616,8 @@ export class InventoryManager {
       tracked.ownershipStatus = 'OWNED';
       tracked.listingStatus = 'PENDING_LISTING';
       tracked.saleConfirmation = undefined;
+      tracked.currency = item.currency;
+      tracked.acquiredPriceUsdg = item.acquiredPriceUsdg;
       tracked.acquiredPriceEth = item.acquiredPriceEth;
       tracked.acquiredPriceUsd = item.acquiredPriceUsd;
       tracked.acquiredAtTimestamp = item.acquiredAtTimestamp;
@@ -644,6 +656,20 @@ export class InventoryManager {
       tracked.currentListingPriceUsd = listPriceUsd;
       tracked.listingOrderId = orderId;
     }
+  }
+
+  public recordStopLossTrigger(identifier: string, threshold: number): void {
+    const item = this.inventory.get(identifier);
+    if (!item) return;
+    const current = item.stopLossTriggeredThresholds || [];
+    if (threshold === 80) {
+      item.stopLossTriggeredThresholds = Array.from(new Set([...current, 45, 60, 80]));
+    } else if (threshold === 60) {
+      item.stopLossTriggeredThresholds = Array.from(new Set([...current, 45, 60]));
+    } else if (threshold === 45) {
+      item.stopLossTriggeredThresholds = Array.from(new Set([...current, 45]));
+    }
+    this.saveState();
   }
 
   public updateHoldStatus(identifier: string, holdReason: string): void {
@@ -714,6 +740,8 @@ export class InventoryManager {
       soldAtTimestamp: Date.now(),
       salePriceEth: soldEth,
       salePriceUsd: soldUsd,
+      currency: item?.currency || 'ETH',
+      saleProceedsUsdg: item?.currency === 'USDG' ? roundToPrecision(netProceedsEth * ethPriceUsd, 2) : undefined,
       realizedProfitUsd,
       transactionHash: txHash
     };
@@ -1120,6 +1148,16 @@ export class InventoryManager {
       return {
         allowed: false,
         reason: `Holding ${held.length} unsold NFT(s) from ${collectionSlug} (${held.map((h) => `#${h.tokenId} ${h.status}`).join(', ')}). No new offers on this collection until they are confirmed sold.`
+      };
+    }
+    const live = this.getLiveOffersForCollection(collectionSlug, contractAddress);
+    const unverified = live.find(
+      (o) => o.status === 'CANCELLATION_PENDING' || o.status === 'CANCELLATION_FAILED' || (o.status === 'CANCELLED' && !o.cancellationVerified)
+    );
+    if (unverified) {
+      return {
+        allowed: false,
+        reason: `Pending unverified cancellation for offer ${unverified.orderHash || 'unknown'} on ${collectionSlug}. New offers blocked until cancellation is verified.`
       };
     }
     return { allowed: true };

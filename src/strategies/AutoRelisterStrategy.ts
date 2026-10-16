@@ -178,9 +178,10 @@ export class AutoRelisterStrategy {
   }
 
   /**
-   * Scans unlisted inventory and creates competitive listing orders
+   * Scans unlisted inventory and creates competitive listing orders.
+   * Returns true if holdings were completely and successfully fetched across all active networks.
    */
-  public async scanAndRelistUnlistedInventory(walletAddress: string): Promise<void> {
+  public async scanAndRelistUnlistedInventory(walletAddress: string): Promise<boolean> {
     // 1. Reconcile on-chain wallet inventory directly from OpenSea across all active networks
     const activeNetworks = this.config.general.activeNetworks || ['robinhood'];
     const allOwnedNfts: any[] = [];
@@ -274,6 +275,7 @@ export class AutoRelisterStrategy {
 
     // 3. Continuous competitive monitoring of our ACTIVE listings
     await this.monitorListedInventory();
+    return holdingsComplete;
   }
 
   /** Minimum time between two price updates of the same listing (anti relist churn). Default ~15s for near-continuous top priority. */
@@ -300,12 +302,27 @@ export class AutoRelisterStrategy {
       try {
         const ourPrice = item.currentListingPriceEth;
         if (!ourPrice || ourPrice <= 0) continue;
-        if (item.lastListingUpdateAt && Date.now() - item.lastListingUpdateAt < this.getRepriceCooldownMs()) continue;
+        
         const competitor = await this.apiService.getLowestCompetingListing(item.collectionSlug, ourAddress);
         if (competitor === undefined || competitor === null) continue; // unknown or no competition: we are top
-        if (competitor.priceEth >= ourPrice) continue; // already lowest
-        const dropPercent = ((ourPrice - competitor.priceEth) / ourPrice) * 100;
-        if (dropPercent < AutoRelisterStrategy.MIN_REPRICE_CHANGE_PERCENT) continue;
+
+        const stopLossThreshold = competitor.priceEth > 0
+          ? this.pricingEngine.getEligibleStopLossThreshold(item.acquiredPriceEth, competitor.priceEth, item.stopLossTriggeredThresholds)
+          : null;
+
+        if (stopLossThreshold === null) {
+          if (item.lastListingUpdateAt && Date.now() - item.lastListingUpdateAt < this.getRepriceCooldownMs()) continue;
+          if (competitor.priceEth >= ourPrice) continue; // already lowest
+          const dropPercent = ((ourPrice - competitor.priceEth) / ourPrice) * 100;
+          if (dropPercent < AutoRelisterStrategy.MIN_REPRICE_CHANGE_PERCENT) continue;
+        } else {
+          // Stop-loss triggered: verify if our current listing is already strictly below competitor
+          if (item.currentListingPriceEth && item.currentListingPriceEth < competitor.priceEth) {
+            this.inventoryManager.recordStopLossTrigger(item.identifier, stopLossThreshold);
+            continue;
+          }
+        }
+
         await this.relistItem(item, competitor.priceEth);
       } catch (err: any) {
         logger.error({ identifier: item.identifier, error: err.message }, 'Error during competitive listing monitor');
@@ -344,7 +361,7 @@ export class AutoRelisterStrategy {
     );
     const targetProfitUsd = targetConfig?.targetNetProfitUsd || this.config.profitTargets.defaultMinNetProfitUsd;
 
-    // 3. Price at the top competitive position that still meets the 40% net margin; HOLD only if impossible
+    // 3. Price at the top competitive position that still meets profit margin; emergency stop-loss at 45%/60%/80% drops
     const listingEval = this.pricingEngine.evaluateListingOrHold(
       item.acquiredPriceEth,
       competitorEth ?? 0,
@@ -355,7 +372,8 @@ export class AutoRelisterStrategy {
       },
       targetProfitUsd,
       networkKey,
-      competitorEth
+      competitorEth,
+      item.stopLossTriggeredThresholds
     );
 
     if (listingEval.action === 'HOLD') {
@@ -376,7 +394,16 @@ export class AutoRelisterStrategy {
     }
 
     const listPriceEth = listingEval.recommendedListPriceEth!;
+    if (!listingEval.isStopLoss && wasListed && competitorEth !== undefined && competitorEth * (1 - (this.config.profitTargets.undercutFloorByPercent ?? 1.0) / 100) < listingEval.minProfitablePriceEth) {
+      item.holdReason = `Competitor (${competitorEth} ETH) is below min profitable price (${listingEval.minProfitablePriceEth} ETH); keeping current listing at ${item.currentListingPriceEth} ETH.`;
+      item.lastListingUpdateAt = Date.now();
+      logger.warn({ identifier: item.identifier, reason: item.holdReason }, 'Undercut not profitable: holding current listing (no loss sale)');
+      return { outcome: 'SKIPPED', reason: item.holdReason };
+    }
     if (wasListed && item.currentListingPriceEth && listPriceEth >= item.currentListingPriceEth) {
+      if (listingEval.isStopLoss && listingEval.stopLossThreshold) {
+        this.inventoryManager.recordStopLossTrigger(item.identifier, listingEval.stopLossThreshold);
+      }
       return { outcome: 'SKIPPED', reason: 'no price improvement' }; // avoid churn
     }
     const expectedNetProfitUsd = listingEval.expectedNetProfitUsd!;
@@ -449,6 +476,20 @@ export class AutoRelisterStrategy {
         res?.order_hash || `sim_list_${Date.now()}`,
         listPriceUsd
       );
+
+      if (listingEval.isStopLoss && listingEval.stopLossThreshold) {
+        this.inventoryManager.recordStopLossTrigger(item.identifier, listingEval.stopLossThreshold);
+        logger.warn(
+          {
+            identifier: item.identifier,
+            threshold: listingEval.stopLossThreshold,
+            acquiredPriceEth: item.acquiredPriceEth,
+            floorEth: competitorEth,
+            listPriceEth
+          },
+          `STOP-LOSS EXECUTED (${listingEval.stopLossThreshold}% drop): Listing updated to ${listPriceEth} ETH to maintain top-priority (#1) status.`
+        );
+      }
 
       this.circuitBreaker.registerSuccess();
       return { outcome: 'LISTED', reason: `listed at ${listPriceEth} ETH` };

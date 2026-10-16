@@ -199,20 +199,35 @@ async function main() {
         `NFT ${identifier} sold successfully! Capital released for next trade.`
       );
 
-      // AUTOMATIC POST-SALE ETH TO WETH CONVERSION RULE:
-      // After an NFT is sold, the bot automatically converts 90% of the ETH received into WETH
-      // for future NFT offers and holds the remaining 10% of the ETH as a gas fee reserve.
+      // POST-SALE AUTOMATIC SWAP RULE:
+      // If the NFT was purchased through a USDG offer, 100% of the USDG proceeds must be automatically swapped to WETH.
+      // If the NFT was purchased with ETH/WETH, convert 90% of ETH into WETH (10% held for gas reserve).
       const targetNetwork = result.soldItem?.network || config.general.network || 'robinhood';
-      logger.info(
-        { identifier, targetNetwork, netProceedsEth: result.netProceedsEth },
-        'NFT SALE CONFIRMED: Automatically converting 90% of received ETH into WETH (10% held for gas reserve)...'
-      );
-      const conversion = await seaportService.handlePostSaleEthConversion(result.netProceedsEth, targetNetwork);
-      if (!conversion.success || !conversion.verified) {
-        logger.error(
-          { identifier, targetNetwork, conversion },
-          'POST-SALE CONVERSION NOT VERIFIED ❌: WETH wrap did not succeed or could not be verified on-chain. Manual review required.'
+      if (result.soldItem?.currency === 'USDG' || result.saleConfirmation?.currency === 'USDG') {
+        const usdgProceeds = result.soldItem?.saleProceedsUsdg || (result.netProceedsEth * ethPriceUsd);
+        logger.info(
+          { identifier, targetNetwork, usdgProceeds },
+          'NFT SALE CONFIRMED (USDG TRADE): Automatically swapping 100% of received USDG proceeds into WETH...'
         );
+        const swapRes = await seaportService.swapUsdgToWeth(usdgProceeds, targetNetwork);
+        if (!swapRes.success || !swapRes.verified) {
+          logger.error(
+            { identifier, targetNetwork, swapRes },
+            'USDG TO WETH SWAP NOT VERIFIED ❌: Manual review required.'
+          );
+        }
+      } else {
+        logger.info(
+          { identifier, targetNetwork, netProceedsEth: result.netProceedsEth },
+          'NFT SALE CONFIRMED: Automatically converting 90% of received ETH into WETH (10% held for gas reserve)...'
+        );
+        const conversion = await seaportService.handlePostSaleEthConversion(result.netProceedsEth, targetNetwork);
+        if (!conversion.success || !conversion.verified) {
+          logger.error(
+            { identifier, targetNetwork, conversion },
+            'POST-SALE CONVERSION NOT VERIFIED ❌: WETH wrap did not succeed or could not be verified on-chain. Manual review required.'
+          );
+        }
       }
     } catch (err: any) {
       logger.error({ err }, 'Error processing nft_sold event');
@@ -259,7 +274,8 @@ async function main() {
   // 8. Start Bidding Loop
   logger.info(`Entering main strategy loop (Interval: ${config.general.loopIntervalMs / 1000}s)`);
 
-  // Never overlap cycles: a slow (rate-limited) cycle must not stack a second one on top of it
+  // Startup Sync Gate: fail-closed safety. Bidding cycle cannot place offers until wallet inventory is verified
+  let initialWalletSyncComplete = false;
   let loopRunning = false;
   const runLoop = async () => {
     if (loopRunning) {
@@ -277,7 +293,13 @@ async function main() {
         }
       }
       // 1. Reconcile on-chain wallet inventory (clear sold NFTs, list new ones)
-      await relisterStrategy.scanAndRelistUnlistedInventory(tradingWallet.address);
+      const syncSuccess = await relisterStrategy.scanAndRelistUnlistedInventory(tradingWallet.address);
+      if (syncSuccess) {
+        initialWalletSyncComplete = true;
+      } else if (!initialWalletSyncComplete) {
+        logger.warn('STARTUP SYNC GATE 🛑: Initial wallet inventory reconciliation failed or was incomplete. Bidding cycle paused until wallet holdings are verified.');
+        return;
+      }
       // 2. Evaluate market and place simultaneous offers across qualifying NFTs
       await bidderStrategy.evaluateAndPlaceBids();
     } catch (err: any) {
