@@ -118,9 +118,9 @@ const OS_FEE = { recipient: '0x0000a26b00c1f0df003000390027140000faa719', fee: 1
   console.log('Case V2 PASSED: no new Veil offer while #991 is unsold (persisted) ✅');
 
   // Reproduce #924 anyway (e.g. an offer that was already live): bought at $2.00 while the market fell below the
-  // 12%-margin price -> HOLD with an explicit reason and a FAST retry, then listed as soon as profitable.
+  // 30%-margin price -> automatically listed within the applicable profit range instead of holding it.
   inv.registerActiveOffer(mkOffer('0xoffer200', 2.0));
-  competitorEth = usd(2.10); // min 12% price for $2.00 cost is ~$2.25+ (with fees); $2.10 stays below
+  competitorEth = usd(2.10); // competitor dropped to $2.10; min 30% price for $2.00 cost is ~$2.64+ (with fees)
   orderStatus['0xoffer200'] = 'FULFILLED';
   walletNfts = [{ contract: VEIL_CONTRACT, identifier: '924', collection: VEIL }, { contract: VEIL_CONTRACT, identifier: '991', collection: VEIL }];
   let fills = 0;
@@ -132,16 +132,9 @@ const OS_FEE = { recipient: '0x0000a26b00c1f0df003000390027140000faa719', fee: 1
   const item924 = inv.getInventoryItem(`${VEIL_CONTRACT}:924`)!;
   assert(item924, '#924 tracked from order-status + wallet lookup');
   assert(Math.abs(item924.acquiredPriceEth - usd(2.0)) < 1e-12, 'Cost basis = the $2.00 offer');
-  assert.strictEqual(item924.status, 'HOLDING');
-  assert(/market below profitable price/.test(item924.holdReason || ''), `Hold reason is explicit: ${item924.holdReason}`);
-  assert(item924.nextListingAttemptAt! - Date.now() <= AutoRelisterStrategy.HOLD_RETRY_MS, 'Quick retry scheduled');
-  const nListed = listed.length;
-  await relister.processPendingListings(Date.now());
-  assert.strictEqual(listed.length, nListed, 'Not retried before its retry time');
-  competitorEth = usd(3.20);
-  await relister.processPendingListings(item924.nextListingAttemptAt! + 1);
-  assert.strictEqual(inv.getInventoryItem(`${VEIL_CONTRACT}:924`)!.status, 'LISTED', '#924 listed as soon as a profitable price exists');
-  console.log('Case V3 PASSED: #924 detected via order FULFILLED, held with explicit reason, relisted on fast retry ✅');
+  assert.strictEqual(item924.status, 'LISTED', '#924 listed within profit range even though floor dropped to $2.10');
+  assert(item924.currentListingPriceEth! >= usd(2.60), 'Listed at >= 30% margin price within profit range');
+  console.log('Case V3 PASSED: #924 detected via order FULFILLED, immediately listed within profit range (never held on floor drop) ✅');
 
   // Unknown cost basis: never guessed (old code used 0.0004 ETH / floor*0.85) -> HOLD with reason
   const r555 = await relister.onPurchaseDetected({ collectionSlug: 'other', contractAddress: '0x5550000000000000000000000000000000000555', tokenId: '1', source: 'wallet-scan' });

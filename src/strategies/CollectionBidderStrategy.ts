@@ -221,6 +221,48 @@ export class CollectionBidderStrategy {
       logger.error({ slug: collectionSlug, reason: collectionCheck.reason }, `FINAL OFFER-EXECUTION BLOCKED 🛑: ${collectionCheck.reason}`);
       return { passed: false, reason: collectionCheck.reason! };
     }
+
+    // Direct Live Wallet Verification Guard: verify on-chain wallet does not hold any unsold NFT in this collection
+    try {
+      const ourWallet = this.seaportService.getWalletAddress();
+      if (ourWallet) {
+        const ownedInCollection = await this.apiService.getAccountNfts(ourWallet, collectionSlug, networkKey);
+        if (ownedInCollection && ownedInCollection.length > 0) {
+          const ignored = this.config.general.ignoredCollections || ['robin-owls', 'robin-owls-269031093'];
+          const matchingNfts = ownedInCollection.filter((nft: any) => {
+            const slug = (nft.collection || collectionSlug).toLowerCase();
+            const cAddr = (nft.contract || contractAddress).toLowerCase();
+            if (ignored.some((i) => slug.includes(i.toLowerCase()) || cAddr.includes(i.toLowerCase()))) {
+              return false;
+            }
+            return true;
+          });
+          if (matchingNfts.length > 0) {
+            for (const nft of matchingNfts) {
+              const id = `${(nft.contract || contractAddress).toLowerCase()}:${nft.identifier}`;
+              if (!this.inventoryManager.getInventoryItem(id)) {
+                this.inventoryManager.addInventoryItem({
+                  identifier: id,
+                  collectionSlug,
+                  contractAddress: nft.contract || contractAddress,
+                  tokenId: String(nft.identifier),
+                  network: networkKey,
+                  acquiredPriceEth: 0,
+                  acquiredAtTimestamp: Date.now(),
+                  status: 'PENDING_LISTING',
+                  isExternalWalletItem: false
+                });
+              }
+            }
+            const blockReason = `Direct wallet verification: Wallet currently holds ${matchingNfts.length} unsold NFT(s) from ${collectionSlug}. Re-offer blocked until confirmed sold.`;
+            logger.error({ slug: collectionSlug, count: matchingNfts.length }, `FINAL OFFER-EXECUTION BLOCKED 🛑: ${blockReason}`);
+            return { passed: false, reason: blockReason };
+          }
+        }
+      }
+    } catch (walletErr: any) {
+      logger.debug({ slug: collectionSlug, err: walletErr.message }, 'Pre-offer direct wallet verification note');
+    }
     let fresh: CollectionMarketData;
     try {
       // fresh: floor / offers re-read now (no cache) so a falling floor or our own new listing is never used stale
@@ -278,7 +320,9 @@ export class CollectionBidderStrategy {
     const ethPriceUsd = fresh.ethPriceUsd || 2700;
     const gasUsd = this.config.networks?.[networkKey]?.estimatedGasCostUsd ?? (networkKey === 'mainnet' ? 3.5 : 0.01);
     const gasEth = gasUsd / ethPriceUsd;
-    const marginPercent = this.pricingEngine.getMinMarginPercent(targetConfig);
+    const creatorFeePercent = creatorFeeBps / 100;
+    const bidPriceUsd = roundToPrecision(bidPriceEth * ethPriceUsd, 2);
+    const marginPercent = this.pricingEngine.getMinMarginPercent(targetConfig, bidPriceUsd, creatorFeePercent);
     const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30;
     if (fresh.floorPriceEth < bidPriceEth * minFloorMultiplier - 1e-12) {
       return block(`Floor (${fresh.floorPriceEth} ETH) < Offer (${bidPriceEth} ETH) * ${minFloorMultiplier}.`);
@@ -288,7 +332,8 @@ export class CollectionBidderStrategy {
       openseaFeeBps: fresh.openseaFeeBps,
       creatorFeeBps,
       gasEth,
-      marginPercent
+      marginPercent,
+      ethPriceUsd
     });
     if (fresh.floorPriceEth < minFloorEth - 1e-12) {
       return block(
@@ -297,7 +342,7 @@ export class CollectionBidderStrategy {
     }
     const undercut = (this.config.profitTargets?.undercutFloorByPercent ?? 0) / 100;
     const expectedSaleEth = fresh.floorPriceEth * (1 - undercut);
-    // 12% margin check excludes creator fees; actual net profit still includes mandatory creator fees
+    // Margin check excludes creator fees; actual net profit still includes mandatory creator fees
     const profitExclCreatorEth = expectedSaleEth * (1 - fresh.openseaFeeBps / 10000) - bidPriceEth - gasEth;
     const marginExclCreator = bidPriceEth > 0 ? (profitExclCreatorEth / bidPriceEth) * 100 : 0;
     if (marginExclCreator < marginPercent - 1e-9) {
@@ -309,6 +354,13 @@ export class CollectionBidderStrategy {
     const minNetProfitUsd = targetConfig?.targetNetProfitUsd ?? this.config.capital?.minNetProfitUsd ?? 0.20;
     if (netProfitEth * ethPriceUsd < minNetProfitUsd - 0.005) {
       return block(`Expected net profit ($${(netProfitEth * ethPriceUsd).toFixed(2)}) below minimum ($${minNetProfitUsd.toFixed(2)}) after creator fees and all costs.`);
+    }
+    const tier1MaxUsd = this.config.profitTargets?.tier1MaxPriceUsd ?? 4.0;
+    const netProfitMarginAfterCreator = bidPriceEth > 0 ? (netProfitEth / bidPriceEth) * 100 : 0;
+    if (bidPriceUsd > tier1MaxUsd && netProfitMarginAfterCreator < 12.0 - 1e-6) {
+      return block(
+        `Expected profit after creator fee (${netProfitMarginAfterCreator.toFixed(1)}%) is below required minimum (12.0%).`
+      );
     }
     // Keep freshData.topOfferEth aligned with the live competing book used for the #1 check
     if (competing) fresh.topOfferEth = competing.priceEth;
@@ -1022,7 +1074,11 @@ export class CollectionBidderStrategy {
       calculation.bidPriceEth,
       this.getOfferMaxAgeMinutes(),
       targetNetwork,
-      offerFees
+      offerFees,
+      {
+        currency: calculation.currency,
+        bidPriceUsdg: calculation.bidPriceUsdg
+      }
     );
     const offerFeeCheck = this.verifySignedOfferCreatorFees(orderComponents, offerFees);
     if (!offerFeeCheck.verified) {
@@ -1046,6 +1102,16 @@ export class CollectionBidderStrategy {
 
     const res = await this.apiService.postCollectionOffer(postPayload);
     this.apiService.invalidateCollectionCache(target.slug);
+
+    // Pre-approve conduit in the background so when an offer fills, instant listing requires 0 on-chain tx
+    this.seaportService.ensureNftConduitApproval(target.contractAddress, targetNetwork).catch((err: any) => {
+      logger.debug({ contract: target.contractAddress, err: err.message }, 'Background conduit pre-approval note');
+    });
+    if (calculation.currency === 'USDG') {
+      const netInfo = this.config.networks[targetNetwork];
+      const usdgAddr = netInfo?.usdgAddress || '0x595a8910ba11e38ada602430b8b1122644247b0c';
+      this.seaportService.ensureTokenConduitApproval(usdgAddr, targetNetwork).catch(() => {});
+    }
 
     // 9.5. Optional: Target recently minted tokens (Larry's offerSingle idea)
     if (target.singleTokenBids) {
@@ -1131,8 +1197,10 @@ export class CollectionBidderStrategy {
       collectionSlug: target.slug,
       contractAddress: target.contractAddress,
       network: targetNetwork,
+      currency: calculation.currency,
       priceEth: calculation.bidPriceEth,
       priceUsd: calculation.bidPriceUsd,
+      priceUsdg: calculation.bidPriceUsdg,
       createdTimestamp: Date.now(),
       expiresTimestamp: Date.now() + this.getOfferMaxAgeMinutes() * 60 * 1000,
       status: 'ACTIVE',
@@ -1412,6 +1480,11 @@ export class CollectionBidderStrategy {
 
     const res = await this.apiService.postSingleOffer(targetNetwork, singlePayload);
     this.apiService.invalidateCollectionCache(params.collectionSlug);
+
+    // Pre-approve conduit in the background so when an offer fills, instant listing requires 0 on-chain tx
+    this.seaportService.ensureNftConduitApproval(params.contractAddress, targetNetwork).catch((err: any) => {
+      logger.debug({ contract: params.contractAddress, err: err.message }, 'Background conduit pre-approval note');
+    });
     const orderHash = res?.order_hash || `sim_single_${params.tokenId}_${Date.now()}`;
 
     // 6. Register Active Offer & Independently Track NFT

@@ -471,24 +471,48 @@ export class OpenSeaApiService {
       const stats = await this.cached(this.statsCache, collectionSlug, this.ttl('stats', 60_000), async () => {
         const statsRes = await this.client.get(`/collections/${collectionSlug}/stats`);
         const statsFloor = statsRes.data?.total?.floor_price;
-        const symbol = statsRes.data?.total?.floor_price_symbol || 'ETH';
+        const symbol = (statsRes.data?.total?.floor_price_symbol || 'ETH').toUpperCase();
         const intervalSales = statsRes.data?.intervals?.find((i: any) => i.interval === 'one_day')?.sales;
         let floor = 0;
-        if (statsFloor !== undefined && statsFloor !== null && (symbol === 'ETH' || symbol === 'WETH')) {
-          floor = parseFloat(statsFloor);
+        let currency: 'ETH' | 'USDG' = symbol === 'USDG' ? 'USDG' : 'ETH';
+        let floorUsdg = 0;
+
+        if (statsFloor !== undefined && statsFloor !== null) {
+          const rawNum = parseFloat(statsFloor);
+          if (symbol === 'USDG') {
+            currency = 'USDG';
+            floorUsdg = rawNum;
+            floor = ethPriceUsd > 0 ? rawNum / ethPriceUsd : 0;
+          } else {
+            currency = 'ETH';
+            floor = rawNum;
+            floorUsdg = rawNum * ethPriceUsd;
+          }
         } else {
           const listingsRes = await this.client.get(`/listings/collection/${collectionSlug}/all?limit=5`);
           const listings = listingsRes.data?.listings || [];
           if (listings.length > 0) {
             const rawPrice = listings[0]?.price?.current?.value;
             const decimals = listings[0]?.price?.current?.decimals || 18;
-            floor = parseFloat(rawPrice) / Math.pow(10, decimals);
+            const listingCurr = (listings[0]?.price?.current?.currency || '').toUpperCase();
+            const parsedPrice = parseFloat(rawPrice) / Math.pow(10, decimals);
+            if (listingCurr === 'USDG') {
+              currency = 'USDG';
+              floorUsdg = parsedPrice;
+              floor = ethPriceUsd > 0 ? parsedPrice / ethPriceUsd : 0;
+            } else {
+              currency = 'ETH';
+              floor = parsedPrice;
+              floorUsdg = parsedPrice * ethPriceUsd;
+            }
           }
         }
-        return { floor, sales24Hours: intervalSales ?? 0 };
+        return { floor, floorUsdg, currency, sales24Hours: intervalSales ?? 0 };
       }, fresh);
       floorPriceEth = stats.floor;
       sales24Hours = stats.sales24Hours;
+      var detectedCurrency: 'ETH' | 'USDG' = stats.currency || 'ETH';
+      var detectedFloorUsdg = stats.floorUsdg;
     } catch (err: any) {
       return unavailable('floor price / stats', err, { ...feeFields, ...mintFields });
     }
@@ -497,7 +521,7 @@ export class OpenSeaApiService {
     // COMPETING listing instead, fetched fresh.
     const statsFloorEth = floorPriceEth;
     if (this.ownWalletAddress) {
-      const competitor = await this.getLowestCompetingListing(collectionSlug, this.ownWalletAddress);
+      const competitor = await this.getLowestCompetingListing(collectionSlug, this.ownWalletAddress, ethPriceUsd);
       if (competitor === undefined) {
         return unavailable('competing listings (floor excluding our own listings)', undefined, { ...feeFields, ...mintFields });
       }
@@ -506,6 +530,10 @@ export class OpenSeaApiService {
         return { ...base(), ...feeFields, ...mintFields, mintDemandPassed: true, earlyRejectReason: reason, liquidityReason: `Not evaluated: ${reason}` };
       }
       floorPriceEth = competitor.priceEth;
+      if (competitor.currency === 'USDG') {
+        detectedCurrency = 'USDG';
+        detectedFloorUsdg = competitor.priceUsdg ?? (competitor.priceEth * ethPriceUsd);
+      }
     }
     if (!(floorPriceEth > 0)) {
       return unavailable('floor price (no ETH floor reported)', undefined, { ...feeFields, ...mintFields });
@@ -553,6 +581,8 @@ export class OpenSeaApiService {
     return {
       slug: collectionSlug,
       contractAddress,
+      currency: detectedCurrency || 'ETH',
+      floorPriceUsdg: detectedFloorUsdg ?? (floorPriceEth * ethPriceUsd),
       floorPriceEth,
       listingFloorEth,
       statsFloorEth,
@@ -923,22 +953,31 @@ export class OpenSeaApiService {
    * so it is divided by the number of NFTs requested (consideration[0].startAmount) for multi-quantity offers.
    * Falls back to Seaport offer[0].startAmount (WETH put up by the bidder) when price.* is missing.
    */
-  public static perUnitOfferPriceEth(off: any): number {
+  public static perUnitOfferPriceEth(off: any, ethPriceUsd: number = 2500): number {
     const qtyRaw = off?.protocol_data?.parameters?.consideration?.[0]?.startAmount;
     const qty = qtyRaw !== undefined && Number(qtyRaw) > 0 ? Number(qtyRaw) : 1;
 
     const rawPrice = off?.price?.value ?? off?.price?.current?.value;
-    const decimals = off?.price?.decimals ?? off?.price?.current?.decimals ?? 18;
+    const symbol = (off?.price?.currency ?? off?.price?.current?.currency ?? '').toUpperCase();
+    const isUsdg = symbol === 'USDG';
+    const decimals = off?.price?.decimals ?? off?.price?.current?.decimals ?? (isUsdg ? 6 : 18);
     if (rawPrice !== undefined && rawPrice !== null && rawPrice !== '') {
       const total = parseFloat(String(rawPrice)) / Math.pow(10, decimals);
-      if (Number.isFinite(total) && total > 0) return total / qty;
+      if (Number.isFinite(total) && total > 0) {
+        const perUnit = total / qty;
+        return isUsdg ? (ethPriceUsd > 0 ? perUnit / ethPriceUsd : perUnit) : perUnit;
+      }
     }
 
-    // Fallback: Seaport offer side is the WETH the bidder escrows for the whole order
+    // Fallback: Seaport offer side is the WETH/USDG the bidder escrows for the whole order
     const offerAmount = off?.protocol_data?.parameters?.offer?.[0]?.startAmount;
     if (offerAmount !== undefined && offerAmount !== null) {
-      const total = parseFloat(String(offerAmount)) / 1e18;
-      if (Number.isFinite(total) && total > 0) return total / qty;
+      const dec = isUsdg ? 6 : 18;
+      const total = parseFloat(String(offerAmount)) / Math.pow(10, dec);
+      if (Number.isFinite(total) && total > 0) {
+        const perUnit = total / qty;
+        return isUsdg ? (ethPriceUsd > 0 ? perUnit / ethPriceUsd : perUnit) : perUnit;
+      }
     }
     return 0;
   }
@@ -1015,8 +1054,9 @@ export class OpenSeaApiService {
    */
   public async getLowestCompetingListing(
     collectionSlug: string,
-    ourAddress: string
-  ): Promise<{ priceEth: number; orderHash?: string } | null | undefined> {
+    ourAddress: string,
+    ethPriceUsd: number = 2500
+  ): Promise<{ priceEth: number; priceUsdg?: number; currency?: 'ETH' | 'USDG'; orderHash?: string } | null | undefined> {
     try {
       const res = await this.client.get(`/listings/collection/${collectionSlug}/best?limit=50`);
       const listings: any[] = res.data?.listings || [];
@@ -1027,8 +1067,15 @@ export class OpenSeaApiService {
         const cur = l?.price?.current;
         if (!cur?.value) continue;
         const qty = Number(params?.offer?.[0]?.startAmount || 1) || 1;
-        const priceEth = Number(cur.value) / Math.pow(10, cur.decimals ?? 18) / qty;
-        if (priceEth > 0) return { priceEth, orderHash: l.order_hash };
+        const symbol = (cur.currency || '').toUpperCase();
+        const isUsdg = symbol === 'USDG';
+        const decimals = cur.decimals ?? (isUsdg ? 6 : 18);
+        const rawAmount = Number(cur.value) / Math.pow(10, decimals) / qty;
+        if (rawAmount > 0) {
+          const priceEth = isUsdg ? (ethPriceUsd > 0 ? rawAmount / ethPriceUsd : 0) : rawAmount;
+          const priceUsdg = isUsdg ? rawAmount : rawAmount * ethPriceUsd;
+          return { priceEth, priceUsdg, currency: isUsdg ? 'USDG' : 'ETH', orderHash: l.order_hash };
+        }
       }
       return null;
     } catch (err: any) {
@@ -1243,11 +1290,13 @@ export class OpenSeaApiService {
               async () => (await this.client.get(`/collections/${col.collection}/stats`, { timeout: 30000 })).data
             );
             const floor = statsRes?.total?.floor_price;
-            const symbol = statsRes?.total?.floor_price_symbol || 'ETH';
+            const symbol = (statsRes?.total?.floor_price_symbol || 'ETH').toUpperCase();
             const oneDaySales = statsRes?.intervals?.find((intervalItem: any) => intervalItem.interval === 'one_day')?.sales || 0;
 
-            if (floor !== undefined && floor !== null && floor > 0 && (symbol === 'ETH' || symbol === 'WETH')) {
-              const floorUsd = floor * ethPriceUsd;
+            if (floor !== undefined && floor !== null && Number(floor) > 0 && (symbol === 'ETH' || symbol === 'WETH' || symbol === 'USDG')) {
+              const isUsdg = symbol === 'USDG';
+              const floorUsd = isUsdg ? Number(floor) : Number(floor) * ethPriceUsd;
+              const floorEth = isUsdg ? (ethPriceUsd > 0 ? Number(floor) / ethPriceUsd : 0) : Number(floor);
               // Floor within target range AND has verified trading activity (>= 1 sale, prioritized >= 5)
               if (floorUsd >= minFloorUsd && floorUsd <= maxFloorUsd && oneDaySales >= 1) {
                 return {
@@ -1255,8 +1304,9 @@ export class OpenSeaApiService {
                   slug: col.collection,
                   contractAddress: contract,
                   network: networkKey,
-                  floorEth: floor,
+                  floorEth,
                   floorUsd,
+                  currency: isUsdg ? 'USDG' : 'ETH',
                   oneDaySales
                 };
               }
