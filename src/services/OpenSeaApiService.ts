@@ -20,6 +20,8 @@ export class OpenSeaApiService {
   private ethPriceCache: { price: number; timestamp: number } | null = null;
   private mockOrderStates: Map<string, { isCancelled: boolean; cancellationFails?: boolean; verificationFails?: boolean }> = new Map();
   private saleOrderSideCache: Map<string, 'LISTING' | 'OFFER' | 'UNKNOWN'> = new Map();
+  private discoverySortIndex: number = 0;
+  public static readonly DISCOVERY_SORT_OPTIONS = ['one_day_volume', 'seven_day_volume', 'created_date'] as const;
 
   constructor(config: BotConfig) {
     this.config = config;
@@ -1233,19 +1235,31 @@ export class OpenSeaApiService {
 
   /**
    * Dynamically discovers active collections with floor prices between minFloorUsd and maxFloorUsd on a given network.
-   * Includes cursor-based pagination (up to 300-500 collections) and controlled batching (5 at a time) with 30s timeout.
+   * Includes cursor-based pagination (up to 800 collections with maxPages=8) and cycle rotation across sorting methods
+   * (e.g. one_day_volume, seven_day_volume, created_date) to uncover fresh collections instead of scanning the same list.
    */
   public async discoverCollectionsByChain(
     networkKey: string,
     minFloorUsd: number = 0.50,
     maxFloorUsd: number = 3.50,
-    maxPages: number = 4
+    maxPages: number = 8,
+    orderBy?: string
   ): Promise<any[]> {
     const chainSlug = OpenSeaApiService.toOpenSeaChain(networkKey);
     const ethPriceUsd = await this.getEthPriceUsd();
     const discovered: any[] = [];
 
+    const sort = orderBy || OpenSeaApiService.DISCOVERY_SORT_OPTIONS[this.discoverySortIndex % OpenSeaApiService.DISCOVERY_SORT_OPTIONS.length];
+    if (!orderBy) {
+      this.discoverySortIndex++;
+    }
+
     try {
+      logger.info(
+        { network: networkKey, sort, maxPages },
+        `Dynamic collection discovery: Scanning OpenSea ${networkKey.toUpperCase()} collections (sort: ${sort}, pages: ${maxPages})...`
+      );
+
       // 1. Paginated collection discovery (follows OpenSea `next` cursor up to maxPages)
       const allCollections: any[] = [];
       const seenSlugs = new Set<string>();
@@ -1253,7 +1267,7 @@ export class OpenSeaApiService {
 
       for (let page = 0; page < maxPages; page++) {
         const url =
-          `/collections?chain=${chainSlug}&limit=100&order_by=one_day_volume` +
+          `/collections?chain=${chainSlug}&limit=100&order_by=${encodeURIComponent(sort)}` +
           (nextCursor ? `&next=${encodeURIComponent(nextCursor)}` : '');
         const res = await this.client.get(url);
         const batch = (res.data?.collections || []).filter(
@@ -1292,13 +1306,21 @@ export class OpenSeaApiService {
             const floor = statsRes?.total?.floor_price;
             const symbol = (statsRes?.total?.floor_price_symbol || 'ETH').toUpperCase();
             const oneDaySales = statsRes?.intervals?.find((intervalItem: any) => intervalItem.interval === 'one_day')?.sales || 0;
+            const sevenDaySales = statsRes?.intervals?.find((intervalItem: any) => intervalItem.interval === 'seven_day')?.sales || 0;
 
             if (floor !== undefined && floor !== null && Number(floor) > 0 && (symbol === 'ETH' || symbol === 'WETH' || symbol === 'USDG')) {
               const isUsdg = symbol === 'USDG';
               const floorUsd = isUsdg ? Number(floor) : Number(floor) * ethPriceUsd;
               const floorEth = isUsdg ? (ethPriceUsd > 0 ? Number(floor) / ethPriceUsd : 0) : Number(floor);
-              // Floor within target range AND has verified trading activity (>= 1 sale, prioritized >= 5)
-              if (floorUsd >= minFloorUsd && floorUsd <= maxFloorUsd && oneDaySales >= 1) {
+              // Floor within target range AND has verified trading activity
+              const hasActivity =
+                sort === 'created_date'
+                  ? true
+                  : sort === 'seven_day_volume'
+                  ? (sevenDaySales >= 1 || oneDaySales >= 1)
+                  : oneDaySales >= 1;
+
+              if (floorUsd >= minFloorUsd && floorUsd <= maxFloorUsd && hasActivity) {
                 return {
                   name: col.name,
                   slug: col.collection,
@@ -1307,7 +1329,9 @@ export class OpenSeaApiService {
                   floorEth,
                   floorUsd,
                   currency: isUsdg ? 'USDG' : 'ETH',
-                  oneDaySales
+                  oneDaySales,
+                  sevenDaySales,
+                  discoverySort: sort
                 };
               }
             }
@@ -1327,15 +1351,16 @@ export class OpenSeaApiService {
               network: networkKey,
               floorEth: item.floorEth,
               floorUsd: `$${item.floorUsd.toFixed(2)}`,
-              oneDaySales: item.oneDaySales
+              oneDaySales: item.oneDaySales,
+              sort
             },
-            `Dynamic Discovery: Found active ${networkKey.toUpperCase()} volume collection ($${minFloorUsd}-$${maxFloorUsd})`
+            `Dynamic Discovery: Found active ${networkKey.toUpperCase()} collection ($${minFloorUsd}-$${maxFloorUsd}) [sort: ${sort}]`
           );
           discovered.push(item);
         }
       }
     } catch (err: any) {
-      logger.debug({ network: networkKey, err: err.message }, 'Dynamic collection discovery routine failed');
+      logger.debug({ network: networkKey, sort, err: err.message }, 'Dynamic collection discovery routine failed');
     }
 
     return discovered;
