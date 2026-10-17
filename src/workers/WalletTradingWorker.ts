@@ -91,6 +91,11 @@ export class WalletTradingWorker {
     return this.tradingWallet.address;
   }
 
+  public setFriendlyWallets(addresses: string[]): void {
+    this.apiService.setFriendlyWalletAddresses(addresses);
+    this.bidderStrategy.setFriendlyWallets(addresses);
+  }
+
   public getStatus() {
     return {
       id: this.id,

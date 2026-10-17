@@ -136,6 +136,61 @@ async function runMultiWalletTests() {
 
     console.log('Test 5 PASSED: Both workers initialized in parallel with complete isolation ✅\n');
 
+    // ------------------------------------------------------------------------
+    // TEST 6: Team Coordination & Anti-Cannibalization Rule
+    // ------------------------------------------------------------------------
+    console.log('--- Test 6: Team Coordination & Anti-Cannibalization Rule ---');
+    const apiService = (worker2 as any).apiService;
+    apiService.setFriendlyWalletAddresses([addr1, addr2]);
+
+    // Mock collection offers where Wallet 1 holds the top offer (0.0015 ETH) and an outsider holds 0.0012 ETH
+    (apiService as any).fetchCollectionOffersPages = async () => [
+      {
+        order_hash: '0xwallet1_top_offer',
+        protocol_data: { parameters: { offerer: addr1 } },
+        price: { currency: 'WETH', value: '1500000000000000', decimals: 18 }
+      },
+      {
+        order_hash: '0xoutsider_lower_offer',
+        protocol_data: { parameters: { offerer: '0x9999999999999999999999999999999999999999' } },
+        price: { currency: 'WETH', value: '1200000000000000', decimals: 18 }
+      }
+    ];
+
+    // 1. getAbsoluteTopCollectionOffer must detect Wallet 1 is #1
+    const absTop = await apiService.getAbsoluteTopCollectionOffer('test-col');
+    assert.strictEqual(absTop?.offerer?.toLowerCase(), addr1.toLowerCase(), 'Must detect Wallet 1 is at the top');
+
+    // 2. getTopCompetingCollectionOffer from Wallet 2's perspective must exclude Wallet 1 (only see the outsider)
+    const competingForWallet2 = await apiService.getTopCompetingCollectionOffer('test-col', {
+      excludeAddresses: [addr2, addr1],
+      fresh: true
+    });
+    assert.strictEqual(competingForWallet2?.offerer?.toLowerCase(), '0x9999999999999999999999999999999999999999', 'Wallet 2 must ignore Wallet 1 as a competitor and only see external offers');
+
+    // 3. CollectionBidderStrategy with friendly wallets set
+    const bidder2 = (worker2 as any).bidderStrategy;
+    bidder2.setFriendlyWallets([addr1, addr2]);
+
+    // When Wallet 2 checks a collection where Wallet 1 is already #1, it must NOT place an offer
+    let offerPlaced = false;
+    (worker2 as any).seaportService.createAndSubmitCollectionOffer = async () => {
+      offerPlaced = true;
+      return { success: true, orderHash: '0xwallet2_duplicate' };
+    };
+
+    await bidder2.processCollectionBid({
+      name: 'Team Col',
+      slug: 'test-col',
+      contractAddress: '0x1234123412341234123412341234123412341234',
+      network: 'robinhood',
+      targetNetProfitUsd: 0.2,
+      maxInventory: 5
+    });
+
+    assert.strictEqual(offerPlaced, false, 'Wallet 2 must NOT place an offer on a collection where Wallet 1 is already #1');
+    console.log('Test 6 PASSED: Team Coordination prevents self-outbidding and cannibalization ✅\n');
+
     console.log('================================================================');
     console.log('All Multi-Wallet Tests Passed Successfully! ✅');
     console.log('================================================================');

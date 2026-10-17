@@ -31,6 +31,13 @@ export class CollectionBidderStrategy {
     this.circuitBreaker = circuitBreaker;
   }
 
+  private friendlyWallets: Set<string> = new Set();
+
+  /** Team Coordination: register other bot wallets so they never outbid or compete with each other */
+  public setFriendlyWallets(addresses: string[]): void {
+    this.friendlyWallets = new Set(addresses.map((a) => a.toLowerCase()));
+  }
+
   /**
    * Offer lifetime: offers must never stay active longer than 20 minutes. The configured
    * offerExpirationMinutes may shorten this, but can never extend it past 20 minutes.
@@ -309,7 +316,7 @@ export class CollectionBidderStrategy {
     const ourAddress = this.seaportService.getWalletAddress();
     const ethPriceUsd = fresh.ethPriceUsd || 2700;
     const competing = await this.apiService.getTopCompetingCollectionOffer(collectionSlug, {
-      excludeAddress: ourAddress,
+      excludeAddresses: [ourAddress, ...Array.from(this.friendlyWallets)],
       ethPriceUsd,
       fresh: true
     });
@@ -551,7 +558,7 @@ export class CollectionBidderStrategy {
     const ethPriceUsd = await this.apiService.getEthPriceUsd();
     const competing = await this.apiService.getTopCompetingCollectionOffer(offer.collectionSlug, {
       excludeOrderHashes: [offer.orderHash],
-      excludeAddress: ourAddress,
+      excludeAddresses: [ourAddress, ...Array.from(this.friendlyWallets)],
       ethPriceUsd,
       fresh: true
     });
@@ -823,6 +830,23 @@ export class CollectionBidderStrategy {
     // 3.0. One-offer + outbid / expiry cancel BEFORE eligibility gates — stale offers must not survive a mint/liquidity SKIP
     await this.cancelDuplicateOffersForCollection(target.slug, target.contractAddress);
     const existingOffer = this.inventoryManager.getActiveOffer(target.slug);
+
+    // Team Coordination Rule: If another friendly wallet already holds the #1 offer on this collection,
+    // do not place a competing offer. Let them maintain #1 priority while this wallet bids elsewhere.
+    if (!existingOffer) {
+      const ourAddress = this.seaportService.getWalletAddress().toLowerCase();
+      const absoluteTop = await this.apiService.getAbsoluteTopCollectionOffer(target.slug);
+      if (absoluteTop?.offerer) {
+        const topOfferer = absoluteTop.offerer.toLowerCase();
+        if (topOfferer !== ourAddress && this.friendlyWallets.has(topOfferer)) {
+          logger.info(
+            { slug: target.slug, topOfferer },
+            `[Team Coordination] Collection ${target.slug} already has #1 offer held by friendly wallet (${topOfferer}). Skipping to diversify coverage.`
+          );
+          return;
+        }
+      }
+    }
     if (existingOffer) {
       if (
         existingOffer.status === 'CANCELLATION_PENDING' ||

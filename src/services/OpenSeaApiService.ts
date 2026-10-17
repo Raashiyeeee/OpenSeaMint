@@ -81,9 +81,26 @@ export class OpenSeaApiService {
   }
 
   private ownWalletAddress?: string;
+  private friendlyWalletAddresses: Set<string> = new Set();
+
   /** Our trading wallet: our own listings are never counted as the market floor. */
   public setOwnWalletAddress(address: string): void {
     this.ownWalletAddress = address;
+    this.friendlyWalletAddresses.add(address.toLowerCase());
+  }
+
+  /** Team Coordination: register all known friendly wallets (e.g. Wallet 1, Wallet 2) */
+  public setFriendlyWalletAddresses(addresses: string[]): void {
+    this.friendlyWalletAddresses = new Set(addresses.map((a) => a.toLowerCase()));
+    if (this.ownWalletAddress) {
+      this.friendlyWalletAddresses.add(this.ownWalletAddress.toLowerCase());
+    }
+  }
+
+  public isFriendlyAddress(address?: string): boolean {
+    if (!address) return false;
+    const lower = address.toLowerCase();
+    return this.friendlyWalletAddresses.has(lower) || (this.ownWalletAddress?.toLowerCase() === lower);
   }
 
   /**
@@ -1068,8 +1085,8 @@ export class OpenSeaApiService {
    */
   public async getTopCompetingCollectionOffer(
     collectionSlug: string,
-    opts: { excludeOrderHashes?: string[]; excludeAddress?: string; fresh?: boolean; ethPriceUsd?: number } = {}
-  ): Promise<{ priceEth: number; priceUsd?: number; orderHash?: string } | null | undefined> {
+    opts: { excludeOrderHashes?: string[]; excludeAddress?: string; excludeAddresses?: string[]; fresh?: boolean; ethPriceUsd?: number } = {}
+  ): Promise<{ priceEth: number; priceUsd?: number; orderHash?: string; offerer?: string } | null | undefined> {
     try {
       const ethPriceUsd = opts.ethPriceUsd ?? (await this.getEthPriceUsd());
       const offers: any[] = await this.cached(
@@ -1080,16 +1097,20 @@ export class OpenSeaApiService {
         opts.fresh === true
       );
       const excludeHashes = new Set((opts.excludeOrderHashes || []).map((h) => h.toLowerCase()).filter(Boolean));
-      const excludeAddr = (opts.excludeAddress || this.ownWalletAddress || '').toLowerCase();
-      let best: { priceEth: number; priceUsd?: number; orderHash?: string } | null = null;
+      const excludeAddrs = new Set([
+        ...(opts.excludeAddresses || []).map((a) => a.toLowerCase()),
+        (opts.excludeAddress || this.ownWalletAddress || '').toLowerCase(),
+        ...Array.from(this.friendlyWalletAddresses)
+      ].filter(Boolean));
+      let best: { priceEth: number; priceUsd?: number; orderHash?: string; offerer?: string } | null = null;
       for (const off of offers) {
         const hash = (off?.order_hash || '').toLowerCase();
         if (hash && excludeHashes.has(hash)) continue;
         const offerer = (off?.protocol_data?.parameters?.offerer || off?.maker?.address || '').toLowerCase();
-        if (excludeAddr && offerer && offerer === excludeAddr) continue;
+        if (offerer && excludeAddrs.has(offerer)) continue;
         const info = OpenSeaApiService.perUnitOfferPriceInfo(off, ethPriceUsd);
         if (info.priceEth > 0 && (!best || info.priceEth > best.priceEth)) {
-          best = { priceEth: info.priceEth, priceUsd: info.priceUsd, orderHash: off?.order_hash };
+          best = { priceEth: info.priceEth, priceUsd: info.priceUsd, orderHash: off?.order_hash, offerer };
         }
       }
       return best;
@@ -1100,12 +1121,39 @@ export class OpenSeaApiService {
   }
 
   /**
-   * Best offer on a specific NFT (OpenSea: GET /offers/collection/{slug}/nfts/{identifier}/best).
-   * Returns per-unit price in ETH and the order hash, or undefined if none / unavailable.
+   * Returns the current absolute top offer on a collection regardless of who placed it,
+   * along with the offerer's wallet address. Used by Team Coordination to detect friendly leads.
    */
+  public async getAbsoluteTopCollectionOffer(
+    collectionSlug: string,
+    ethPriceUsd?: number
+  ): Promise<{ priceEth: number; priceUsd?: number; orderHash?: string; offerer?: string } | null | undefined> {
+    try {
+      const priceUsd = ethPriceUsd ?? (await this.getEthPriceUsd());
+      const offers: any[] = await this.cached(
+        this.offersCache,
+        collectionSlug,
+        this.ttl('offers', 20_000),
+        () => this.fetchCollectionOffersPages(collectionSlug),
+        false
+      );
+      let best: { priceEth: number; priceUsd?: number; orderHash?: string; offerer?: string } | null = null;
+      for (const off of offers) {
+        const offerer = (off?.protocol_data?.parameters?.offerer || off?.maker?.address || '').toLowerCase();
+        const info = OpenSeaApiService.perUnitOfferPriceInfo(off, priceUsd);
+        if (info.priceEth > 0 && (!best || info.priceEth > best.priceEth)) {
+          best = { priceEth: info.priceEth, priceUsd: info.priceUsd, orderHash: off?.order_hash, offerer };
+        }
+      }
+      return best;
+    } catch (err: any) {
+      logger.warn({ slug: collectionSlug, err: err.message }, 'Failed to fetch absolute top collection offer');
+      return undefined;
+    }
+  }
+
   /**
-   * Lowest active listing in the collection that is NOT ours (GET /listings/collection/{slug}/best, sorted by
-   * price ascending). Returns null when no competing listing exists, undefined when the lookup failed.
+   * Lowest active listing in the collection that is NOT ours or a friendly wallet's (GET /listings/collection/{slug}/best).
    */
   public async getLowestCompetingListing(
     collectionSlug: string,
@@ -1118,7 +1166,8 @@ export class OpenSeaApiService {
       const ours = (ourAddress || '').toLowerCase();
       for (const l of listings) {
         const params = l?.protocol_data?.parameters;
-        if ((params?.offerer || '').toLowerCase() === ours) continue;
+        const offerer = (params?.offerer || '').toLowerCase();
+        if (offerer === ours || this.isFriendlyAddress(offerer)) continue;
         const cur = l?.price?.current;
         if (!cur?.value) continue;
         const qty = Number(params?.offer?.[0]?.startAmount || 1) || 1;
