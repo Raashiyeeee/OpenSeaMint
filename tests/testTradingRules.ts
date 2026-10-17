@@ -1030,6 +1030,118 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
 
   console.log('Case G PASSED: Stop-loss auto-listing at 45%, 60%, 80% with #1 priority & one-time trigger verified ✅\n');
 
+  // ------------------------------------------------------------------------
+  // RULE H: Same-Buyer Activity Filter
+  // ------------------------------------------------------------------------
+  console.log('--- Rule H: Same-Buyer Activity Filter ---');
+  // H1: PricingEngine rejects if sameBuyerActivityDetected is true
+  const sameBuyerMarketData = baseMarketData({
+    sales3Hours: 15,
+    uniqueWallets3Hours: 8,
+    sales30Minutes: 5,
+    uniqueBuyers30Minutes: 1,
+    sameBuyerActivityDetected: true,
+    liquidityPassed: false,
+    liquidityReason: 'Same-Buyer Activity Filter: Only 1 unique buyer in last 30 min'
+  });
+  const sameBuyerCalc = pricingEngine.calculateMaxBid(sameBuyerMarketData, 0.20, 10, 'robinhood');
+  assert.strictEqual(sameBuyerCalc.decision, 'REJECT', 'Same buyer activity must reject offer');
+  assert.strictEqual(sameBuyerCalc.checkLLiquidityPassed, false, 'Liquidity must not pass when same buyer activity detected');
+
+  // H2: OpenSeaApiService getCollectionLiquidity flags same buyer when only 1 buyer in 30 min
+  const sameBuyerApi = new OpenSeaApiService(config);
+  const nowSecH = Math.floor(Date.now() / 1000);
+  const sampleEvents = [
+    // 5 sales in the last 15 minutes, all to same buyer '0xbuyer1' from 5 different sellers
+    ...Array.from({ length: 5 }, (_, i) => ({
+      event_timestamp: String(nowSecH - 600),
+      payment_token: { symbol: 'ETH', eth_price: '0.0020' },
+      buyer: '0xbuyer1',
+      seller: `0xseller${i}`
+    })),
+    // 6 older sales (1-2 hours ago) to different buyers
+    ...Array.from({ length: 6 }, (_, i) => ({
+      event_timestamp: String(nowSecH - 4000),
+      payment_token: { symbol: 'ETH', eth_price: '0.0020' },
+      buyer: `0xdifferentbuyer${i}`,
+      seller: `0xoldseller${i}`
+    }))
+  ];
+  (sameBuyerApi as any).client = { get: async () => ({ data: { asset_events: sampleEvents } }) };
+  const sameBuyerLiq = await sameBuyerApi.getCollectionLiquidity('same-buyer-test', 0.0020);
+  assert.strictEqual(sameBuyerLiq.sameBuyerActivityDetected, true, 'Should detect only 1 unique buyer in last 30 minutes');
+  assert.strictEqual(sameBuyerLiq.liquidityPassed, false, 'Liquidity must fail when same buyer detected');
+  assert(sameBuyerLiq.liquidityReason?.includes('Same-Buyer Activity Filter'), 'Reason must mention Same-Buyer Filter');
+
+  // H3: When multiple buyers exist in last 30 min, sameBuyerActivityDetected is false
+  const multiBuyerEvents = [
+    { event_timestamp: String(nowSecH - 600), payment_token: { symbol: 'ETH', eth_price: '0.0020' }, buyer: '0xbuyerA', seller: '0xseller1' },
+    { event_timestamp: String(nowSecH - 500), payment_token: { symbol: 'ETH', eth_price: '0.0020' }, buyer: '0xbuyerB', seller: '0xseller2' },
+    ...Array.from({ length: 9 }, (_, i) => ({
+      event_timestamp: String(nowSecH - 4000),
+      payment_token: { symbol: 'ETH', eth_price: '0.0020' },
+      buyer: `0xbuyer${i}`,
+      seller: `0xseller${i}`
+    }))
+  ];
+  (sameBuyerApi as any).client = { get: async () => ({ data: { asset_events: multiBuyerEvents } }) };
+  const multiBuyerLiq = await sameBuyerApi.getCollectionLiquidity('multi-buyer-test', 0.0020);
+  assert.strictEqual(multiBuyerLiq.sameBuyerActivityDetected, false, 'Multiple buyers in 30 min must not flag same buyer');
+  assert.strictEqual(multiBuyerLiq.liquidityPassed, true, 'Diversified buyers must pass liquidity');
+  console.log('Case H PASSED: Same-Buyer Activity Filter rejects collections with single buyer in last 30 minutes ✅\n');
+
+  // ------------------------------------------------------------------------
+  // RULE I: Instant Offer Cancellation Rule (USD/USDG & Continuous Retry)
+  // ------------------------------------------------------------------------
+  console.log('--- Rule I: Instant Offer Cancellation (USD/USDG & Continuous Retry) ---');
+  // I1: Outbid in USD ($4.36 > $4.12) is immediately detected and cancelled
+  const outbidApi = new OpenSeaApiService(config);
+  (outbidApi as any).getEthPriceUsd = async () => 2700;
+  (outbidApi as any).getTopCompetingCollectionOffer = async () => ({
+    priceEth: 4.36 / 2700,
+    priceUsd: 4.36,
+    orderHash: '0xcompetitor_top'
+  });
+  let instantCancelled = 0;
+  (outbidApi as any).cancelOffer = async () => { instantCancelled++; return { success: true }; };
+  (outbidApi as any).verifyOfferInactive = async () => ({ isInactive: true, status: 'CANCELLED' });
+
+  const outbidInv = new InventoryManager(config);
+  const { bidder: outbidBidder } = makeBidder(outbidApi, outbidInv);
+  outbidInv.registerActiveOffer({
+    orderHash: 'our_offer_412',
+    collectionSlug: 'usd-test-collection',
+    contractAddress: baseMarketData().contractAddress,
+    priceEth: 4.12 / 2700,
+    priceUsd: 4.12,
+    createdTimestamp: Date.now() - 60000, // placed 1 minute ago (not expired!)
+    expiresTimestamp: Date.now() + 19 * 60000,
+    status: 'ACTIVE'
+  });
+
+  const scanRes = await outbidBidder.processOutbidOfferCancellations();
+  assert.strictEqual(scanRes.cancelled, 1, 'Offer outbid in USD ($4.36 > $4.12) must be cancelled immediately');
+  assert.strictEqual(instantCancelled, 1, 'Cancel request must have been sent immediately');
+  assert.strictEqual(outbidInv.getActiveOffer('our_offer_412'), undefined, 'Offer must be removed from active offers');
+
+  // I2: Offer in CANCELLATION_FAILED or CANCELLATION_PENDING is retried immediately by processOutbidOfferCancellations
+  const retryInv = new InventoryManager(config);
+  const { bidder: retryBidder } = makeBidder(outbidApi, retryInv);
+  retryInv.registerActiveOffer({
+    orderHash: 'pending_outbid_offer',
+    collectionSlug: 'usd-test-collection',
+    contractAddress: baseMarketData().contractAddress,
+    priceEth: 4.12 / 2700,
+    priceUsd: 4.12,
+    createdTimestamp: Date.now() - 30000, // only 30s old, far from 20m expiry
+    expiresTimestamp: Date.now() + 19 * 60000,
+    status: 'CANCELLATION_FAILED'
+  });
+  const retryScan = await retryBidder.processOutbidOfferCancellations();
+  assert.strictEqual(retryScan.cancelled, 1, 'Pending/failed cancellation must be retried and resolved without waiting 20m');
+  assert.strictEqual(retryInv.getActiveOffer('pending_outbid_offer'), undefined, 'Pending offer confirmed cancelled and removed');
+  console.log('Case I PASSED: Instant Offer Cancellation in USD & immediate pending cancellation retries verified ✅\n');
+
   process.env.BOT_MODE = originalBotMode;
   console.log('================================================================');
   console.log('All Trading Rules regression tests passed successfully!');

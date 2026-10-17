@@ -282,8 +282,11 @@ export class CollectionBidderStrategy {
     if (!mint.passed) return block(mint.reason);
 
     const minSales = this.config.liquidity?.minSales3Hours ?? 10;
+    if (fresh.sameBuyerActivityDetected) {
+      return block(fresh.liquidityReason || 'Same-Buyer Activity Filter: Only the same buyer has been buying NFTs during the last 30 minutes.');
+    }
     if ((fresh.sales3Hours ?? 0) < minSales || fresh.liquidityPassed === false) {
-      return block(`Recent floor sales requirement failed (${fresh.sales3Hours ?? 0}/${minSales} native ETH floor sales in 3h).`);
+      return block(fresh.liquidityReason || `Recent floor sales requirement failed (${fresh.sales3Hours ?? 0}/${minSales} native ETH floor sales in 3h).`);
     }
 
     const refFloor = fresh.referenceFloorEth && fresh.referenceFloorEth > 0 ? fresh.referenceFloorEth : fresh.floorPriceEth;
@@ -304,24 +307,29 @@ export class CollectionBidderStrategy {
     // Rule 1 (Top-Priority Offers): never post a bid that is already below the live competing top.
     // Fresh competing book — independent of cached marketData.topOfferEth.
     const ourAddress = this.seaportService.getWalletAddress();
+    const ethPriceUsd = fresh.ethPriceUsd || 2700;
     const competing = await this.apiService.getTopCompetingCollectionOffer(collectionSlug, {
       excludeAddress: ourAddress,
+      ethPriceUsd,
       fresh: true
     });
     if (competing === undefined) {
       return block('Top-Priority Offer Rule: competing offers could not be verified; refusing to place below #1.');
     }
-    if (competing && bidPriceEth <= competing.priceEth + 1e-12) {
+    const bidPriceUsd = roundToPrecision(bidPriceEth * ethPriceUsd, 2);
+    const wouldBeOutbid = competing && (
+      bidPriceEth <= competing.priceEth + 1e-12 ||
+      (competing.priceUsd !== undefined && bidPriceUsd > 0 && bidPriceUsd <= competing.priceUsd + 0.001)
+    );
+    if (wouldBeOutbid) {
+      const topDesc = competing.priceUsd ? `$${competing.priceUsd.toFixed(2)} (${competing.priceEth} ETH)` : `${competing.priceEth} ETH`;
       return block(
-        `Top-Priority Offer Rule: bid (${bidPriceEth} ETH) would not be #1 (competing top ${competing.priceEth} ETH). Adjust before placing.`
+        `Top-Priority Offer Rule: bid (${bidPriceEth} ETH / $${bidPriceUsd.toFixed(2)}) would not be #1 (competing top ${topDesc}). Adjust before placing.`
       );
     }
-
-    const ethPriceUsd = fresh.ethPriceUsd || 2700;
     const gasUsd = this.config.networks?.[networkKey]?.estimatedGasCostUsd ?? (networkKey === 'mainnet' ? 3.5 : 0.01);
     const gasEth = gasUsd / ethPriceUsd;
     const creatorFeePercent = creatorFeeBps / 100;
-    const bidPriceUsd = roundToPrecision(bidPriceEth * ethPriceUsd, 2);
     const marginPercent = this.pricingEngine.getMinMarginPercent(targetConfig, bidPriceUsd, creatorFeePercent);
     const minFloorMultiplier = this.config.liquidity?.minFloorMultiplier ?? 1.30;
     if (fresh.floorPriceEth < bidPriceEth * minFloorMultiplier - 1e-12) {
@@ -518,28 +526,57 @@ export class CollectionBidderStrategy {
   }
 
   /**
-   * Highest competing offer price (ETH) for an active offer we hold.
+   * Evaluates if our offer is outbid by a competitor, checking both USD and ETH amounts.
+   */
+  public static isOutbidBy(competing: { priceEth: number; priceUsd?: number }, offer: ActiveOffer): boolean {
+    if (competing.priceUsd !== undefined && offer.priceUsd !== undefined && offer.priceUsd > 0 && competing.priceUsd > 0) {
+      if (competing.priceUsd > offer.priceUsd + 0.001) {
+        return true;
+      }
+    }
+    if (competing.priceEth > offer.priceEth + 1e-12) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Highest competing offer info (ETH and USD) for an active offer we hold.
    * Uses a FRESH lightweight offers lookup — never gated by mint / floor / liquidity eligibility.
    *
    * Returns `undefined` when the competing book cannot be read (caller must NOT treat that as "we are #1").
    */
-  public async getCompetingTopOfferEth(offer: ActiveOffer): Promise<number | undefined> {
+  public async getCompetingTopOffer(offer: ActiveOffer): Promise<{ priceEth: number; priceUsd?: number; orderHash?: string } | undefined> {
     const ourAddress = this.seaportService.getWalletAddress();
+    const ethPriceUsd = await this.apiService.getEthPriceUsd();
     const competing = await this.apiService.getTopCompetingCollectionOffer(offer.collectionSlug, {
       excludeOrderHashes: [offer.orderHash],
       excludeAddress: ourAddress,
+      ethPriceUsd,
       fresh: true
     });
     if (competing === undefined) return undefined;
-    let competingTopEth = competing?.priceEth || 0;
+    let best = competing ? { ...competing } : { priceEth: 0, priceUsd: 0 };
     // Single-NFT offers also compete with the best offer on that specific token
     if (offer.tokenId) {
       const bestNft = await this.apiService.getBestNftOffer(offer.collectionSlug, offer.tokenId);
-      if (bestNft && bestNft.orderHash !== offer.orderHash && bestNft.priceEth > competingTopEth) {
-        competingTopEth = bestNft.priceEth;
+      if (bestNft && bestNft.orderHash !== offer.orderHash && bestNft.priceEth > best.priceEth) {
+        best = {
+          priceEth: bestNft.priceEth,
+          priceUsd: ethPriceUsd > 0 ? bestNft.priceEth * ethPriceUsd : undefined,
+          orderHash: bestNft.orderHash
+        };
       }
     }
-    return competingTopEth;
+    return best;
+  }
+
+  /**
+   * Highest competing offer price (ETH) for an active offer we hold.
+   */
+  public async getCompetingTopOfferEth(offer: ActiveOffer): Promise<number | undefined> {
+    const competing = await this.getCompetingTopOffer(offer);
+    return competing ? competing.priceEth : undefined;
   }
 
   /**
@@ -564,21 +601,22 @@ export class CollectionBidderStrategy {
   }
 
   /**
-   * Automatic Offer Cancellation — Outbid Rule:
+   * Instant Offer Cancellation — Outbid Rule:
    * 1. Cancel When Outbid: If another buyer places a higher offer on an NFT,
-   *    the bot must automatically cancel its existing offer.
-   * 2. No Stale Offers: The bot must not leave outdated offers active after being outbid.
-   *
-   * Outbid detection MUST NOT depend on full market-data eligibility (mint/liquidity/fees).
-   * Those gates apply only when deciding whether to place a NEW offer after cancel.
+   *    the bot must automatically cancel its existing offer immediately without waiting 20 minutes.
+   * 2. Continuous Verification: Live offers with CANCELLATION_PENDING or CANCELLATION_FAILED are re-verified
+   *    immediately on every cycle so they are resolved without waiting for the 20-minute expiry.
+   * 3. No Stale Offers: The bot must not leave outdated offers active after being outbid.
    */
   public async processOutbidOfferCancellations(): Promise<{
     cancelled: number;
     failed: number;
     pending: number;
   }> {
-    const activeOffers = this.inventoryManager.getAllActiveOffers().filter((o) => o.status === 'ACTIVE');
-    if (activeOffers.length === 0) {
+    const liveOffers = this.inventoryManager.getAllActiveOffers().filter(
+      (o) => o.status === 'ACTIVE' || o.status === 'CANCELLATION_PENDING' || o.status === 'CANCELLATION_FAILED'
+    );
+    if (liveOffers.length === 0) {
       return { cancelled: 0, failed: 0, pending: 0 };
     }
 
@@ -586,13 +624,30 @@ export class CollectionBidderStrategy {
     let failed = 0;
     let pending = 0;
 
-    for (const offer of activeOffers) {
+    for (const offer of liveOffers) {
       try {
+        // If cancellation was already initiated or pending, re-verify and retry immediately so it does NOT wait 20 minutes
+        if (offer.status === 'CANCELLATION_PENDING' || offer.status === 'CANCELLATION_FAILED') {
+          const res = await this.cancelAndVerifyOffer(offer, 'Pending Outbid Cancellation Retry');
+          if (res.success) {
+            this.apiService.invalidateCollectionCache(offer.collectionSlug);
+            cancelled++;
+          } else {
+            const currentOffer = this.inventoryManager.getActiveOffer(offer.orderHash);
+            if (currentOffer?.flaggedForAttention || currentOffer?.status === 'CANCELLATION_FAILED') {
+              failed++;
+            } else {
+              pending++;
+            }
+          }
+          continue;
+        }
+
         // Rule 2: collapse duplicate simultaneous offers on the same collection first
         await this.cancelDuplicateOffersForCollection(offer.collectionSlug, offer.contractAddress);
 
-        const competingTopEth = await this.getCompetingTopOfferEth(offer);
-        if (competingTopEth === undefined) {
+        const competing = await this.getCompetingTopOffer(offer);
+        if (competing === undefined) {
           logger.warn(
             { orderHash: offer.orderHash, collection: offer.collectionSlug },
             'Cancel When Outbid: competing offers unavailable — cannot confirm #1 priority; will retry next cycle (offer left active).'
@@ -600,20 +655,24 @@ export class CollectionBidderStrategy {
           pending++;
           continue;
         }
-        if (competingTopEth > offer.priceEth + 1e-12) {
+
+        const isOutbid = CollectionBidderStrategy.isOutbidBy(competing, offer);
+        if (isOutbid) {
+          const competingDisplay = competing.priceUsd ? `$${competing.priceUsd.toFixed(2)}` : `${competing.priceEth} ETH`;
+          const ourDisplay = offer.priceUsd ? `$${offer.priceUsd.toFixed(2)}` : `${offer.priceEth} ETH`;
           logger.info(
             {
               orderHash: offer.orderHash,
               collection: offer.collectionSlug,
-              ourPriceEth: offer.priceEth,
-              topOfferEth: competingTopEth
+              ourPrice: ourDisplay,
+              topOffer: competingDisplay
             },
-            `Cancel When Outbid Rule: Another buyer placed a higher offer (${competingTopEth} ETH > ${offer.priceEth} ETH). Automatically cancelling existing offer...`
+            `Instant Offer Cancellation Rule: Another buyer placed a higher offer (${competingDisplay} > ${ourDisplay}). Automatically cancelling existing offer immediately...`
           );
 
           const res = await this.cancelAndVerifyOffer(
             offer,
-            `Outbid by higher offer (${competingTopEth} ETH > ${offer.priceEth} ETH)`
+            `Outbid by higher offer (${competingDisplay} > ${ourDisplay})`
           );
           if (res.success) {
             this.apiService.invalidateCollectionCache(offer.collectionSlug);
@@ -770,33 +829,38 @@ export class CollectionBidderStrategy {
         existingOffer.status === 'CANCELLATION_FAILED' ||
         (existingOffer.status === 'CANCELLED' && !existingOffer.cancellationVerified)
       ) {
-        logger.warn(
-          { slug: target.slug, orderHash: existingOffer.orderHash, status: existingOffer.status },
-          'Cannot place new offer: Previous offer cancellation is not yet confirmed/verified. Capital remains locked.'
-        );
-        return;
-      }
-
-      if (existingOffer.status === 'ACTIVE') {
-        const competingTopEth = await this.getCompetingTopOfferEth(existingOffer);
-        if (competingTopEth === undefined) {
+        // Try verifying/completing cancellation immediately
+        const cancelRes = await this.cancelAndVerifyOffer(existingOffer, 'Verifying previous cancellation before re-entry');
+        if (!cancelRes.success) {
+          logger.warn(
+            { slug: target.slug, orderHash: existingOffer.orderHash, status: existingOffer.status },
+            'Cannot place new offer: Previous offer cancellation is not yet confirmed/verified. Capital remains locked.'
+          );
+          return;
+        }
+        this.apiService.invalidateCollectionCache(target.slug);
+      } else if (existingOffer.status === 'ACTIVE') {
+        const competing = await this.getCompetingTopOffer(existingOffer);
+        if (competing === undefined) {
           logger.warn(
             { slug: target.slug, orderHash: existingOffer.orderHash },
             'Cannot confirm #1 offer priority (competing book unavailable). Leaving existing offer; will retry next cycle.'
           );
           return;
         }
-        const isOutbid = competingTopEth > existingOffer.priceEth + 1e-12;
+        const isOutbid = CollectionBidderStrategy.isOutbidBy(competing, existingOffer);
         const isExpired = Date.now() - existingOffer.createdTimestamp >= this.getOfferMaxAgeMinutes() * 60 * 1000;
 
         if (isOutbid || isExpired) {
+          const competingDisplay = competing.priceUsd ? `$${competing.priceUsd.toFixed(2)}` : `${competing.priceEth} ETH`;
+          const ourDisplay = existingOffer.priceUsd ? `$${existingOffer.priceUsd.toFixed(2)}` : `${existingOffer.priceEth} ETH`;
           const cancelReason = isOutbid
-            ? `Outbid by higher offer (${competingTopEth} ETH > ${existingOffer.priceEth} ETH)`
+            ? `Outbid by higher offer (${competingDisplay} > ${ourDisplay})`
             : '20-Minute Expiry (Unaccepted within 20 minutes)';
 
           logger.info(
-            { slug: target.slug, orderHash: existingOffer.orderHash, ourPrice: existingOffer.priceEth, topOfferEth: competingTopEth, cancelReason },
-            `Automatic Offer Cancellation Rule: Cancelling outdated offer (${cancelReason})...`
+            { slug: target.slug, orderHash: existingOffer.orderHash, ourPrice: ourDisplay, topOffer: competingDisplay, cancelReason },
+            `Instant Offer Cancellation Rule: Cancelling outdated offer immediately (${cancelReason})...`
           );
 
           const cancelRes = await this.cancelAndVerifyOffer(existingOffer, cancelReason);
@@ -811,12 +875,12 @@ export class CollectionBidderStrategy {
 
           logger.info(
             { slug: target.slug, cancelReason },
-            'Automatic Offer Cancellation: Cancellation verified ✅ Proceeding to recheck all trading criteria for re-entry...'
+            'Instant Offer Cancellation: Cancellation verified ✅ Proceeding to recheck all trading criteria for re-entry...'
           );
         } else {
           // Offer is active, confirmed #1, and within 20-minute expiry window
           logger.debug(
-            { slug: target.slug, network: targetNetwork, price: existingOffer.priceEth, competingTopEth },
+            { slug: target.slug, network: targetNetwork, price: existingOffer.priceEth, competingTopEth: competing.priceEth },
             'Active offer already in place at #1 priority and within 20-minute expiry window.'
           );
           return;

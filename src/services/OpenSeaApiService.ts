@@ -595,6 +595,9 @@ export class OpenSeaApiService {
       timestamp: Date.now(),
       sales1Hour: liquidity.sales1Hour,
       uniqueWallets1Hour: liquidity.uniqueWallets1Hour,
+      sales30Minutes: liquidity.sales30Minutes,
+      uniqueBuyers30Minutes: liquidity.uniqueBuyers30Minutes,
+      sameBuyerActivityDetected: liquidity.sameBuyerActivityDetected,
       sales3Hours: liquidity.sales3Hours,
       uniqueWallets3Hours: liquidity.uniqueWallets3Hours,
       sales24Hours,
@@ -623,6 +626,9 @@ export class OpenSeaApiService {
     uniqueWallets3Hours: number;
     sales1Hour: number;
     uniqueWallets1Hour: number;
+    sales30Minutes: number;
+    uniqueBuyers30Minutes: number;
+    sameBuyerActivityDetected: boolean;
     liquidityPassed: boolean;
     liquidityReason?: string;
     dataUnavailable?: boolean;
@@ -633,6 +639,7 @@ export class OpenSeaApiService {
     const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 5;
     const threeHoursAgo = Math.floor(Date.now() / 1000) - (3 * 3600);
     const oneHourAgo = Math.floor(Date.now() / 1000) - 3600;
+    const thirtyMinutesAgo = Math.floor(Date.now() / 1000) - 1800;
 
     const floorMinPercent = (this.config.liquidity?.floorRangeMinPercent ?? 80.0) / 100;
     const floorMaxPercent = (this.config.liquidity?.floorRangeMaxPercent ?? 135.0) / 100;
@@ -750,12 +757,25 @@ export class OpenSeaApiService {
         if (s.seller) wallets1Hour.add(s.seller.toLowerCase());
       }
 
-      // Recent Floor Sales Requirement: Requires at least 10 completed native ETH floor sales within 3h AND 5+ unique wallets around floor
-      const liquidityPassed = sales3Hours >= minSales && uniqueWallets3Hours >= minWallets;
+      // Same-Buyer Activity Filter:
+      // The bot must check the buyers involved in recent NFT sales before placing an offer.
+      // If only the same buyer has been buying NFTs during the last 30 minutes, the bot must not place an offer.
+      const sales30MinutesList = qualifiedSales.filter((e: any) => Number(e.event_timestamp) >= thirtyMinutesAgo);
+      const buyers30Minutes = new Set<string>();
+      for (const s of sales30MinutesList) {
+        if (s.buyer) buyers30Minutes.add(s.buyer.toLowerCase());
+      }
+      const sameBuyerActivityDetected = sales30MinutesList.length > 0 && buyers30Minutes.size === 1;
+
+      // Recent Floor Sales Requirement: Requires at least 10 completed native ETH floor sales within 3h AND 5+ unique wallets around floor AND no same-buyer monopoly
+      const liquidityPassed = sales3Hours >= minSales && uniqueWallets3Hours >= minWallets && !sameBuyerActivityDetected;
 
       let liquidityReason = `Passed 3-hour native ETH floor liquidity check (${sales3Hours}/${minSales} sales, ${uniqueWallets3Hours}/${minWallets} unique wallets)`;
       if (!liquidityPassed) {
-        if (sales3Hours < minSales) {
+        if (sameBuyerActivityDetected) {
+          const singleBuyer = Array.from(buyers30Minutes)[0];
+          liquidityReason = `Offer Rejected ❌: Same-Buyer Activity Filter — Only the same buyer (${singleBuyer}) has been buying NFTs during the last 30 minutes (${sales30MinutesList.length} sale${sales30MinutesList.length > 1 ? 's' : ''}). Minimum diversified buyer activity required.`;
+        } else if (sales3Hours < minSales) {
           liquidityReason = `Offer Rejected ❌: Only ${sales3Hours}/${minSales} genuine native ETH floor-price sales in the last 3 hours (minimum ${minSales} required, WETH and offer acceptances excluded).`;
         } else {
           liquidityReason = `Offer Rejected ❌: Only ${uniqueWallets3Hours}/${minWallets} unique wallets in the last 3 hours (minimum ${minWallets} required).`;
@@ -775,6 +795,9 @@ export class OpenSeaApiService {
         uniqueWallets3Hours,
         sales1Hour: sales1HourList.length,
         uniqueWallets1Hour: wallets1Hour.size,
+        sales30Minutes: sales30MinutesList.length,
+        uniqueBuyers30Minutes: buyers30Minutes.size,
+        sameBuyerActivityDetected,
         liquidityPassed,
         liquidityReason
       };
@@ -786,6 +809,9 @@ export class OpenSeaApiService {
         uniqueWallets3Hours: 0,
         sales1Hour: 0,
         uniqueWallets1Hour: 0,
+        sales30Minutes: 0,
+        uniqueBuyers30Minutes: 0,
+        sameBuyerActivityDetected: false,
         liquidityPassed: false,
         dataUnavailable: true,
         liquidityReason: `SKIPPED (data unavailable, will retry): sales events ${err?.response?.status ?? ''} ${err.message}`
@@ -956,18 +982,42 @@ export class OpenSeaApiService {
    * Falls back to Seaport offer[0].startAmount (WETH put up by the bidder) when price.* is missing.
    */
   public static perUnitOfferPriceEth(off: any, ethPriceUsd: number = 2500): number {
+    return OpenSeaApiService.perUnitOfferPriceInfo(off, ethPriceUsd).priceEth;
+  }
+
+  /**
+   * Extracts per-unit price in both ETH and USD for an OpenSea offer object, accurately detecting USDG/USDC.
+   */
+  public static perUnitOfferPriceInfo(off: any, ethPriceUsd: number = 2500): { priceEth: number; priceUsd?: number } {
     const qtyRaw = off?.protocol_data?.parameters?.consideration?.[0]?.startAmount;
     const qty = qtyRaw !== undefined && Number(qtyRaw) > 0 ? Number(qtyRaw) : 1;
 
+    const offerToken = (off?.protocol_data?.parameters?.offer?.[0]?.token || '').toLowerCase();
+    const usdgAddress = '0x595a8910ba11e38ada602430b8b1122644247b0c'.toLowerCase();
+    const rawCurrency = (off?.price?.currency ?? off?.price?.current?.currency ?? '').toUpperCase();
+    const isUsdg = rawCurrency === 'USDG' || rawCurrency === 'USDC' || rawCurrency === 'USD' || offerToken === usdgAddress;
+
+    // Direct per-item price if available from OpenSea v2 API
+    const perItemVal = off?.price_per_item?.value;
+    if (perItemVal !== undefined && perItemVal !== null && perItemVal !== '') {
+      const dec = off?.price_per_item?.decimals ?? (isUsdg ? 6 : 18);
+      const unitVal = parseFloat(String(perItemVal)) / Math.pow(10, dec);
+      if (Number.isFinite(unitVal) && unitVal > 0) {
+        const priceEth = isUsdg ? (ethPriceUsd > 0 ? unitVal / ethPriceUsd : unitVal) : unitVal;
+        const priceUsd = isUsdg ? unitVal : (ethPriceUsd > 0 ? unitVal * ethPriceUsd : undefined);
+        return { priceEth, priceUsd };
+      }
+    }
+
     const rawPrice = off?.price?.value ?? off?.price?.current?.value;
-    const symbol = (off?.price?.currency ?? off?.price?.current?.currency ?? '').toUpperCase();
-    const isUsdg = symbol === 'USDG';
     const decimals = off?.price?.decimals ?? off?.price?.current?.decimals ?? (isUsdg ? 6 : 18);
     if (rawPrice !== undefined && rawPrice !== null && rawPrice !== '') {
       const total = parseFloat(String(rawPrice)) / Math.pow(10, decimals);
       if (Number.isFinite(total) && total > 0) {
         const perUnit = total / qty;
-        return isUsdg ? (ethPriceUsd > 0 ? perUnit / ethPriceUsd : perUnit) : perUnit;
+        const priceEth = isUsdg ? (ethPriceUsd > 0 ? perUnit / ethPriceUsd : perUnit) : perUnit;
+        const priceUsd = isUsdg ? perUnit : (ethPriceUsd > 0 ? perUnit * ethPriceUsd : undefined);
+        return { priceEth, priceUsd };
       }
     }
 
@@ -978,10 +1028,12 @@ export class OpenSeaApiService {
       const total = parseFloat(String(offerAmount)) / Math.pow(10, dec);
       if (Number.isFinite(total) && total > 0) {
         const perUnit = total / qty;
-        return isUsdg ? (ethPriceUsd > 0 ? perUnit / ethPriceUsd : perUnit) : perUnit;
+        const priceEth = isUsdg ? (ethPriceUsd > 0 ? perUnit / ethPriceUsd : perUnit) : perUnit;
+        const priceUsd = isUsdg ? perUnit : (ethPriceUsd > 0 ? perUnit * ethPriceUsd : undefined);
+        return { priceEth, priceUsd };
       }
     }
-    return 0;
+    return { priceEth: 0 };
   }
 
   /**
@@ -1010,15 +1062,16 @@ export class OpenSeaApiService {
    * outbid cancel must still fire even when the collection is no longer eligible for a new offer.
    *
    * Returns:
-   *  - `{ priceEth, orderHash }` when a competitor exists
+   *  - `{ priceEth, priceUsd, orderHash }` when a competitor exists
    *  - `null` when the book was read and no competing offers exist
    *  - `undefined` when the lookup failed (MUST NOT be treated as "we are #1")
    */
   public async getTopCompetingCollectionOffer(
     collectionSlug: string,
-    opts: { excludeOrderHashes?: string[]; excludeAddress?: string; fresh?: boolean } = {}
-  ): Promise<{ priceEth: number; orderHash?: string } | null | undefined> {
+    opts: { excludeOrderHashes?: string[]; excludeAddress?: string; fresh?: boolean; ethPriceUsd?: number } = {}
+  ): Promise<{ priceEth: number; priceUsd?: number; orderHash?: string } | null | undefined> {
     try {
+      const ethPriceUsd = opts.ethPriceUsd ?? (await this.getEthPriceUsd());
       const offers: any[] = await this.cached(
         this.offersCache,
         collectionSlug,
@@ -1028,15 +1081,15 @@ export class OpenSeaApiService {
       );
       const excludeHashes = new Set((opts.excludeOrderHashes || []).map((h) => h.toLowerCase()).filter(Boolean));
       const excludeAddr = (opts.excludeAddress || this.ownWalletAddress || '').toLowerCase();
-      let best: { priceEth: number; orderHash?: string } | null = null;
+      let best: { priceEth: number; priceUsd?: number; orderHash?: string } | null = null;
       for (const off of offers) {
         const hash = (off?.order_hash || '').toLowerCase();
         if (hash && excludeHashes.has(hash)) continue;
         const offerer = (off?.protocol_data?.parameters?.offerer || off?.maker?.address || '').toLowerCase();
         if (excludeAddr && offerer && offerer === excludeAddr) continue;
-        const offerEth = OpenSeaApiService.perUnitOfferPriceEth(off);
-        if (offerEth > 0 && (!best || offerEth > best.priceEth)) {
-          best = { priceEth: offerEth, orderHash: off?.order_hash };
+        const info = OpenSeaApiService.perUnitOfferPriceInfo(off, ethPriceUsd);
+        if (info.priceEth > 0 && (!best || info.priceEth > best.priceEth)) {
+          best = { priceEth: info.priceEth, priceUsd: info.priceUsd, orderHash: off?.order_hash };
         }
       }
       return best;

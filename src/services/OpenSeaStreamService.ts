@@ -123,6 +123,8 @@ export class OpenSeaStreamService extends EventEmitter {
       }
     } else if (event === 'item_listed') {
       this.emit('floor_updated', payload);
+    } else if (event === 'item_received_offer') {
+      this.emit('offer_received', payload);
     }
   }
 
