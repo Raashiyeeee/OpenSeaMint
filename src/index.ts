@@ -139,6 +139,12 @@ async function main() {
     });
   });
 
+  // 4.5. Register friendly wallet addresses across all workers for Team Coordination
+  const allWalletAddresses = workers.map((w) => w.getAddress());
+  for (const worker of workers) {
+    worker.setFriendlyWallets(allWalletAddresses);
+  }
+
   // 5. Start lightweight health-check server (Required for Render)
   const port = process.env.PORT || 3000;
   const server = http.createServer((req, res) => {
