@@ -237,6 +237,15 @@ async function main() {
   // Connect WebSocket stream
   streamService.connect();
 
+  // Instant Reactive Outbid Trigger: when a new offer is received on any subscribed collection, check for outbid immediately
+  streamService.on('offer_received', async () => {
+    try {
+      await bidderStrategy.processOutbidOfferCancellations();
+    } catch (err: any) {
+      logger.error({ err: err.message }, 'Error in reactive outbid cancellation handler');
+    }
+  });
+
   // FAST LOOP (every 3s, independent of the long main cycle and its caches):
   //  - Cancel When Outbid + 20-Minute Expiry (must not wait for the slow bidding cycle)
   //  - Continuous top-priority listing monitor (reprice when a competitor undercuts, if still profitable)

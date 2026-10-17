@@ -657,8 +657,9 @@ export class PricingEngine {
     const minWallets = this.config.liquidity?.minUniqueWallets3Hours ?? 5;
 
     // NFT Recent Floor Sales Requirement:
-    // Requires at least 10 completed floor-price sales within last 3 hours using native ETH
+    // Requires at least 10 completed floor-price sales within last 3 hours using native ETH AND Same-Buyer Activity Filter
     const checkLLiquidityPassed = marketData.liquidityPassed !== false &&
+      !marketData.sameBuyerActivityDetected &&
       sales3Hours >= minSales && uniqueWallets3Hours >= minWallets;
 
     // Formula 1 & Rule 4: Floor difference calculation compares raw Floor Price to Offer Price directly without creator fees (Floor >= Offer * 1.30)
@@ -719,6 +720,8 @@ export class PricingEngine {
       reason = mintCheck.reason;
     } else if (!checkMarketDumpPassed) {
       reason = `Market Dump Protection: Floor declined by ${floorDeclinePercent.toFixed(1)}% (Reference: ${refFloorEth} ETH, Current: ${floor} ETH), reaching or exceeding 40% decline limit. Strict Rejection ❌`;
+    } else if (marketData.sameBuyerActivityDetected) {
+      reason = marketData.liquidityReason || 'Same-Buyer Activity Filter: Only the same buyer has been buying NFTs during the last 30 minutes. Strict Rejection ❌';
     } else if (!checkLLiquidityPassed) {
       reason = marketData.liquidityReason || `Recent Floor Sales Requirement Failed ❌: Only ${sales3Hours}/${minSales} completed native ETH floor sales in the last 3 hours (minimum ${minSales} required, WETH sales and accepted offers excluded).`;
     } else if (!checkFFloorRatioPassed) {
@@ -771,6 +774,9 @@ export class PricingEngine {
       marginPercent: roundToPrecision(marginPercent, 2),
       sales1Hour: marketData.sales1Hour,
       uniqueWallets1Hour: marketData.uniqueWallets1Hour,
+      sales30Minutes: marketData.sales30Minutes,
+      uniqueBuyers30Minutes: marketData.uniqueBuyers30Minutes,
+      sameBuyerActivityDetected: marketData.sameBuyerActivityDetected,
       sales3Hours,
       uniqueWallets3Hours,
       checkLLiquidityPassed,

@@ -130,6 +130,9 @@ export interface CollectionMarketData {
   creatorFeeDisabled?: boolean;
   sales1Hour?: number;
   uniqueWallets1Hour?: number;
+  sales30Minutes?: number;
+  uniqueBuyers30Minutes?: number;
+  sameBuyerActivityDetected?: boolean;
   sales3Hours?: number;
   uniqueWallets3Hours?: number;
   sales24Hours?: number;
@@ -188,6 +191,9 @@ export interface ProfitCalculationResult {
   targetListPriceUsdg?: number;
   sales1Hour?: number;
   uniqueWallets1Hour?: number;
+  sales30Minutes?: number;
+  uniqueBuyers30Minutes?: number;
+  sameBuyerActivityDetected?: boolean;
   sales3Hours?: number;
   uniqueWallets3Hours?: number;
   checkLLiquidityPassed: boolean;
