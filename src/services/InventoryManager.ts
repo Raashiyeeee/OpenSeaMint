@@ -175,6 +175,10 @@ export class InventoryManager {
     return roundToPrecision(this.totalCapitalUsd + this.cumulativeProfitUsd, 2);
   }
 
+  public getCumulativeProfitUsd(): number {
+    return roundToPrecision(this.cumulativeProfitUsd, 2);
+  }
+
   private getNftKey(contractAddress: string, tokenId: string): string {
     return `${contractAddress.toLowerCase()}:${tokenId}`;
   }

@@ -6,14 +6,15 @@ export class KeyManager {
   private wallet: Wallet | ethers.HDNodeWallet;
   private readonly provider: ethers.Provider;
 
-  constructor(provider: ethers.Provider) {
+  constructor(provider: ethers.Provider, privateKeyOverride?: string, label?: string) {
     this.provider = provider;
-    this.wallet = this.initializeWallet();
-    logger.info(`Trading wallet initialized successfully: ${this.wallet.address}`);
+    this.wallet = this.initializeWallet(privateKeyOverride);
+    const prefix = label ? `[${label}] ` : '';
+    logger.info(`${prefix}Trading wallet initialized successfully: ${this.wallet.address}`);
   }
 
-  private initializeWallet(): Wallet | ethers.HDNodeWallet {
-    const privateKey = process.env.PRIVATE_KEY;
+  private initializeWallet(privateKeyOverride?: string): Wallet | ethers.HDNodeWallet {
+    const privateKey = privateKeyOverride || process.env.PRIVATE_KEY;
     const keystorePath = process.env.KEYSTORE_PATH;
     const keystorePassword = process.env.KEYSTORE_PASSWORD;
 
