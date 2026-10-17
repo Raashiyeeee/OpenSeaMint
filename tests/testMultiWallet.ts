@@ -168,15 +168,49 @@ async function runMultiWalletTests() {
     });
     assert.strictEqual(competingForWallet2?.offerer?.toLowerCase(), '0x9999999999999999999999999999999999999999', 'Wallet 2 must ignore Wallet 1 as a competitor and only see external offers');
 
-    // 3. CollectionBidderStrategy with friendly wallets set
+    // 3. CollectionBidderStrategy with friendly wallets set (Queue-Stacking)
     const bidder2 = (worker2 as any).bidderStrategy;
     bidder2.setFriendlyWallets([addr1, addr2]);
 
-    // When Wallet 2 checks a collection where Wallet 1 is already #1, it must NOT place an offer
+    (apiService as any).getCollectionMarketData = async () => ({
+      floorPriceEth: 0.003,
+      floorPriceUsd: 8.1,
+      topOfferEth: 0.0015,
+      sales3Hours: 15,
+      uniqueWallets3Hours: 8,
+      liquidityPassed: true,
+      oneDaySales: 20,
+      uniqueBuyers24h: 12,
+      isMintComplete: true,
+      mintCompleted: true,
+      mintStatusVerified: true,
+      totalSupply: 1000,
+      maxSupply: 1000,
+      isMinting: false,
+      openseaFeeBps: 50,
+      creatorFeeBps: 0,
+      ethPriceUsd: 2700
+    });
+
+    (apiService as any).getRecentCompletedFloorSales = async () => ({
+      salesCount: 15,
+      salesCount1Hour: 5,
+      uniqueBuyers1Hour: 3,
+      uniqueBuyers: 8,
+      medianSalePriceEth: 0.003,
+      sales: []
+    });
+
+    (worker2 as any).seaportService.getWethBalance = async () => 0.05;
+    (worker2 as any).seaportService.ensureNftConduitApproval = async () => true;
+
     let offerPlaced = false;
-    (worker2 as any).seaportService.createAndSubmitCollectionOffer = async () => {
+    let placedPriceEth = 0;
+    (apiService as any).postCollectionOffer = async (payload: any) => {
       offerPlaced = true;
-      return { success: true, orderHash: '0xwallet2_duplicate' };
+      const startAmt = payload.protocol_data?.parameters?.offer?.[0]?.startAmount;
+      placedPriceEth = Number(startAmt) / 1e18;
+      return { order_hash: '0xwallet2_queue_offer' };
     };
 
     await bidder2.processCollectionBid({
@@ -188,8 +222,10 @@ async function runMultiWalletTests() {
       maxInventory: 5
     });
 
-    assert.strictEqual(offerPlaced, false, 'Wallet 2 must NOT place an offer on a collection where Wallet 1 is already #1');
-    console.log('Test 6 PASSED: Team Coordination prevents self-outbidding and cannibalization ✅\n');
+    assert.strictEqual(offerPlaced, true, 'Wallet 2 MUST place a Queue-Stacking #2 offer when Wallet 1 is at #1');
+    assert.strictEqual(placedPriceEth < 0.0015, true, 'Wallet 2 bid must sit strictly below Wallet 1 (0.0015 ETH)');
+    assert.strictEqual(placedPriceEth > 0.0012, true, 'Wallet 2 bid must beat the external competitor (0.0012 ETH)');
+    console.log(`Test 6 PASSED: Queue-Stacking successfully placed #2 offer (${placedPriceEth} ETH) between competitor and teammate ✅\n`);
 
     console.log('================================================================');
     console.log('All Multi-Wallet Tests Passed Successfully! ✅');

@@ -331,8 +331,18 @@ export class CollectionBidderStrategy {
     if (wouldBeOutbid) {
       const topDesc = competing.priceUsd ? `$${competing.priceUsd.toFixed(2)} (${competing.priceEth} ETH)` : `${competing.priceEth} ETH`;
       return block(
-        `Top-Priority Offer Rule: bid (${bidPriceEth} ETH / $${bidPriceUsd.toFixed(2)}) would not be #1 (competing top ${topDesc}). Adjust before placing.`
+        `Top-Priority Offer Rule: bid (${bidPriceEth} ETH / $${bidPriceUsd.toFixed(2)}) would not beat external competitor (top ${topDesc}). Adjust before placing.`
       );
+    }
+
+    // Queue-Stacking Guard: If a friendly teammate holds #1, our offer must sit strictly below it
+    const absoluteTop = await this.apiService.getAbsoluteTopCollectionOffer(collectionSlug, ethPriceUsd);
+    if (absoluteTop?.offerer && this.friendlyWallets.has(absoluteTop.offerer.toLowerCase())) {
+      if (bidPriceEth >= absoluteTop.priceEth - 1e-12) {
+        return block(
+          `Queue-Stacking Rule: bid (${bidPriceEth} ETH) must sit below friendly teammate's #1 offer (${absoluteTop.priceEth} ETH).`
+        );
+      }
     }
     const gasUsd = this.config.networks?.[networkKey]?.estimatedGasCostUsd ?? (networkKey === 'mainnet' ? 3.5 : 0.01);
     const gasEth = gasUsd / ethPriceUsd;
@@ -831,19 +841,24 @@ export class CollectionBidderStrategy {
     await this.cancelDuplicateOffersForCollection(target.slug, target.contractAddress);
     const existingOffer = this.inventoryManager.getActiveOffer(target.slug);
 
-    // Team Coordination Rule: If another friendly wallet already holds the #1 offer on this collection,
-    // do not place a competing offer. Let them maintain #1 priority while this wallet bids elsewhere.
+    // Team Coordination & Queue-Stacking Rule:
+    // If another friendly wallet already holds the #1 offer on this collection,
+    // do not outbid them! Instead, place a #2 queue-stacking offer right behind them.
+    let isQueueStacking = false;
+    let friendlyTopOfferEth: number | undefined;
+
     if (!existingOffer) {
       const ourAddress = this.seaportService.getWalletAddress().toLowerCase();
       const absoluteTop = await this.apiService.getAbsoluteTopCollectionOffer(target.slug);
       if (absoluteTop?.offerer) {
         const topOfferer = absoluteTop.offerer.toLowerCase();
-        if (topOfferer !== ourAddress && this.friendlyWallets.has(topOfferer)) {
+        if (topOfferer !== ourAddress && this.friendlyWallets.has(topOfferer) && (absoluteTop.priceEth || 0) > 0) {
+          isQueueStacking = true;
+          friendlyTopOfferEth = absoluteTop.priceEth;
           logger.info(
-            { slug: target.slug, topOfferer },
-            `[Team Coordination] Collection ${target.slug} already has #1 offer held by friendly wallet (${topOfferer}). Skipping to diversify coverage.`
+            { slug: target.slug, topOfferer, friendlyTopOfferEth },
+            `[Queue-Stacking] Teammate holds #1 (${friendlyTopOfferEth} ETH). Positioning #2 backup offer behind teammate to capture secondary fills.`
           );
-          return;
         }
       }
     }
@@ -1010,6 +1025,41 @@ export class CollectionBidderStrategy {
       return;
     }
 
+    // If Queue-Stacking behind a friendly teammate:
+    // Our bid must beat the highest EXTERNAL competitor, while sitting below the friendly teammate!
+    if (isQueueStacking && friendlyTopOfferEth) {
+      const ourAddress = this.seaportService.getWalletAddress().toLowerCase();
+      const competingExternal = await this.apiService.getTopCompetingCollectionOffer(target.slug, {
+        excludeAddresses: [ourAddress, ...Array.from(this.friendlyWallets)],
+        ethPriceUsd: marketData.ethPriceUsd,
+        fresh: true
+      });
+      const externalTopEth = competingExternal?.priceEth || 0;
+      const minOfferEth = (this.config.capital?.minOfferPriceUsd ?? 1.0) / (marketData.ethPriceUsd || 2700);
+      const incrementEth = (this.config.profitTargets?.bidIncrementUsd ?? 0.05) / (marketData.ethPriceUsd || 2700);
+
+      let targetQueueBidEth = roundToPrecision(
+        Math.max(minOfferEth, externalTopEth > 0 ? externalTopEth + incrementEth : minOfferEth),
+        6
+      );
+
+      // Must sit strictly below friendly teammate's offer
+      if (targetQueueBidEth >= friendlyTopOfferEth) {
+        targetQueueBidEth = roundToPrecision(friendlyTopOfferEth - Math.min(incrementEth, 0.000005), 6);
+      }
+
+      if (externalTopEth > 0 && targetQueueBidEth <= externalTopEth) {
+        logger.info(
+          { slug: target.slug, externalTopEth, friendlyTopOfferEth },
+          '[Queue-Stacking] No room to place #2 offer between teammate and external competitor. Skipping.'
+        );
+        return;
+      }
+
+      calculation.bidPriceEth = targetQueueBidEth;
+      calculation.bidPriceUsd = roundToPrecision(targetQueueBidEth * (marketData.ethPriceUsd || 2700), 2);
+    }
+
     // Ensure bid does not exceed configured ceiling
     if (target.maxBidEth && calculation.bidPriceEth > target.maxBidEth) {
       logger.debug(
@@ -1020,15 +1070,23 @@ export class CollectionBidderStrategy {
       calculation.bidPriceUsd = roundToPrecision(calculation.bidPriceEth * (marketData.ethPriceUsd || 2700), 2);
     }
 
-    // Rule 1: after all caps, the posted bid MUST still be strictly above the competing top (or be the first offer)
-    if (marketData.topOfferEth > 0 && calculation.bidPriceEth <= marketData.topOfferEth + 1e-12) {
+    // Rule 1: after all caps, the posted bid MUST beat the highest external competitor
+    const ourAddressLower = this.seaportService.getWalletAddress().toLowerCase();
+    const competingTop = await this.apiService.getTopCompetingCollectionOffer(target.slug, {
+      excludeAddresses: [ourAddressLower, ...Array.from(this.friendlyWallets)],
+      ethPriceUsd: marketData.ethPriceUsd,
+      fresh: true
+    });
+    const competingTopEth = competingTop?.priceEth || 0;
+
+    if (competingTopEth > 0 && calculation.bidPriceEth <= competingTopEth + 1e-12) {
       logger.info(
         {
           slug: target.slug,
           bidPriceEth: calculation.bidPriceEth,
-          topOfferEth: marketData.topOfferEth
+          competingTopEth
         },
-        `TRADE REJECTED ❌ [${targetNetwork.toUpperCase()}]: Top-Priority Offer Rule — cannot place at #1 without violating profitability (bid ${calculation.bidPriceEth} ETH <= competing top ${marketData.topOfferEth} ETH).`
+        `TRADE REJECTED ❌ [${targetNetwork.toUpperCase()}]: Top-Priority Offer Rule — cannot beat competing top without violating profitability (bid ${calculation.bidPriceEth} ETH <= competing top ${competingTopEth} ETH).`
       );
       return;
     }
