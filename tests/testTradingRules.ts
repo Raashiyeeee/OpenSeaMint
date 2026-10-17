@@ -340,7 +340,7 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   console.log('--- Rule 6: Post-Sale 90% WETH Wrap (Verified) ---');
   let wethBal = parseEther('0.01');
   let depositedWei = 0n;
-  const fakeProvider: any = { getBalance: async () => parseEther('1') };
+  const fakeProvider: any = { getBalance: async () => parseEther('0.01') };
   const wrapSigner = new Wallet(Wallet.createRandom().privateKey, fakeProvider);
   const seaport6 = new SeaportService(config, wrapSigner);
   let creditWeth = true;
@@ -367,7 +367,40 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   (seaport6c as any).swapEthToWeth = async () => ({ success: true, verified: true, amountWrappedEth: 0.004 });
   const convPartial = await seaport6c.handlePostSaleEthConversion(0.01, 'robinhood');
   assert.strictEqual(convPartial.verified, false, 'Partial wrap must not count as verified');
-  console.log('Case R6a-c PASSED: 90% wrapped / 10% kept as gas; wrap verified by receipt + WETH balance delta ✅\n');
+  // 6d. Combined existing ETH balance + newly received ETH
+  let wethBalCombined = parseEther('0.05');
+  let depositedCombined = 0n;
+  // Wallet has 0.002 existing ETH + receives 0.018 ETH from sale = 0.020 ETH total capital
+  const fakeProviderCombined: any = { getBalance: async () => parseEther('0.02') };
+  const seaport6d = new SeaportService(config, new Wallet(Wallet.createRandom().privateKey, fakeProviderCombined));
+  (seaport6d as any).getWethContract = () => ({
+    balanceOf: async () => wethBalCombined,
+    deposit: async ({ value }: { value: bigint }) => {
+      depositedCombined = value;
+      wethBalCombined += value;
+      return { status: 1, hash: '0xwrap_combined', wait: async () => ({ status: 1, hash: '0xwrap_combined' }) };
+    }
+  });
+  const convCombined = await seaport6d.handlePostSaleEthConversion(0.018, 'robinhood', 'sale_tx_1');
+  assert.strictEqual(convCombined.success, true);
+  assert.strictEqual(convCombined.amountWrappedEth, 0.018, 'Must wrap 90% of total 0.02 ETH balance (0.018 ETH)');
+  assert.strictEqual(convCombined.gasReserveRetainedEth, 0.002, 'Must retain 10% of total 0.02 ETH balance (0.002 ETH) as gas fee reserve');
+  assert.strictEqual(depositedCombined, parseEther('0.018'));
+
+  // 6e. Gas reserve protection: autoWrapAvailableEthIfDeficit must NOT wrap the 10% gas reserve (prevents second wrap)
+  (seaport6d as any).getWethBalance = async () => 0.018; // WETH in wallet
+  // Wallet now has 0.002 ETH native (the 10% gas reserve)
+  fakeProviderCombined.getBalance = async () => parseEther('0.002');
+  const deficitRes = await seaport6d.autoWrapAvailableEthIfDeficit(0.05, 'robinhood');
+  assert.strictEqual(deficitRes.success, true);
+  assert.strictEqual(deficitRes.amountWrappedEth, 0, 'Must NOT wrap the 10% native ETH gas reserve to fund bids!');
+
+  // 6f. Deduplication: duplicate trigger on same sale identifier must NOT wrap again
+  const dupConv = await seaport6d.handlePostSaleEthConversion(0.018, 'robinhood', 'sale_tx_1');
+  assert.strictEqual(dupConv.success, true);
+  assert.strictEqual(dupConv.amountWrappedEth, 0.018, 'Returns cached result without executing second on-chain wrap');
+
+  console.log('Case R6a-f PASSED: Combined total ETH balance 90% wrapped / 10% gas reserve retained, protected against second wrap, deduplicated ✅\n');
 
   // ------------------------------------------------------------------------
   // RULE 7: No re-offer on bought NFT until sold (persisted)

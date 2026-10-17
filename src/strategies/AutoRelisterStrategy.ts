@@ -259,7 +259,7 @@ export class AutoRelisterStrategy {
         'NFT SALE CONFIRMED (RECONCILIATION): Automatically converting 90% of received ETH into WETH (10% held for gas reserve)...'
       );
       try {
-        await this.seaportService.handlePostSaleEthConversion(sold.netProceedsEth, net);
+        await this.seaportService.handlePostSaleEthConversion(sold.netProceedsEth, net, sold.identifier);
       } catch (err: any) {
         logger.error({ identifier: sold.identifier, err: err.message }, 'Failed to convert received ETH to WETH');
       }

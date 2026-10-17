@@ -221,7 +221,11 @@ async function main() {
           { identifier, targetNetwork, netProceedsEth: result.netProceedsEth },
           'NFT SALE CONFIRMED: Automatically converting 90% of received ETH into WETH (10% held for gas reserve)...'
         );
-        const conversion = await seaportService.handlePostSaleEthConversion(result.netProceedsEth, targetNetwork);
+        const conversion = await seaportService.handlePostSaleEthConversion(
+          result.netProceedsEth,
+          targetNetwork,
+          txHash || identifier
+        );
         if (!conversion.success || !conversion.verified) {
           logger.error(
             { identifier, targetNetwork, conversion },
