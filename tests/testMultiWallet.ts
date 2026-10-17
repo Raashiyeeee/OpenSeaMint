@@ -3,6 +3,7 @@ import fs from 'fs';
 import { resolveWalletConfigs } from '../src/index';
 import { WalletTradingWorker } from '../src/workers/WalletTradingWorker';
 import { loadConfig } from '../src/config/schema';
+import { runWithWalletContext } from '../src/utils/logger';
 import { ethers, Wallet } from 'ethers';
 
 async function runMultiWalletTests() {
@@ -217,13 +218,15 @@ async function runMultiWalletTests() {
       return { order_hash: '0xwallet2_queue_offer' };
     };
 
-    await bidder2.processCollectionBid({
-      name: 'Team Col',
-      slug: 'test-col',
-      contractAddress: '0x1234123412341234123412341234123412341234',
-      network: 'robinhood',
-      targetNetProfitUsd: 0.2,
-      maxInventory: 5
+    await runWithWalletContext('Wallet 2', async () => {
+      await bidder2.processCollectionBid({
+        name: 'Team Col',
+        slug: 'test-col',
+        contractAddress: '0x1234123412341234123412341234123412341234',
+        network: 'robinhood',
+        targetNetProfitUsd: 0.2,
+        maxInventory: 5
+      });
     });
 
     assert.strictEqual(offerPlaced, true, 'Wallet 2 MUST place a Queue-Stacking #2 offer when Wallet 1 is at #1');
