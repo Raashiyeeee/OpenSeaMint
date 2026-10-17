@@ -20,13 +20,19 @@ const CONDUITS: Record<string, string> = {
 
 async function main() {
   const config = loadConfig();
-  const privateKey = process.env.PRIVATE_KEY;
-  if (!privateKey) {
-    logger.error('PRIVATE_KEY is missing in .env');
-    process.exit(1);
+  const networkArg = process.argv[2] || 'all'; // 'mainnet', 'robinhood', or 'all'
+  const walletArg = process.argv[3]; // '1', '2', or a private key
+  let privateKey = process.env.PRIVATE_KEY_1 || process.env.PRIVATE_KEY;
+  if (walletArg === '2' || walletArg === 'wallet-2') {
+    privateKey = process.env.PRIVATE_KEY_2 || process.env.PRIVATE_KEY;
+  } else if (walletArg && walletArg.startsWith('0x')) {
+    privateKey = walletArg;
   }
 
-  const networkArg = process.argv[2] || 'all'; // 'mainnet', 'robinhood', or 'all'
+  if (!privateKey) {
+    logger.error('No valid trading private key found for selected wallet.');
+    process.exit(1);
+  }
   const networksToProcess = networkArg === 'all' 
     ? (config.general.activeNetworks || ['robinhood', 'mainnet'])
     : [networkArg];
