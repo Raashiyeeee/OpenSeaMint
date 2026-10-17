@@ -1,6 +1,6 @@
 import { ethers } from 'ethers';
 import { BotConfig } from '../types';
-import { logger } from '../utils/logger';
+import { logger, runWithWalletContext } from '../utils/logger';
 import { KeyManager } from '../security/KeyManager';
 import { CircuitBreaker } from '../security/CircuitBreaker';
 import { OpenSeaApiService } from '../services/OpenSeaApiService';
@@ -126,127 +126,135 @@ export class WalletTradingWorker {
     };
 
     this.streamService.on('nft_received', async (eventData: any) => {
-      try {
-        const { slug, contract, tokenId, network } = parseNftId(eventData);
-        if (!contract || !tokenId) return;
-        await this.relisterStrategy.onPurchaseDetected({
-          collectionSlug: slug,
-          contractAddress: contract,
-          tokenId,
-          network,
-          source: 'stream:item_transferred'
-        });
-      } catch (err: any) {
-        logger.error({ worker: this.label, err }, 'Error processing nft_received event');
-      }
+      await runWithWalletContext(this.label, async () => {
+        try {
+          const { slug, contract, tokenId, network } = parseNftId(eventData);
+          if (!contract || !tokenId) return;
+          await this.relisterStrategy.onPurchaseDetected({
+            collectionSlug: slug,
+            contractAddress: contract,
+            tokenId,
+            network,
+            source: 'stream:item_transferred'
+          });
+        } catch (err: any) {
+          logger.error({ worker: this.label, err }, 'Error processing nft_received event');
+        }
+      });
     });
 
     this.streamService.on('nft_trade', async (eventData: any) => {
-      try {
-        const { slug, contract, tokenId, network } = parseNftId(eventData);
-        if (!contract || !tokenId) return;
-        const held = this.inventoryManager.getInventoryItem(`${contract.toLowerCase()}:${tokenId}`);
-        const isUnsoldHolding = held && ['PENDING_LISTING', 'LISTED', 'HOLDING', 'ERROR'].includes(held.status);
-        if (isUnsoldHolding) {
-          this.streamService.emit('nft_sold', eventData);
-          return;
-        }
-        const decimals = Number(eventData.payment_token?.decimals ?? 18);
-        const tokenEthPrice = parseFloat(eventData.payment_token?.eth_price || '1') || 1;
-        const qty = Number(eventData.quantity || 1) || 1;
-        const eventPriceEth = eventData.sale_price
-          ? (parseFloat(eventData.sale_price) / Math.pow(10, decimals)) * tokenEthPrice / qty
-          : undefined;
+      await runWithWalletContext(this.label, async () => {
+        try {
+          const { slug, contract, tokenId, network } = parseNftId(eventData);
+          if (!contract || !tokenId) return;
+          const held = this.inventoryManager.getInventoryItem(`${contract.toLowerCase()}:${tokenId}`);
+          const isUnsoldHolding = held && ['PENDING_LISTING', 'LISTED', 'HOLDING', 'ERROR'].includes(held.status);
+          if (isUnsoldHolding) {
+            this.streamService.emit('nft_sold', eventData);
+            return;
+          }
+          const decimals = Number(eventData.payment_token?.decimals ?? 18);
+          const tokenEthPrice = parseFloat(eventData.payment_token?.eth_price || '1') || 1;
+          const qty = Number(eventData.quantity || 1) || 1;
+          const eventPriceEth = eventData.sale_price
+            ? (parseFloat(eventData.sale_price) / Math.pow(10, decimals)) * tokenEthPrice / qty
+            : undefined;
 
-        await this.relisterStrategy.onPurchaseDetected({
-          collectionSlug: slug,
-          contractAddress: contract,
-          tokenId,
-          network,
-          orderHash: eventData.order_hash,
-          eventPriceEth,
-          source: 'stream:item_sold'
-        });
-      } catch (err: any) {
-        logger.error({ worker: this.label, err }, 'Error processing nft_trade event');
-      }
+          await this.relisterStrategy.onPurchaseDetected({
+            collectionSlug: slug,
+            contractAddress: contract,
+            tokenId,
+            network,
+            orderHash: eventData.order_hash,
+            eventPriceEth,
+            source: 'stream:item_sold'
+          });
+        } catch (err: any) {
+          logger.error({ worker: this.label, err }, 'Error processing nft_trade event');
+        }
+      });
     });
 
     this.streamService.on('nft_sold', async (eventData: any) => {
-      try {
-        const tokenId = eventData.item?.nft_id?.split('/')?.[2] || '';
-        const contract = eventData.item?.nft_id?.split('/')?.[1] || '';
-        const identifier = `${contract.toLowerCase()}:${tokenId}`;
-        const decimals = Number(eventData.payment_token?.decimals ?? 18);
-        const tokenEthPrice = parseFloat(eventData.payment_token?.eth_price || '1') || 1;
-        const salePriceEth = eventData.sale_price
-          ? (parseFloat(eventData.sale_price) / Math.pow(10, decimals)) * tokenEthPrice
-          : 0;
-        const txHash: string | undefined = eventData.transaction?.hash;
-        const ethPriceUsd = await this.apiService.getEthPriceUsd();
-        const gasUsd = this.config.networks['robinhood']?.estimatedGasCostUsd || 0.01;
+      await runWithWalletContext(this.label, async () => {
+        try {
+          const tokenId = eventData.item?.nft_id?.split('/')?.[2] || '';
+          const contract = eventData.item?.nft_id?.split('/')?.[1] || '';
+          const identifier = `${contract.toLowerCase()}:${tokenId}`;
+          const decimals = Number(eventData.payment_token?.decimals ?? 18);
+          const tokenEthPrice = parseFloat(eventData.payment_token?.eth_price || '1') || 1;
+          const salePriceEth = eventData.sale_price
+            ? (parseFloat(eventData.sale_price) / Math.pow(10, decimals)) * tokenEthPrice
+            : 0;
+          const txHash: string | undefined = eventData.transaction?.hash;
+          const ethPriceUsd = await this.apiService.getEthPriceUsd();
+          const gasUsd = this.config.networks['robinhood']?.estimatedGasCostUsd || 0.01;
 
-        const result = this.inventoryManager.markItemSold(
-          identifier,
-          salePriceEth > 0 ? salePriceEth : undefined,
-          ethPriceUsd,
-          100,
-          gasUsd,
-          txHash
-        );
-        logger.info(
-          {
-            worker: this.label,
+          const result = this.inventoryManager.markItemSold(
             identifier,
-            realizedProfitUsd: result.realizedProfitUsd,
-            newBalanceUsd: result.newTotalCapitalUsd,
-            netProceedsEth: result.netProceedsEth
-          },
-          `[${this.label}] NFT ${identifier} sold successfully! Capital released for next trade.`
-        );
+            salePriceEth > 0 ? salePriceEth : undefined,
+            ethPriceUsd,
+            100,
+            gasUsd,
+            txHash
+          );
+          logger.info(
+            {
+              worker: this.label,
+              identifier,
+              realizedProfitUsd: result.realizedProfitUsd,
+              newBalanceUsd: result.newTotalCapitalUsd,
+              netProceedsEth: result.netProceedsEth
+            },
+            `[${this.label}] NFT ${identifier} sold successfully! Capital released for next trade.`
+          );
 
-        const targetNetwork = result.soldItem?.network || this.config.general.network || 'robinhood';
-        if (result.soldItem?.currency === 'USDG' || result.saleConfirmation?.currency === 'USDG') {
-          const usdgProceeds = result.soldItem?.saleProceedsUsdg || (result.netProceedsEth * ethPriceUsd);
-          logger.info(
-            { worker: this.label, identifier, targetNetwork, usdgProceeds },
-            `[${this.label}] NFT SALE CONFIRMED (USDG TRADE): Automatically swapping 100% of received USDG proceeds into WETH...`
-          );
-          const swapRes = await this.seaportService.swapUsdgToWeth(usdgProceeds, targetNetwork);
-          if (!swapRes.success || !swapRes.verified) {
-            logger.error(
-              { worker: this.label, identifier, targetNetwork, swapRes },
-              `[${this.label}] USDG TO WETH SWAP NOT VERIFIED ❌: Manual review required.`
+          const targetNetwork = result.soldItem?.network || this.config.general.network || 'robinhood';
+          if (result.soldItem?.currency === 'USDG' || result.saleConfirmation?.currency === 'USDG') {
+            const usdgProceeds = result.soldItem?.saleProceedsUsdg || (result.netProceedsEth * ethPriceUsd);
+            logger.info(
+              { worker: this.label, identifier, targetNetwork, usdgProceeds },
+              `[${this.label}] NFT SALE CONFIRMED (USDG TRADE): Automatically swapping 100% of received USDG proceeds into WETH...`
             );
-          }
-        } else {
-          logger.info(
-            { worker: this.label, identifier, targetNetwork, netProceedsEth: result.netProceedsEth },
-            `[${this.label}] NFT SALE CONFIRMED: Automatically converting 90% of received ETH into WETH (10% held for gas reserve)...`
-          );
-          const conversion = await this.seaportService.handlePostSaleEthConversion(
-            result.netProceedsEth,
-            targetNetwork,
-            txHash || identifier
-          );
-          if (!conversion.success || !conversion.verified) {
-            logger.error(
-              { worker: this.label, identifier, targetNetwork, conversion },
-              `[${this.label}] POST-SALE CONVERSION NOT VERIFIED ❌: WETH wrap did not succeed or could not be verified on-chain. Manual review required.`
+            const swapRes = await this.seaportService.swapUsdgToWeth(usdgProceeds, targetNetwork);
+            if (!swapRes.success || !swapRes.verified) {
+              logger.error(
+                { worker: this.label, identifier, targetNetwork, swapRes },
+                `[${this.label}] USDG TO WETH SWAP NOT VERIFIED ❌: Manual review required.`
+              );
+            }
+          } else {
+            logger.info(
+              { worker: this.label, identifier, targetNetwork, netProceedsEth: result.netProceedsEth },
+              `[${this.label}] NFT SALE CONFIRMED: Automatically converting 90% of received ETH into WETH (10% held for gas reserve)...`
             );
+            const conversion = await this.seaportService.handlePostSaleEthConversion(
+              result.netProceedsEth,
+              targetNetwork,
+              txHash || identifier
+            );
+            if (!conversion.success || !conversion.verified) {
+              logger.error(
+                { worker: this.label, identifier, targetNetwork, conversion },
+                `[${this.label}] POST-SALE CONVERSION NOT VERIFIED ❌: WETH wrap did not succeed or could not be verified on-chain. Manual review required.`
+              );
+            }
           }
+        } catch (err: any) {
+          logger.error({ worker: this.label, err }, 'Error processing nft_sold event');
         }
-      } catch (err: any) {
-        logger.error({ worker: this.label, err }, 'Error processing nft_sold event');
-      }
+      });
     });
 
     this.streamService.on('offer_received', async () => {
-      try {
-        await this.bidderStrategy.processOutbidOfferCancellations();
-      } catch (err: any) {
-        logger.error({ worker: this.label, err: err.message }, 'Error in reactive outbid cancellation handler');
-      }
+      await runWithWalletContext(this.label, async () => {
+        try {
+          await this.bidderStrategy.processOutbidOfferCancellations();
+        } catch (err: any) {
+          logger.error({ worker: this.label, err: err.message }, 'Error in reactive outbid cancellation handler');
+        }
+      });
     });
   }
 
@@ -276,61 +284,65 @@ export class WalletTradingWorker {
 
     // Start Fast Loop
     const fastLoop = async () => {
-      if (this.fastRunning) return;
-      this.fastRunning = true;
-      try {
-        for (const o of this.inventoryManager.getAllActiveOffers()) this.streamService.subscribeCollection(o.collectionSlug);
-        for (const i of this.inventoryManager.getAllInventory()) this.streamService.subscribeCollection(i.collectionSlug);
+      await runWithWalletContext(this.label, async () => {
+        if (this.fastRunning) return;
+        this.fastRunning = true;
+        try {
+          for (const o of this.inventoryManager.getAllActiveOffers()) this.streamService.subscribeCollection(o.collectionSlug);
+          for (const i of this.inventoryManager.getAllInventory()) this.streamService.subscribeCollection(i.collectionSlug);
 
-        await this.bidderStrategy.processAutomaticOfferCancellations(this.bidderStrategy.getOfferMaxAgeMinutes());
-        await this.bidderStrategy.processOutbidOfferCancellations();
-        await this.relisterStrategy.monitorListedInventory();
-        await this.bidderStrategy.checkOffersForFills(async (offer) => {
-          await this.relisterStrategy.detectNewHoldings(this.tradingWallet.address, offer.collectionSlug, offer.network || 'robinhood', 'order:FULFILLED');
-        });
+          await this.bidderStrategy.processAutomaticOfferCancellations(this.bidderStrategy.getOfferMaxAgeMinutes());
+          await this.bidderStrategy.processOutbidOfferCancellations();
+          await this.relisterStrategy.monitorListedInventory();
+          await this.bidderStrategy.checkOffersForFills(async (offer) => {
+            await this.relisterStrategy.detectNewHoldings(this.tradingWallet.address, offer.collectionSlug, offer.network || 'robinhood', 'order:FULFILLED');
+          });
 
-        for (const o of this.inventoryManager.getAllActiveOffers().filter((x) => x.status === 'FULFILLED')) {
-          await this.relisterStrategy.detectNewHoldings(this.tradingWallet.address, o.collectionSlug, o.network || 'robinhood', 'order:FULFILLED');
+          for (const o of this.inventoryManager.getAllActiveOffers().filter((x) => x.status === 'FULFILLED')) {
+            await this.relisterStrategy.detectNewHoldings(this.tradingWallet.address, o.collectionSlug, o.network || 'robinhood', 'order:FULFILLED');
+          }
+          await this.relisterStrategy.processPendingListings();
+        } catch (err: any) {
+          logger.error({ worker: this.label, err: err.message }, 'Error in fast purchase/listing loop');
+        } finally {
+          this.fastRunning = false;
         }
-        await this.relisterStrategy.processPendingListings();
-      } catch (err: any) {
-        logger.error({ worker: this.label, err: err.message }, 'Error in fast purchase/listing loop');
-      } finally {
-        this.fastRunning = false;
-      }
+      });
     };
     this.fastInterval = setInterval(fastLoop, 3000);
 
     // Start Main Bidding Loop
     const runLoop = async () => {
-      if (this.loopRunning) {
-        logger.debug(`[${this.label}] Previous strategy cycle still running; skipping this tick`);
-        return;
-      }
-      this.loopRunning = true;
-      try {
-        for (const netKey of activeNetworks) {
-          try {
-            await this.seaportService.syncNativeEthAndWrapDeposits(netKey);
-          } catch (wrapErr: any) {
-            logger.warn({ worker: this.label, network: netKey, err: wrapErr.message }, 'Deposit ETH→WETH sync failed this cycle');
-          }
-        }
-
-        const syncSuccess = await this.relisterStrategy.scanAndRelistUnlistedInventory(this.tradingWallet.address);
-        if (syncSuccess) {
-          this.initialWalletSyncComplete = true;
-        } else if (!this.initialWalletSyncComplete) {
-          logger.warn(`[${this.label}] STARTUP SYNC GATE 🛑: Initial wallet inventory reconciliation failed or was incomplete. Pausing bids.`);
+      await runWithWalletContext(this.label, async () => {
+        if (this.loopRunning) {
+          logger.debug(`Previous strategy cycle still running; skipping this tick`);
           return;
         }
+        this.loopRunning = true;
+        try {
+          for (const netKey of activeNetworks) {
+            try {
+              await this.seaportService.syncNativeEthAndWrapDeposits(netKey);
+            } catch (wrapErr: any) {
+              logger.warn({ network: netKey, err: wrapErr.message }, 'Deposit ETH→WETH sync failed this cycle');
+            }
+          }
 
-        await this.bidderStrategy.evaluateAndPlaceBids();
-      } catch (err: any) {
-        logger.error({ worker: this.label, err }, 'Unhandled error in strategy loop iteration');
-      } finally {
-        this.loopRunning = false;
-      }
+          const syncSuccess = await this.relisterStrategy.scanAndRelistUnlistedInventory(this.tradingWallet.address);
+          if (syncSuccess) {
+            this.initialWalletSyncComplete = true;
+          } else if (!this.initialWalletSyncComplete) {
+            logger.warn(`STARTUP SYNC GATE 🛑: Initial wallet inventory reconciliation failed or was incomplete. Pausing bids.`);
+            return;
+          }
+
+          await this.bidderStrategy.evaluateAndPlaceBids();
+        } catch (err: any) {
+          logger.error({ worker: this.label, err }, 'Unhandled error in strategy loop iteration');
+        } finally {
+          this.loopRunning = false;
+        }
+      });
     };
 
     // Immediate first evaluation
