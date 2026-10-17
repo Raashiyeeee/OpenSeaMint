@@ -1,4 +1,5 @@
 import assert from 'assert';
+import fs from 'fs';
 import { resolveWalletConfigs } from '../src/index';
 import { WalletTradingWorker } from '../src/workers/WalletTradingWorker';
 import { loadConfig } from '../src/config/schema';
@@ -98,6 +99,9 @@ async function runMultiWalletTests() {
       robinhood: fakeProvider,
       mainnet: fakeProvider
     };
+
+    try { fs.unlinkSync('data/test-inv-1.json'); } catch {}
+    try { fs.unlinkSync('data/test-inv-2.json'); } catch {}
 
     const worker1 = new WalletTradingWorker({
       id: 'wallet-1',

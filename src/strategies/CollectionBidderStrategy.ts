@@ -1035,17 +1035,27 @@ export class CollectionBidderStrategy {
         fresh: true
       });
       const externalTopEth = competingExternal?.priceEth || 0;
-      const minOfferEth = (this.config.capital?.minOfferPriceUsd ?? 1.0) / (marketData.ethPriceUsd || 2700);
-      const incrementEth = (this.config.profitTargets?.bidIncrementUsd ?? 0.05) / (marketData.ethPriceUsd || 2700);
+      const ethPriceUsd = marketData.ethPriceUsd || 2700;
+      const minOfferPriceUsd = this.config.capital?.minOfferPriceUsd ?? 1.0;
+      const minOfferEth = roundToPrecision(Math.ceil((minOfferPriceUsd / ethPriceUsd) * 10000) / 10000, 4);
+      const tickEth = 0.0001; // Seaport 4-decimal tick size for ETH/WETH
 
       let targetQueueBidEth = roundToPrecision(
-        Math.max(minOfferEth, externalTopEth > 0 ? externalTopEth + incrementEth : minOfferEth),
-        6
+        Math.max(minOfferEth, externalTopEth > 0 ? externalTopEth + tickEth : minOfferEth),
+        4
       );
 
-      // Must sit strictly below friendly teammate's offer
+      // Must sit strictly below friendly teammate's offer (at least 1 Seaport tick below)
       if (targetQueueBidEth >= friendlyTopOfferEth) {
-        targetQueueBidEth = roundToPrecision(friendlyTopOfferEth - Math.min(incrementEth, 0.000005), 6);
+        targetQueueBidEth = roundToPrecision(friendlyTopOfferEth - tickEth, 4);
+      }
+
+      if (targetQueueBidEth < minOfferEth) {
+        logger.info(
+          { slug: target.slug, targetQueueBidEth, minOfferEth, minOfferPriceUsd },
+          '[Queue-Stacking] Teammate offer is at minimum threshold; cannot place #2 offer without going below minimum offer price. Skipping.'
+        );
+        return;
       }
 
       if (externalTopEth > 0 && targetQueueBidEth <= externalTopEth) {
@@ -1057,7 +1067,7 @@ export class CollectionBidderStrategy {
       }
 
       calculation.bidPriceEth = targetQueueBidEth;
-      calculation.bidPriceUsd = roundToPrecision(targetQueueBidEth * (marketData.ethPriceUsd || 2700), 2);
+      calculation.bidPriceUsd = roundToPrecision(targetQueueBidEth * ethPriceUsd, 2);
     }
 
     // Ensure bid does not exceed configured ceiling
