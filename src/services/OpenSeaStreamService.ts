@@ -12,14 +12,17 @@ export class OpenSeaStreamService extends EventEmitter {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private ref = 0;
 
-  constructor(config: BotConfig, userWalletAddress: string) {
+  private apiKeyOverride?: string;
+
+  constructor(config: BotConfig, userWalletAddress: string, apiKeyOverride?: string) {
     super();
     this.config = config;
     this.userWalletAddress = userWalletAddress.toLowerCase();
+    this.apiKeyOverride = apiKeyOverride;
   }
 
   public connect(): void {
-    const apiKey = process.env.OPENSEA_API_KEY;
+    const apiKey = this.apiKeyOverride || process.env.OPENSEA_API_KEY;
     if (!apiKey) {
       logger.warn('No OPENSEA_API_KEY provided. OpenSea Stream WebSocket client running in simulated polling mode.');
       return;

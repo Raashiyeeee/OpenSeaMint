@@ -23,9 +23,9 @@ export class OpenSeaApiService {
   private discoverySortIndex: number = 0;
   public static readonly DISCOVERY_SORT_OPTIONS = ['one_day_volume', 'seven_day_volume', 'created_date'] as const;
 
-  constructor(config: BotConfig) {
+  constructor(config: BotConfig, apiKeyOverride?: string) {
     this.config = config;
-    const apiKey = process.env.OPENSEA_API_KEY || '';
+    const apiKey = apiKeyOverride || process.env.OPENSEA_API_KEY || '';
 
     this.http = axios.create({
       baseURL: 'https://api.opensea.io/api/v2',
