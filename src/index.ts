@@ -177,10 +177,15 @@ async function main() {
     logger.info(`Health check dashboard listening on port ${port}`);
   });
 
-  // 6. Start all workers concurrently
-  for (const worker of workers) {
-    await worker.start();
-  }
+  // 6. Start all workers concurrently (staggered by 2s so Wallet 1 initializes top offers first)
+  await Promise.all(
+    workers.map(async (worker, index) => {
+      if (index > 0) {
+        await new Promise((r) => setTimeout(r, index * 2000));
+      }
+      return worker.start();
+    })
+  );
 
   // 7. Graceful shutdown
   const shutdown = () => {
