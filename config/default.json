@@ -1,29 +1,34 @@
 {
   "general": {
-    "activeNetworks": ["robinhood"],
+    "activeNetworks": [
+      "robinhood"
+    ],
     "currency": "ETH",
     "minBalanceReserveEth": 0.0001,
-    "maxTotalActiveOfferVolumeEth": 0.004,
+    "maxTotalActiveOfferVolumeEth": 0.02,
     "loopIntervalMs": 15000,
     "offerExpirationMinutes": 20,
     "listingExpirationDays": 7,
     "relistCooldownMinutes": 0.25,
-    "ignoredCollections": ["robin-owls-269031093", "robin-owls"],
+    "ignoredCollections": [
+      "robin-owls-269031093",
+      "robin-owls"
+    ],
     "postSaleWethConvertPercent": 90.0,
     "postSaleGasReservePercent": 10.0
   },
   "capital": {
-    "totalTradingCapitalUsd": 10.0,
+    "totalTradingCapitalUsd": 50.0,
     "maxActiveTrades": 999,
     "minOfferPriceUsd": 1.0,
-    "maxBuyPriceUsd": 9.0,
-    "minNetProfitUsd": 0.20,
+    "maxBuyPriceUsd": 15.0,
+    "minNetProfitUsd": 0.2,
     "maxOfferCapitalPercent": 70.0
   },
   "liquidity": {
     "minSales3Hours": 10,
     "minUniqueWallets3Hours": 5,
-    "minFloorMultiplier": 1.30,
+    "minFloorMultiplier": 1.3,
     "floorRangeMinPercent": 80.0,
     "floorRangeMaxPercent": 135.0
   },
@@ -48,13 +53,24 @@
       "chainId": 1,
       "currency": "ETH",
       "blockExplorer": "https://etherscan.io",
-      "estimatedGasCostUsd": 3.50,
+      "estimatedGasCostUsd": 3.5,
       "seaportAddress": "0x0000000000000068F116a894984e2DB1123eB395",
       "conduitKey": "0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000",
       "wethAddress": "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
       "usdgAddress": "0x595a8910ba11e38ada602430b8b1122644247b0c",
       "usdgDecimals": 6,
       "dexRouterAddress": "0xE592427A0AEce92De3Edee1F18E0157C05861564"
+    },
+    "ink": {
+      "name": "Ink Mainnet",
+      "rpcUrl": "https://rpc-gel.inkonchain.com",
+      "chainId": 57073,
+      "currency": "ETH",
+      "blockExplorer": "https://explorer.inkonchain.com",
+      "estimatedGasCostUsd": 0.01,
+      "seaportAddress": "0x0000000000000068F116a894984e2DB1123eB395",
+      "conduitKey": "0x1e0049783f008a0085193e00003d00cd54003c71000000000000000000000000",
+      "wethAddress": "0x4200000000000000000000000000000000000006"
     }
   },
   "fees": {

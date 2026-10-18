@@ -84,7 +84,7 @@ export class SeaportService {
   public getEip712Domain(networkKey?: string): any {
     const activeNetworkKey = networkKey || this.config.general.network || 'robinhood';
     const networkInfo = this.config.networks?.[activeNetworkKey];
-    const chainId = networkInfo?.chainId ?? (activeNetworkKey === 'robinhood' ? 4663 : 1);
+    const chainId = networkInfo?.chainId ?? (activeNetworkKey === 'robinhood' ? 4663 : (activeNetworkKey === 'ink' ? 57073 : 1));
     const verifyingContract = networkInfo?.seaportAddress || this.config.seaport.contractAddress;
 
     return {

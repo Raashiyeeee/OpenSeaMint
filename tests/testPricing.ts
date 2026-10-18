@@ -13,7 +13,7 @@ console.log('================================================================');
 console.log('Running OpenSea Bot Capital & Profitability Rule Tests');
 console.log('================================================================\n');
 
-const config = loadConfig();
+const config = { ...loadConfig(), capital: { ...loadConfig().capital, totalTradingCapitalUsd: 10.0, maxBuyPriceUsd: 9.0 } };
 const pricingEngine = new PricingEngine(config);
 
 // --------------------------------------------------------------------------
@@ -106,7 +106,8 @@ console.log('Test 4 PASSED: Capital limit check correctly failed: ' + capitalExc
 // Number of NFTs is unlimited by count; limited only by capital allocation (70% of $10 = $7.00 max, 30% reserved).
 // --------------------------------------------------------------------------
 console.log('--- Test 5: Simultaneous Offers & 70% Capital Allocation ---');
-const inventoryManager = new InventoryManager(config);
+const testCapitalConfig = { ...config, capital: { ...config.capital, totalTradingCapitalUsd: 10.0 } };
+const inventoryManager = new InventoryManager(testCapitalConfig);
 
 assert.strictEqual(inventoryManager.getTotalCapitalUsd(), 10.0, 'Total capital must be $10');
 assert.strictEqual(inventoryManager.getAvailableCapitalUsd(), 10.0, 'Available capital must start at $10');
@@ -324,7 +325,7 @@ const expensiveData: CollectionMarketData = {
   liquidityPassed: true
 };
 const expensiveCalc = pricingEngine.calculateMaxBid(expensiveData, 0.20, 10.0, 'robinhood');
-assert.strictEqual(expensiveCalc.decision, 'REJECT', 'Trade requiring bid above $9 max buy price must be rejected');
+assert.strictEqual(expensiveCalc.decision, 'REJECT', 'Trade requiring bid above max buy price must be rejected');
 console.log('Test 9 PASSED: Trade above $9 correctly rejected:', expensiveCalc.reason, '\n');
 
 // --------------------------------------------------------------------------

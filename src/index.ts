@@ -11,6 +11,7 @@ export interface WalletConfigItem {
   privateKey?: string;
   apiKey?: string;
   statePath: string;
+  capitalUsd?: number;
 }
 
 export function resolveWalletConfigs(): WalletConfigItem[] {
@@ -40,12 +41,16 @@ export function resolveWalletConfigs(): WalletConfigItem[] {
           ? deriveStatePath(defaultStatePath, i)
           : path.resolve(process.cwd(), `data/inventory-wallet${i}.json`));
 
+      const capitalEnv = process.env[`CAPITAL_USD_${i}`] || (i === 1 ? process.env.CAPITAL_USD : undefined);
+      const capitalUsd = capitalEnv ? parseFloat(capitalEnv) : (i === 2 ? 10.0 : undefined);
+
       configs.push({
         id: `wallet-${i}`,
         label: `Wallet ${i}`,
         privateKey: key,
         apiKey,
-        statePath
+        statePath,
+        capitalUsd
       });
       i++;
     }
@@ -67,12 +72,16 @@ export function resolveWalletConfigs(): WalletConfigItem[] {
           ? deriveStatePath(defaultStatePath, num)
           : path.resolve(process.cwd(), `data/inventory-wallet${num}.json`));
 
+      const capitalEnv = process.env[`CAPITAL_USD_${num}`] || (num === 1 ? process.env.CAPITAL_USD : undefined);
+      const capitalUsd = capitalEnv ? parseFloat(capitalEnv) : (num === 2 ? 10.0 : undefined);
+
       configs.push({
         id: `wallet-${num}`,
         label: `Wallet ${num}`,
         privateKey: key,
         apiKey,
-        statePath
+        statePath,
+        capitalUsd
       });
     });
   }
@@ -124,7 +133,7 @@ async function main() {
 
   // 3. Resolve wallet configurations
   const walletConfigs = resolveWalletConfigs();
-  logger.info(`Configured Trading Wallets: ${walletConfigs.length} [${walletConfigs.map((w) => w.label).join(', ')}]`);
+  logger.info(`Configured Trading Wallets: ${walletConfigs.length} [${walletConfigs.map((w) => `${w.label} ($${(w.capitalUsd ?? config.capital.totalTradingCapitalUsd).toFixed(2)})`).join(', ')}]`);
 
   // 4. Instantiate Workers
   const workers = walletConfigs.map((wCfg) => {
@@ -135,7 +144,8 @@ async function main() {
       apiKey: wCfg.apiKey,
       statePath: wCfg.statePath,
       config,
-      providers
+      providers,
+      capitalUsd: wCfg.capitalUsd
     });
   });
 

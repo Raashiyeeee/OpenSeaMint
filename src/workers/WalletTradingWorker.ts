@@ -19,6 +19,7 @@ export interface WalletWorkerOptions {
   statePath: string;
   config: BotConfig;
   providers: Record<string, ethers.JsonRpcProvider>;
+  capitalUsd?: number;
 }
 
 export class WalletTradingWorker {
@@ -46,7 +47,15 @@ export class WalletTradingWorker {
   constructor(options: WalletWorkerOptions) {
     this.id = options.id;
     this.label = options.label;
-    this.config = options.config;
+    this.config = options.capitalUsd
+      ? {
+          ...options.config,
+          capital: {
+            ...options.config.capital,
+            totalTradingCapitalUsd: options.capitalUsd
+          }
+        }
+      : options.config;
     this.providers = options.providers;
 
     const primaryProvider =

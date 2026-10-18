@@ -15,18 +15,25 @@ const WETH_ABI = [
 
 const CONDUITS: Record<string, string> = {
   mainnet: '0x1E0049783F008A0085193E00003D00cd54003c71',
+  ink: '0x1E0049783F008A0085193E00003D00cd54003c71',
   robinhood: '0x963F00d3ff000064fFCbA824b800c0000000C300'
 };
 
 async function main() {
   const config = loadConfig();
-  const networkArg = process.argv[2] || 'all'; // 'mainnet', 'robinhood', or 'all'
-  const walletArg = process.argv[3]; // '1', '2', or a private key
+  let networkArg = process.argv[2] || 'all';
+  let walletArg = process.argv[3];
+
   let privateKey = process.env.PRIVATE_KEY_1 || process.env.PRIVATE_KEY;
-  if (walletArg === '2' || walletArg === 'wallet-2') {
-    privateKey = process.env.PRIVATE_KEY_2 || process.env.PRIVATE_KEY;
+
+  // If the user passed the 0x private key as the first argument:
+  if (networkArg && networkArg.startsWith('0x')) {
+    privateKey = networkArg;
+    networkArg = walletArg || 'ink';
   } else if (walletArg && walletArg.startsWith('0x')) {
     privateKey = walletArg;
+  } else if (walletArg === '2' || walletArg === 'wallet-2') {
+    privateKey = process.env.PRIVATE_KEY_2 || process.env.PRIVATE_KEY;
   }
 
   if (!privateKey) {

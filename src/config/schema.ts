@@ -135,6 +135,9 @@ export function loadConfig(configPath?: string): BotConfig {
     if (process.env.ROBINHOOD_RPC_URL && parsed.networks?.robinhood) {
       parsed.networks.robinhood.rpcUrl = process.env.ROBINHOOD_RPC_URL;
     }
+    if (process.env.INK_RPC_URL && parsed.networks?.ink) {
+      parsed.networks.ink.rpcUrl = process.env.INK_RPC_URL;
+    }
     if (process.env.ETHEREUM_RPC_URL && parsed.networks?.mainnet) {
       parsed.networks.mainnet.rpcUrl = process.env.ETHEREUM_RPC_URL;
     }

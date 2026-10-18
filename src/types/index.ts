@@ -43,7 +43,7 @@ export interface BotConfig {
     cacheTtlMs?: { collection?: number; stats?: number; offers?: number; salesEvents?: number; mintComplete?: number; mintIncomplete?: number };
   };
   general: {
-    network?: 'robinhood' | 'mainnet' | 'base' | 'polygon' | 'sepolia';
+    network?: 'robinhood' | 'ink' | 'mainnet' | 'base' | 'polygon' | 'sepolia';
     activeNetworks: string[];
     currency: string;
     minBalanceReserveEth: number;

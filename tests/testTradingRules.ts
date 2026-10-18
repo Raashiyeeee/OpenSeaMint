@@ -28,7 +28,7 @@ import { CollectionMarketData } from '../src/types';
  * All network access is stubbed. No live markets are touched and no orders are posted.
  */
 
-const config = loadConfig();
+const config = { ...loadConfig(), capital: { ...loadConfig().capital, totalTradingCapitalUsd: 10.0 } };
 const pricingEngine = new PricingEngine(config);
 const ZERO = '0x0000000000000000000000000000000000000000';
 
