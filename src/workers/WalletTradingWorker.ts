@@ -8,6 +8,7 @@ import { OpenSeaStreamService } from '../services/OpenSeaStreamService';
 import { SeaportService } from '../services/SeaportService';
 import { PricingEngine } from '../services/PricingEngine';
 import { InventoryManager } from '../services/InventoryManager';
+import { WalletMonitorService, SpottedCollectionEvent } from '../services/WalletMonitorService';
 import { CollectionBidderStrategy } from '../strategies/CollectionBidderStrategy';
 import { AutoRelisterStrategy } from '../strategies/AutoRelisterStrategy';
 
@@ -37,6 +38,7 @@ export class WalletTradingWorker {
   private inventoryManager: InventoryManager;
   private bidderStrategy: CollectionBidderStrategy;
   private relisterStrategy: AutoRelisterStrategy;
+  private walletMonitor: WalletMonitorService;
 
   private fastInterval: NodeJS.Timeout | null = null;
   private mainInterval: NodeJS.Timeout | null = null;
@@ -93,7 +95,10 @@ export class WalletTradingWorker {
       this.circuitBreaker
     );
 
+    this.walletMonitor = new WalletMonitorService(this.config, this.apiService);
+
     this.setupStreamHandlers();
+    this.setupWalletMonitorHandlers();
   }
 
   public getAddress(): string {
@@ -267,6 +272,22 @@ export class WalletTradingWorker {
     });
   }
 
+  private setupWalletMonitorHandlers(): void {
+    this.walletMonitor.on('collection_spotted', async (event: SpottedCollectionEvent) => {
+      await runWithWalletContext(this.label, async () => {
+        try {
+          logger.info(
+            { worker: this.label, slug: event.slug, network: event.network, source: event.sourceWallet },
+            `[${this.label}] Wallet monitor detected collection offer from target wallet. Evaluating for mirror bid...`
+          );
+          await this.bidderStrategy.evaluateSingleCollection(event.slug, event.contractAddress, event.network);
+        } catch (err: any) {
+          logger.error({ worker: this.label, slug: event.slug, err: err.message }, 'Error in wallet monitor evaluation handler');
+        }
+      });
+    });
+  }
+
   public async start(): Promise<void> {
     const activeNetworks = this.config.general.activeNetworks || ['robinhood'];
 
@@ -290,6 +311,9 @@ export class WalletTradingWorker {
 
     // Connect WebSocket stream
     this.streamService.connect();
+
+    // Start Live Wallet Monitor (BenDoverXI offer mirroring)
+    this.walletMonitor.start();
 
     // Start Fast Loop
     const fastLoop = async () => {
@@ -366,5 +390,6 @@ export class WalletTradingWorker {
     if (this.fastInterval) clearInterval(this.fastInterval);
     if (this.mainInterval) clearInterval(this.mainInterval);
     this.streamService.disconnect();
+    this.walletMonitor.stop();
   }
 }

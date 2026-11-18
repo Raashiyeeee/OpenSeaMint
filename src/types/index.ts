@@ -90,6 +90,14 @@ export interface BotConfig {
     conduitKey: string;
     zoneAddress: string;
   };
+  walletMonitor?: WalletMonitorConfig;
+}
+
+export interface WalletMonitorConfig {
+  enabled?: boolean;
+  targetWallets?: string[];
+  pollIntervalMs?: number;
+  seenCollectionCooldownMs?: number;
 }
 
 export interface FeeRecipient {

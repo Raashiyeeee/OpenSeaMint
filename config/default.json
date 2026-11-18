@@ -103,5 +103,13 @@
     "contractAddress": "0x0000000000000068F116a894984e2DB1123eB395",
     "conduitKey": "0x61159fefdfada89302ed55f8b9e89e2d67d8258712b3a3f89aa88525877f1d5e",
     "zoneAddress": "0x000056f7000000ece9003ca63978907a00ffd100"
+  },
+  "walletMonitor": {
+    "enabled": true,
+    "targetWallets": [
+      "0x7d0d4312ade311c9d2cfb220cd25a12eb186b764"
+    ],
+    "pollIntervalMs": 45000,
+    "seenCollectionCooldownMs": 300000
   }
 }

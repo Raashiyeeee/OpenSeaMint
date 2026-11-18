@@ -805,6 +805,37 @@ export class CollectionBidderStrategy {
     }
   }
 
+  /**
+   * Evaluates and attempts to place a collection offer on a single collection discovered via live wallet monitoring.
+   * Runs through the exact same comprehensive risk, liquidity, mint-out, and profitability checks as the main loop.
+   */
+  public async evaluateSingleCollection(slug: string, contractAddress?: string, networkKey?: string): Promise<void> {
+    if (!this.circuitBreaker.isOperational()) {
+      logger.warn({ slug }, 'Circuit breaker is tripped. Skipping monitored collection evaluation.');
+      return;
+    }
+
+    const pauseCheck = this.inventoryManager.evaluateOfferCyclePause();
+    if (pauseCheck.paused) {
+      logger.warn({ slug, pauseState: this.inventoryManager.getOfferCyclePauseState() }, `OFFER CYCLE PAUSED ⏸: ${pauseCheck.reason}`);
+      return;
+    }
+
+    const net = networkKey || this.config.general.network || 'robinhood';
+    try {
+      await this.processCollectionBid({
+        name: slug,
+        slug,
+        contractAddress: contractAddress || '',
+        network: net,
+        targetNetProfitUsd: this.config.capital?.minNetProfitUsd ?? 0.20,
+        maxInventory: 5
+      }, net);
+    } catch (err: any) {
+      logger.error({ slug, network: net, error: err.message }, 'Error processing monitored collection bid');
+    }
+  }
+
   private async processCollectionBid(target: any, networkKey?: string): Promise<void> {
     const targetNetwork = networkKey || target.network || 'robinhood';
 

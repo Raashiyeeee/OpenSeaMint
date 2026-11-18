@@ -122,7 +122,13 @@ const BotConfigSchema = z.object({
     contractAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
     conduitKey: z.string(),
     zoneAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/)
-  })
+  }),
+  walletMonitor: z.object({
+    enabled: z.boolean().default(false),
+    targetWallets: z.array(z.string()).default([]),
+    pollIntervalMs: z.number().int().positive().default(45000),
+    seenCollectionCooldownMs: z.number().int().positive().default(300000)
+  }).default({})
 });
 
 export function loadConfig(configPath?: string): BotConfig {
@@ -154,6 +160,25 @@ export function loadConfig(configPath?: string): BotConfig {
         if (usdgOverride) parsed.networks[netKey].usdgAddress = usdgOverride;
         if (dexRouterOverride) parsed.networks[netKey].dexRouterAddress = dexRouterOverride;
       }
+    }
+
+    // Environment overrides for Wallet Monitor
+    if (process.env.WALLET_MONITOR_ENABLED !== undefined) {
+      if (!parsed.walletMonitor) parsed.walletMonitor = {};
+      parsed.walletMonitor.enabled = process.env.WALLET_MONITOR_ENABLED === 'true' || process.env.WALLET_MONITOR_ENABLED === '1';
+    }
+    if (process.env.TARGET_WALLETS || process.env.MONITOR_WALLETS) {
+      if (!parsed.walletMonitor) parsed.walletMonitor = {};
+      const raw = process.env.TARGET_WALLETS || process.env.MONITOR_WALLETS || '';
+      parsed.walletMonitor.targetWallets = raw.split(',').map((w: string) => w.trim()).filter(Boolean);
+    }
+    if (process.env.WALLET_MONITOR_POLL_INTERVAL_MS) {
+      if (!parsed.walletMonitor) parsed.walletMonitor = {};
+      parsed.walletMonitor.pollIntervalMs = parseInt(process.env.WALLET_MONITOR_POLL_INTERVAL_MS, 10);
+    }
+    if (process.env.WALLET_MONITOR_COOLDOWN_MS) {
+      if (!parsed.walletMonitor) parsed.walletMonitor = {};
+      parsed.walletMonitor.seenCollectionCooldownMs = parseInt(process.env.WALLET_MONITOR_COOLDOWN_MS, 10);
     }
 
     if (!parsed.general.activeNetworks || parsed.general.activeNetworks.length === 0) {
