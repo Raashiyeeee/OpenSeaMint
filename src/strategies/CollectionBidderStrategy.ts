@@ -991,70 +991,7 @@ export class CollectionBidderStrategy {
       }
     }
 
-    // 3. PRICING: OUTBID TARGET TRADER BY 1 TICK (default 0.0001 WETH)
-    const ethPriceUsd = await this.apiService.getEthPriceUsd();
-    const outbidTickEth = this.config.walletMonitor?.outbidTickEth ?? 0.0001;
-    let targetOfferEth = params.targetOfferEth || 0;
-
-    if (targetOfferEth <= 0) {
-      const competing = await this.apiService.getTopCompetingCollectionOffer(slug, {
-        excludeAddress: this.seaportService.getWalletAddress(),
-        fresh: true
-      });
-      targetOfferEth = competing?.priceEth || 0;
-    }
-
-    if (targetOfferEth <= 0) {
-      logger.info({ slug }, '[Direct Mirror] Target offer price unknown and no competing offer found. Skipping.');
-      return { success: false, reason: 'Target offer price unknown' };
-    }
-
-    let calculatedBidEth = roundToPrecision(targetOfferEth + outbidTickEth, 4);
-
-    // 4. MAX BID CEILING GUARD (default $10.00 USD)
-    const maxBidUsd = this.config.walletMonitor?.maxBidUsd ?? 10.0;
-    const maxBidEth = roundToPrecision(maxBidUsd / ethPriceUsd, 4);
-    if (calculatedBidEth > maxBidEth) {
-      logger.info(
-        { slug, calculatedBidEth, maxBidEth, maxBidUsd, targetOfferEth },
-        `[Direct Mirror] 🛑 Offer (${calculatedBidEth} ETH / $${(calculatedBidEth * ethPriceUsd).toFixed(2)}) exceeds max cap of $${maxBidUsd.toFixed(2)}. Skipping.`
-      );
-      return { success: false, reason: `Bid exceeds $${maxBidUsd} cap` };
-    }
-
-    // 5. MIN OFFER PRICE GUARD ($1.00 USD)
-    const minOfferPriceUsd = this.config.capital?.minOfferPriceUsd ?? 1.0;
-    const minOfferEth = roundToPrecision(minOfferPriceUsd / ethPriceUsd, 4);
-    if (calculatedBidEth < minOfferEth) {
-      calculatedBidEth = minOfferEth;
-    }
-
-    const calculatedBidUsd = roundToPrecision(calculatedBidEth * ethPriceUsd, 2);
-
-    // 6. CAPITAL ALLOCATION CHECK
-    const capitalCheck = this.inventoryManager.canAllocateCapitalForOffer(calculatedBidUsd, ethPriceUsd);
-    if (!capitalCheck.allowed) {
-      logger.info({ slug, reason: capitalCheck.reason }, `[Direct Mirror] 🛑 Capital check: ${capitalCheck.reason}`);
-      return { success: false, reason: capitalCheck.reason };
-    }
-
-    // 7. PRE-FLIGHT WETH CHECK & AUTO-WRAP
-    let availableWeth = await this.seaportService.getWethBalance(targetNetwork);
-    if (availableWeth < calculatedBidEth) {
-      const rebalanceRes = await this.seaportService.autoWrapAvailableEthIfDeficit(calculatedBidEth, targetNetwork);
-      if (rebalanceRes.amountWrappedEth > 0) {
-        availableWeth = await this.seaportService.getWethBalance(targetNetwork);
-      }
-    }
-    if (availableWeth < calculatedBidEth) {
-      logger.info(
-        { slug, targetNetwork, availableWeth, requiredWeth: calculatedBidEth },
-        `[Direct Mirror] 🛑 Insufficient WETH balance (${availableWeth} vs ${calculatedBidEth} required). Skipping until WETH available.`
-      );
-      return { success: false, reason: 'Insufficient WETH balance' };
-    }
-
-    // 8. RESOLVE CONTRACT & FEES
+    // 3. RESOLVE METADATA & FLOOR PRICE
     let collectionData: any;
     try {
       collectionData = (await this.apiService.client.get(`/collections/${slug}`)).data;
@@ -1070,9 +1007,99 @@ export class CollectionBidderStrategy {
       return { success: false, reason: 'Missing contract address' };
     }
 
+    const floorPriceEth = parseFloat(
+      collectionData?.stats?.floor_price ?? collectionData?.floor_price ?? '0'
+    ) || 0;
+
+    // 4. PRICING: OUTBID THE HIGHEST OFFER ON THE BOOK TO GUARANTEE #1 PRIORITY
+    const ethPriceUsd = await this.apiService.getEthPriceUsd();
+    const outbidTickEth = this.config.walletMonitor?.outbidTickEth ?? 0.0001;
+    let targetOfferEth = params.targetOfferEth || 0;
+
+    // Fetch the live #1 top competing offer across the entire order book (excluding our own wallet)
+    const competing = await this.apiService.getTopCompetingCollectionOffer(slug, {
+      excludeAddress: this.seaportService.getWalletAddress(),
+      fresh: true
+    });
+    const bookTopEth = competing?.priceEth || 0;
+
+    // To guarantee #1 priority, outbid the HIGHER of target trader's bid AND the book's top bid:
+    const highestToBeat = Math.max(targetOfferEth, bookTopEth);
+
+    if (highestToBeat <= 0) {
+      logger.info({ slug }, '[Direct Mirror] Target offer price unknown and no competing offer found. Skipping.');
+      return { success: false, reason: 'Target offer price unknown' };
+    }
+
+    let calculatedBidEth = roundToPrecision(highestToBeat + outbidTickEth, 4);
+
+    // Floor Guard: Never bid at or above the collection floor price
+    if (floorPriceEth > 0 && calculatedBidEth >= floorPriceEth) {
+      logger.info(
+        { slug, calculatedBidEth, floorPriceEth },
+        `[Direct Mirror] 🛑 Outbid amount (${calculatedBidEth} ETH) is at or above floor (${floorPriceEth} ETH). Skipping to avoid buying at/above floor.`
+      );
+      return { success: false, reason: 'Bid at or above floor price' };
+    }
+
+    // 5. MAX BID CEILING GUARD (default $10.00 USD)
+    const maxBidUsd = this.config.walletMonitor?.maxBidUsd ?? 10.0;
+    const maxBidEth = roundToPrecision(maxBidUsd / ethPriceUsd, 4);
+    if (calculatedBidEth > maxBidEth) {
+      logger.info(
+        { slug, calculatedBidEth, maxBidEth, maxBidUsd, targetOfferEth, bookTopEth },
+        `[Direct Mirror] 🛑 Offer (${calculatedBidEth} ETH / $${(calculatedBidEth * ethPriceUsd).toFixed(2)}) exceeds max cap of $${maxBidUsd.toFixed(2)}. Skipping.`
+      );
+      return { success: false, reason: `Bid exceeds $${maxBidUsd} cap` };
+    }
+
+    // 6. MIN OFFER PRICE GUARD ($1.00 USD)
+    const minOfferPriceUsd = this.config.capital?.minOfferPriceUsd ?? 1.0;
+    const minOfferEth = roundToPrecision(minOfferPriceUsd / ethPriceUsd, 4);
+    if (calculatedBidEth < minOfferEth) {
+      calculatedBidEth = minOfferEth;
+    }
+
+    const calculatedBidUsd = roundToPrecision(calculatedBidEth * ethPriceUsd, 2);
+
+    logger.info(
+      {
+        slug,
+        targetOfferEth,
+        bookTopEth,
+        highestToBeat,
+        calculatedBidEth,
+        calculatedBidUsd
+      },
+      `[Direct Mirror] 🎯 Pricing: Outbidding top offer by +${outbidTickEth} ETH to take #1 PRIORITY (Target: ${targetOfferEth} ETH, Book Top: ${bookTopEth} ETH -> Our Bid: ${calculatedBidEth} ETH / $${calculatedBidUsd})`
+    );
+
+    // 7. CAPITAL ALLOCATION CHECK
+    const capitalCheck = this.inventoryManager.canAllocateCapitalForOffer(calculatedBidUsd, ethPriceUsd);
+    if (!capitalCheck.allowed) {
+      logger.info({ slug, reason: capitalCheck.reason }, `[Direct Mirror] 🛑 Capital check: ${capitalCheck.reason}`);
+      return { success: false, reason: capitalCheck.reason };
+    }
+
+    // 8. PRE-FLIGHT WETH CHECK & AUTO-WRAP
+    let availableWeth = await this.seaportService.getWethBalance(targetNetwork);
+    if (availableWeth < calculatedBidEth) {
+      const rebalanceRes = await this.seaportService.autoWrapAvailableEthIfDeficit(calculatedBidEth, targetNetwork);
+      if (rebalanceRes.amountWrappedEth > 0) {
+        availableWeth = await this.seaportService.getWethBalance(targetNetwork);
+      }
+    }
+    if (availableWeth < calculatedBidEth) {
+      logger.info(
+        { slug, targetNetwork, availableWeth, requiredWeth: calculatedBidEth },
+        `[Direct Mirror] 🛑 Insufficient WETH balance (${availableWeth} vs ${calculatedBidEth} required). Skipping until WETH available.`
+      );
+      return { success: false, reason: 'Insufficient WETH balance' };
+    }
+
+    // 9. RESOLVE FEES & SIGN SEAPORT 1.6 COLLECTION OFFER (EIP-712, 0 gas)
     const { rawFees } = this.apiService.parseCollectionFees(slug, collectionData);
 
-    // 9. SIGN SEAPORT 1.6 COLLECTION OFFER (EIP-712, 0 gas)
     const { orderComponents, signature } = await this.seaportService.createSignedCollectionOffer(
       contractAddress,
       calculatedBidEth,
