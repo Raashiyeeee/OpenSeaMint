@@ -1121,6 +1121,39 @@ export class OpenSeaApiService {
   }
 
   /**
+   * Queries live OpenSea order book for any active collection offers placed by our wallet.
+   * Prevents placing duplicate simultaneous offers even after container restart / redeployment.
+   */
+  public async getWalletActiveCollectionOffers(
+    collectionSlug: string,
+    walletAddress: string
+  ): Promise<Array<{ orderHash: string; priceEth: number; priceUsd?: number }>> {
+    try {
+      const ethPriceUsd = await this.getEthPriceUsd();
+      const offers: any[] = await this.cached(
+        this.offersCache,
+        collectionSlug,
+        this.ttl('offers', 20_000),
+        () => this.fetchCollectionOffersPages(collectionSlug),
+        true
+      );
+      const target = (walletAddress || '').toLowerCase();
+      const ourOffers: Array<{ orderHash: string; priceEth: number; priceUsd?: number }> = [];
+      for (const off of offers) {
+        const offerer = (off?.protocol_data?.parameters?.offerer || off?.maker?.address || '').toLowerCase();
+        if (offerer && offerer === target && off?.order_hash) {
+          const info = OpenSeaApiService.perUnitOfferPriceInfo(off, ethPriceUsd);
+          ourOffers.push({ orderHash: off.order_hash, priceEth: info.priceEth, priceUsd: info.priceUsd });
+        }
+      }
+      return ourOffers;
+    } catch (err: any) {
+      logger.debug({ slug: collectionSlug, err: err.message }, 'Could not query wallet active collection offers');
+      return [];
+    }
+  }
+
+  /**
    * Returns the current absolute top offer on a collection regardless of who placed it,
    * along with the offerer's wallet address. Used by Team Coordination to detect friendly leads.
    */

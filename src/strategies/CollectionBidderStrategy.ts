@@ -623,6 +623,36 @@ export class CollectionBidderStrategy {
    * collection, cancel every duplicate except the highest-priced one (then outbid logic can raise/cancel it).
    */
   public async cancelDuplicateOffersForCollection(collectionSlug: string, contractAddress?: string): Promise<number> {
+    // 1. Live OpenSea reconciliation: discover any offers from our wallet on marketplace (even after container restart)
+    try {
+      const ourAddress = this.seaportService.getWalletAddress();
+      if (ourAddress) {
+        const liveOnMarketplace = await this.apiService.getWalletActiveCollectionOffers(collectionSlug, ourAddress);
+        for (const liveOff of liveOnMarketplace) {
+          const existing = this.inventoryManager.getActiveOffer(liveOff.orderHash);
+          if (!existing) {
+            this.inventoryManager.registerActiveOffer({
+              orderHash: liveOff.orderHash,
+              collectionSlug,
+              contractAddress: contractAddress || '',
+              network: this.config.general.network || 'robinhood',
+              priceEth: liveOff.priceEth,
+              priceUsd: liveOff.priceUsd ?? 0,
+              createdTimestamp: Date.now() - 60_000,
+              expiresTimestamp: Date.now() + this.getOfferMaxAgeMinutes() * 60 * 1000,
+              status: 'ACTIVE'
+            });
+            logger.info(
+              { slug: collectionSlug, orderHash: liveOff.orderHash, priceEth: liveOff.priceEth },
+              'Discovered existing active offer on OpenSea for this collection. Registered in tracking.'
+            );
+          }
+        }
+      }
+    } catch (err: any) {
+      logger.debug({ slug: collectionSlug, err: err.message }, 'Live offer reconciliation check note');
+    }
+
     const live = this.inventoryManager.getLiveOffersForCollection(collectionSlug, contractAddress)
       .filter((o) => o.status === 'ACTIVE' || o.status === 'CANCELLATION_FAILED');
     if (live.length <= 1) return 0;
