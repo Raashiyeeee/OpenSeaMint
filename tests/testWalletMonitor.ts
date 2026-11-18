@@ -13,7 +13,7 @@ async function runTests() {
   assert.strictEqual(config.walletMonitor?.enabled, true, 'Wallet monitor should be enabled in default.json');
   assert.strictEqual(config.walletMonitor?.directMirrorMode, true, 'Direct mirror mode should be enabled');
   assert.strictEqual(config.walletMonitor?.outbidTickEth, 0.0001, 'Outbid tick should be 0.0001 WETH');
-  assert.strictEqual(config.walletMonitor?.maxBidUsd, 15.0, 'Max bid should be $15.00 USD');
+  assert.strictEqual(config.walletMonitor?.maxBidUsd, 10.0, 'Max bid should be $10.00 USD');
   assert.ok(Array.isArray(config.walletMonitor?.targetWallets), 'Target wallets should be an array');
   assert.strictEqual(config.walletMonitor?.targetWallets?.[0]?.toLowerCase(), '0x7d0d4312ade311c9d2cfb220cd25a12eb186b764'.toLowerCase(), 'Target wallet should be BenDoverXI');
   console.log('✓ Config parsing and schema validation passed');

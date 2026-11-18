@@ -21,7 +21,7 @@
     "totalTradingCapitalUsd": 50.0,
     "maxActiveTrades": 999,
     "minOfferPriceUsd": 1.0,
-    "maxBuyPriceUsd": 15.0,
+    "maxBuyPriceUsd": 10.0,
     "minNetProfitUsd": 0.2,
     "maxOfferCapitalPercent": 70.0
   },
@@ -108,7 +108,7 @@
     "enabled": true,
     "directMirrorMode": true,
     "outbidTickEth": 0.0001,
-    "maxBidUsd": 15.0,
+    "maxBidUsd": 10.0,
     "targetWallets": [
       "0x7d0d4312ade311c9d2cfb220cd25a12eb186b764"
     ],

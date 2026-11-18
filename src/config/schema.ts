@@ -127,7 +127,7 @@ const BotConfigSchema = z.object({
     enabled: z.boolean().default(false),
     directMirrorMode: z.boolean().default(true),
     outbidTickEth: z.number().nonnegative().default(0.0001),
-    maxBidUsd: z.number().positive().default(15.0),
+    maxBidUsd: z.number().positive().default(10.0),
     targetWallets: z.array(z.string()).default([]),
     pollIntervalMs: z.number().int().positive().default(45000),
     seenCollectionCooldownMs: z.number().int().positive().default(300000)

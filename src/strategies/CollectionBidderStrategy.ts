@@ -885,7 +885,7 @@ export class CollectionBidderStrategy {
    * Safety rules retained:
    *   1. Only supported active networks (e.g. robinhood, ink)
    *   2. Collection Re-Offer Rule: Never place offer if wallet already holds an unsold NFT from this collection
-   *   3. Maximum Bid Cap (default $15.00 USD)
+   *   3. Maximum Bid Cap (default $10.00 USD)
    *   4. Capital / WETH balance check (auto-wraps if deficit)
    */
   public async mirrorCollectionOffer(params: {
@@ -981,8 +981,8 @@ export class CollectionBidderStrategy {
 
     let calculatedBidEth = roundToPrecision(targetOfferEth + outbidTickEth, 4);
 
-    // 4. MAX BID CEILING GUARD (default $15.00 USD)
-    const maxBidUsd = this.config.walletMonitor?.maxBidUsd ?? 15.0;
+    // 4. MAX BID CEILING GUARD (default $10.00 USD)
+    const maxBidUsd = this.config.walletMonitor?.maxBidUsd ?? 10.0;
     const maxBidEth = roundToPrecision(maxBidUsd / ethPriceUsd, 4);
     if (calculatedBidEth > maxBidEth) {
       logger.info(
