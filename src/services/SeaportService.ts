@@ -690,7 +690,21 @@ export class SeaportService {
         connectedSigner
       );
 
-      const tx = await seaportContract.cancel([orderComponents]);
+      const sanitizedOrderComponents = {
+        offerer: ethers.getAddress(orderComponents.offerer),
+        zone: ethers.getAddress(orderComponents.zone),
+        offer: orderComponents.offer,
+        consideration: orderComponents.consideration,
+        orderType: Number(orderComponents.orderType),
+        startTime: BigInt(orderComponents.startTime),
+        endTime: BigInt(orderComponents.endTime),
+        zoneHash: orderComponents.zoneHash || ethers.ZeroHash,
+        salt: BigInt(orderComponents.salt),
+        conduitKey: orderComponents.conduitKey,
+        counter: BigInt(orderComponents.counter || 0)
+      };
+
+      const tx = await seaportContract.cancel([sanitizedOrderComponents]);
       const receipt = await tx.wait(1);
       logger.info({ txHash: receipt.hash, network: activeNetworkKey }, '✅ On-chain Seaport order cancellation confirmed');
       return { success: true, txHash: receipt.hash };

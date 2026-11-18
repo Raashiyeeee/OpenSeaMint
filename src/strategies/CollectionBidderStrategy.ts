@@ -433,6 +433,28 @@ export class CollectionBidderStrategy {
             { orderHash, network, error: cancelRes.error, reason },
             'Marketplace cancel request failed or queued. Will perform verification check.'
           );
+
+          // If OpenSea requires on-chain cancellation and we have orderComponents, execute on-chain Seaport cancel fallback
+          const errorStr = (typeof cancelRes.error === 'string' ? cancelRes.error : JSON.stringify(cancelRes.error || '')).toLowerCase();
+          if (
+            offer.orderComponents &&
+            (errorStr.includes('cancelled onchain') || errorStr.includes('onchain'))
+          ) {
+            logger.info(
+              { orderHash, network },
+              'OpenSea requires on-chain cancellation for recently created order. Executing on-chain Seaport cancel fallback...'
+            );
+            try {
+              const onchainRes = await this.seaportService.cancelOrderOnChain(offer.orderComponents, network);
+              if (onchainRes.success) {
+                logger.info({ orderHash, txHash: onchainRes.txHash, network }, '✅ On-chain Seaport cancellation transaction confirmed');
+              } else {
+                logger.warn({ orderHash, error: onchainRes.error, network }, 'On-chain Seaport cancellation failed or skipped');
+              }
+            } catch (onchainErr: any) {
+              logger.warn({ orderHash, err: onchainErr.message, network }, 'On-chain Seaport cancellation call encountered an error');
+            }
+          }
         }
         if (cancelRes.fillableUntil) {
           this.inventoryManager.setOfferFillableUntil(orderHash, cancelRes.fillableUntil);
@@ -449,11 +471,16 @@ export class CollectionBidderStrategy {
         return { success: false, error: 'Offer was fulfilled (accepted) before cancellation' };
       }
 
-      // 3b. API could not confirm: fall back to on-chain Seaport getOrderStatus (isCancelled)
-      if (!verification.isInactive && verification.status !== 'ACTIVE' && verification.status !== 'INACTIVE') {
-        const cancelledOnChain = await this.seaportService.isOrderCancelledOnChain(orderHash, network);
-        if (cancelledOnChain) {
-          verification = { isInactive: true, status: 'CANCELLED_ONCHAIN' };
+      // 3b. If API did not confirm inactive, fall back to on-chain Seaport getOrderStatus (isCancelled)
+      if (!verification.isInactive) {
+        try {
+          const cancelledOnChain = await this.seaportService.isOrderCancelledOnChain(orderHash, network);
+          if (cancelledOnChain) {
+            logger.info({ orderHash, network }, 'Seaport on-chain status confirmed order is CANCELLED ✅');
+            verification = { isInactive: true, status: 'CANCELLED_ONCHAIN' };
+          }
+        } catch (chainErr: any) {
+          logger.debug({ orderHash, err: chainErr.message }, 'Could not verify on-chain cancellation status');
         }
       }
 
@@ -643,8 +670,27 @@ export class CollectionBidderStrategy {
 
     for (const offer of liveOffers) {
       try {
-        // If cancellation was already initiated or pending, re-verify and retry immediately so it does NOT wait 20 minutes
+        // If cancellation was already initiated or pending, re-verify and retry with backoff so it does NOT hammer OpenSea every 3s
         if (offer.status === 'CANCELLATION_PENDING' || offer.status === 'CANCELLATION_FAILED') {
+          // If the offer has passed its expiration timestamp, it is permanently expired in Seaport
+          if (offer.expiresTimestamp && Date.now() >= offer.expiresTimestamp) {
+            this.inventoryManager.confirmOfferCancellation(offer.orderHash);
+            this.apiService.invalidateCollectionCache(offer.collectionSlug);
+            logger.info(
+              { orderHash: offer.orderHash, collection: offer.collectionSlug },
+              'Offer reached expiration timestamp. Confirmed inactive and capital released.'
+            );
+            cancelled++;
+            continue;
+          }
+
+          // Throttle retry attempts: wait at least 30s between attempts to avoid spamming OpenSea API
+          const lastAttempt = offer.lastCancellationAttempt || 0;
+          if (Date.now() - lastAttempt < 30_000) {
+            pending++;
+            continue;
+          }
+
           const res = await this.cancelAndVerifyOffer(offer, 'Pending Outbid Cancellation Retry');
           if (res.success) {
             this.apiService.invalidateCollectionCache(offer.collectionSlug);
