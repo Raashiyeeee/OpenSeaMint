@@ -125,6 +125,9 @@ const BotConfigSchema = z.object({
   }),
   walletMonitor: z.object({
     enabled: z.boolean().default(false),
+    directMirrorMode: z.boolean().default(true),
+    outbidTickEth: z.number().nonnegative().default(0.0001),
+    maxBidUsd: z.number().positive().default(15.0),
     targetWallets: z.array(z.string()).default([]),
     pollIntervalMs: z.number().int().positive().default(45000),
     seenCollectionCooldownMs: z.number().int().positive().default(300000)
@@ -179,6 +182,18 @@ export function loadConfig(configPath?: string): BotConfig {
     if (process.env.WALLET_MONITOR_COOLDOWN_MS) {
       if (!parsed.walletMonitor) parsed.walletMonitor = {};
       parsed.walletMonitor.seenCollectionCooldownMs = parseInt(process.env.WALLET_MONITOR_COOLDOWN_MS, 10);
+    }
+    if (process.env.MIRROR_DIRECT_MODE !== undefined) {
+      if (!parsed.walletMonitor) parsed.walletMonitor = {};
+      parsed.walletMonitor.directMirrorMode = process.env.MIRROR_DIRECT_MODE === 'true' || process.env.MIRROR_DIRECT_MODE === '1';
+    }
+    if (process.env.MIRROR_OUTBID_TICK_ETH) {
+      if (!parsed.walletMonitor) parsed.walletMonitor = {};
+      parsed.walletMonitor.outbidTickEth = parseFloat(process.env.MIRROR_OUTBID_TICK_ETH);
+    }
+    if (process.env.MIRROR_MAX_BID_USD) {
+      if (!parsed.walletMonitor) parsed.walletMonitor = {};
+      parsed.walletMonitor.maxBidUsd = parseFloat(process.env.MIRROR_MAX_BID_USD);
     }
 
     if (!parsed.general.activeNetworks || parsed.general.activeNetworks.length === 0) {

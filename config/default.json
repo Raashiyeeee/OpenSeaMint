@@ -106,6 +106,9 @@
   },
   "walletMonitor": {
     "enabled": true,
+    "directMirrorMode": true,
+    "outbidTickEth": 0.0001,
+    "maxBidUsd": 15.0,
     "targetWallets": [
       "0x7d0d4312ade311c9d2cfb220cd25a12eb186b764"
     ],

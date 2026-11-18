@@ -98,6 +98,9 @@ export interface WalletMonitorConfig {
   targetWallets?: string[];
   pollIntervalMs?: number;
   seenCollectionCooldownMs?: number;
+  directMirrorMode?: boolean;
+  outbidTickEth?: number;
+  maxBidUsd?: number;
 }
 
 export interface FeeRecipient {

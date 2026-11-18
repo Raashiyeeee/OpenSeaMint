@@ -836,6 +836,242 @@ export class CollectionBidderStrategy {
     }
   }
 
+  /**
+   * Direct Copy-Trading / Offer Mirroring Mode:
+   * Directly mirrors an offer placed by a target trader (e.g. BenDoverXI).
+   * Bypasses strict pre-entry filters (10 floor sales in 3h, mint completion, 30% margin check).
+   * Outbids the target trader by 1 tick (default 0.0001 WETH) so our bot sits at #1 priority.
+   * Safety rules retained:
+   *   1. Only supported active networks (e.g. robinhood, ink)
+   *   2. Collection Re-Offer Rule: Never place offer if wallet already holds an unsold NFT from this collection
+   *   3. Maximum Bid Cap (default $15.00 USD)
+   *   4. Capital / WETH balance check (auto-wraps if deficit)
+   */
+  public async mirrorCollectionOffer(params: {
+    slug: string;
+    contractAddress?: string;
+    networkKey?: string;
+    targetOfferEth?: number;
+    sourceWallet?: string;
+  }): Promise<{ success: boolean; reason?: string }> {
+    const slug = params.slug;
+    const targetNetwork = params.networkKey || this.config.general.network || 'robinhood';
+    const sourceWallet = params.sourceWallet || 'target';
+
+    if (!this.circuitBreaker.isOperational()) {
+      return { success: false, reason: 'Circuit breaker is tripped' };
+    }
+
+    if (this.circuitBreaker.isCollectionPermanentlyExcluded(slug)) {
+      return { success: false, reason: 'Collection is permanently excluded (Market Dump Protection)' };
+    }
+
+    // 1. COLLECTION RE-OFFER RULE: Never place a bid if we already own an unsold NFT in this collection
+    let contractAddress = params.contractAddress || '';
+    if (!contractAddress) {
+      try {
+        const colData = await this.apiService.client.get(`/collections/${slug}`);
+        contractAddress = colData.data?.contracts?.[0]?.address || '';
+      } catch (err: any) {
+        logger.debug({ slug, err: err.message }, 'Could not resolve contract address for mirror offer');
+      }
+    }
+
+    const collectionCheck = this.inventoryManager.canOfferOnCollection(slug, contractAddress);
+    if (!collectionCheck.allowed) {
+      logger.info(
+        { slug, network: targetNetwork, reason: collectionCheck.reason },
+        `[Direct Mirror] 🛑 Re-Offer Block: ${collectionCheck.reason}`
+      );
+      return { success: false, reason: collectionCheck.reason };
+    }
+
+    // Direct Live Wallet Verification Guard:
+    try {
+      const ourWallet = this.seaportService.getWalletAddress();
+      if (ourWallet) {
+        const ownedInCollection = await this.apiService.getAccountNfts(ourWallet, slug, targetNetwork);
+        if (ownedInCollection && ownedInCollection.length > 0) {
+          const ignored = this.config.general.ignoredCollections || ['robin-owls', 'robin-owls-269031093'];
+          const matchingNfts = ownedInCollection.filter((nft: any) => {
+            const s = (nft.collection || slug).toLowerCase();
+            const cAddr = (nft.contract || contractAddress).toLowerCase();
+            return !ignored.some((i) => s.includes(i.toLowerCase()) || cAddr.includes(i.toLowerCase()));
+          });
+          if (matchingNfts.length > 0) {
+            const blockReason = `Wallet currently holds ${matchingNfts.length} unsold NFT(s) from ${slug}. Mirror offer blocked until sold.`;
+            logger.info({ slug, count: matchingNfts.length }, `[Direct Mirror] 🛑 ${blockReason}`);
+            return { success: false, reason: blockReason };
+          }
+        }
+      }
+    } catch (err: any) {
+      logger.debug({ slug, err: err.message }, 'Mirror direct wallet verification note');
+    }
+
+    // 2. CHECK IF WE ALREADY HAVE AN ACTIVE #1 OFFER ON THIS COLLECTION
+    await this.cancelDuplicateOffersForCollection(slug, contractAddress);
+    const existingOffer = this.inventoryManager.getActiveOffer(slug);
+    if (existingOffer && existingOffer.status === 'ACTIVE') {
+      const isExpired = Date.now() - existingOffer.createdTimestamp >= this.getOfferMaxAgeMinutes() * 60 * 1000;
+      if (!isExpired) {
+        logger.debug({ slug, priceEth: existingOffer.priceEth }, '[Direct Mirror] Active offer already in place on this collection.');
+        return { success: false, reason: 'Active offer already in place' };
+      }
+    }
+
+    // 3. PRICING: OUTBID TARGET TRADER BY 1 TICK (default 0.0001 WETH)
+    const ethPriceUsd = await this.apiService.getEthPriceUsd();
+    const outbidTickEth = this.config.walletMonitor?.outbidTickEth ?? 0.0001;
+    let targetOfferEth = params.targetOfferEth || 0;
+
+    if (targetOfferEth <= 0) {
+      const competing = await this.apiService.getTopCompetingCollectionOffer(slug, {
+        excludeAddress: this.seaportService.getWalletAddress(),
+        fresh: true
+      });
+      targetOfferEth = competing?.priceEth || 0;
+    }
+
+    if (targetOfferEth <= 0) {
+      logger.info({ slug }, '[Direct Mirror] Target offer price unknown and no competing offer found. Skipping.');
+      return { success: false, reason: 'Target offer price unknown' };
+    }
+
+    let calculatedBidEth = roundToPrecision(targetOfferEth + outbidTickEth, 4);
+
+    // 4. MAX BID CEILING GUARD (default $15.00 USD)
+    const maxBidUsd = this.config.walletMonitor?.maxBidUsd ?? 15.0;
+    const maxBidEth = roundToPrecision(maxBidUsd / ethPriceUsd, 4);
+    if (calculatedBidEth > maxBidEth) {
+      logger.info(
+        { slug, calculatedBidEth, maxBidEth, maxBidUsd, targetOfferEth },
+        `[Direct Mirror] 🛑 Offer (${calculatedBidEth} ETH / $${(calculatedBidEth * ethPriceUsd).toFixed(2)}) exceeds max cap of $${maxBidUsd.toFixed(2)}. Skipping.`
+      );
+      return { success: false, reason: `Bid exceeds $${maxBidUsd} cap` };
+    }
+
+    // 5. MIN OFFER PRICE GUARD ($1.00 USD)
+    const minOfferPriceUsd = this.config.capital?.minOfferPriceUsd ?? 1.0;
+    const minOfferEth = roundToPrecision(minOfferPriceUsd / ethPriceUsd, 4);
+    if (calculatedBidEth < minOfferEth) {
+      calculatedBidEth = minOfferEth;
+    }
+
+    const calculatedBidUsd = roundToPrecision(calculatedBidEth * ethPriceUsd, 2);
+
+    // 6. CAPITAL ALLOCATION CHECK
+    const capitalCheck = this.inventoryManager.canAllocateCapitalForOffer(calculatedBidUsd, ethPriceUsd);
+    if (!capitalCheck.allowed) {
+      logger.info({ slug, reason: capitalCheck.reason }, `[Direct Mirror] 🛑 Capital check: ${capitalCheck.reason}`);
+      return { success: false, reason: capitalCheck.reason };
+    }
+
+    // 7. PRE-FLIGHT WETH CHECK & AUTO-WRAP
+    let availableWeth = await this.seaportService.getWethBalance(targetNetwork);
+    if (availableWeth < calculatedBidEth) {
+      const rebalanceRes = await this.seaportService.autoWrapAvailableEthIfDeficit(calculatedBidEth, targetNetwork);
+      if (rebalanceRes.amountWrappedEth > 0) {
+        availableWeth = await this.seaportService.getWethBalance(targetNetwork);
+      }
+    }
+    if (availableWeth < calculatedBidEth) {
+      logger.info(
+        { slug, targetNetwork, availableWeth, requiredWeth: calculatedBidEth },
+        `[Direct Mirror] 🛑 Insufficient WETH balance (${availableWeth} vs ${calculatedBidEth} required). Skipping until WETH available.`
+      );
+      return { success: false, reason: 'Insufficient WETH balance' };
+    }
+
+    // 8. RESOLVE CONTRACT & FEES
+    let collectionData: any;
+    try {
+      collectionData = (await this.apiService.client.get(`/collections/${slug}`)).data;
+      if (!contractAddress) {
+        contractAddress = collectionData?.contracts?.[0]?.address || '';
+      }
+    } catch (err: any) {
+      logger.warn({ slug, err: err.message }, '[Direct Mirror] Could not fetch collection metadata');
+    }
+
+    if (!contractAddress) {
+      logger.warn({ slug }, '[Direct Mirror] 🛑 Missing contract address. Cannot place Seaport offer.');
+      return { success: false, reason: 'Missing contract address' };
+    }
+
+    const { rawFees } = this.apiService.parseCollectionFees(slug, collectionData);
+
+    // 9. SIGN SEAPORT 1.6 COLLECTION OFFER (EIP-712, 0 gas)
+    const { orderComponents, signature } = await this.seaportService.createSignedCollectionOffer(
+      contractAddress,
+      calculatedBidEth,
+      this.getOfferMaxAgeMinutes(),
+      targetNetwork,
+      rawFees
+    );
+
+    const offerFeeCheck = this.verifySignedOfferCreatorFees(orderComponents, rawFees);
+    if (!offerFeeCheck.verified) {
+      logger.error({ slug, reason: offerFeeCheck.reason }, '[Direct Mirror] Optional creator fee present in offer. Aborting.');
+      return { success: false, reason: offerFeeCheck.reason };
+    }
+
+    // 10. POST OFFER TO OPENSEA
+    const postPayload = {
+      criteria: {
+        collection: { slug }
+      },
+      protocol_data: {
+        parameters: orderComponents,
+        signature
+      },
+      protocol_address: this.config.seaport.contractAddress
+    };
+
+    const res = await this.apiService.postCollectionOffer(postPayload);
+    this.apiService.invalidateCollectionCache(slug);
+
+    // Pre-approve conduit in background so when accepted, instant listing is 0-gas
+    this.seaportService.ensureNftConduitApproval(contractAddress, targetNetwork).catch((err: any) => {
+      logger.debug({ contract: contractAddress, err: err.message }, 'Background conduit approval note');
+    });
+
+    // 11. REGISTER OFFER IN INVENTORY MANAGER
+    const orderHash = res?.order_hash || `sim_mirror_${slug}_${Date.now()}`;
+    this.inventoryManager.registerActiveOffer({
+      orderHash,
+      collectionSlug: slug,
+      contractAddress,
+      network: targetNetwork,
+      priceEth: calculatedBidEth,
+      priceUsd: calculatedBidUsd,
+      createdTimestamp: Date.now(),
+      expiresTimestamp: Date.now() + this.getOfferMaxAgeMinutes() * 60 * 1000,
+      status: 'ACTIVE',
+      orderComponents,
+      signature
+    });
+
+    this.circuitBreaker.registerSuccess();
+
+    logger.info(
+      {
+        slug,
+        network: targetNetwork,
+        ourBidEth: calculatedBidEth,
+        ourBidUsd: `$${calculatedBidUsd}`,
+        targetTraderBidEth: targetOfferEth,
+        outbidByEth: outbidTickEth,
+        maxCapUsd: `$${maxBidUsd}`,
+        sourceWallet,
+        orderHash
+      },
+      `🎯 [Direct Mirror] SUCCESS! Placed #1 collection offer on '${slug}' [${targetNetwork.toUpperCase()}] beating ${sourceWallet}! Awaiting seller acceptance.`
+    );
+
+    return { success: true };
+  }
+
   private async processCollectionBid(target: any, networkKey?: string): Promise<void> {
     const targetNetwork = networkKey || target.network || 'robinhood';
 

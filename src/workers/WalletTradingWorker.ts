@@ -276,11 +276,25 @@ export class WalletTradingWorker {
     this.walletMonitor.on('collection_spotted', async (event: SpottedCollectionEvent) => {
       await runWithWalletContext(this.label, async () => {
         try {
-          logger.info(
-            { worker: this.label, slug: event.slug, network: event.network, source: event.sourceWallet },
-            `[${this.label}] Wallet monitor detected collection offer from target wallet. Evaluating for mirror bid...`
-          );
-          await this.bidderStrategy.evaluateSingleCollection(event.slug, event.contractAddress, event.network);
+          if (this.config.walletMonitor?.directMirrorMode !== false) {
+            logger.info(
+              { worker: this.label, slug: event.slug, network: event.network, source: event.sourceWallet, targetOfferEth: event.makerPriceEth },
+              `[${this.label}] Wallet monitor detected collection offer from ${event.sourceWallet}. Directly mirroring offer (+1 tick outbid)...`
+            );
+            await this.bidderStrategy.mirrorCollectionOffer({
+              slug: event.slug,
+              contractAddress: event.contractAddress,
+              networkKey: event.network,
+              targetOfferEth: event.makerPriceEth,
+              sourceWallet: event.sourceWallet
+            });
+          } else {
+            logger.info(
+              { worker: this.label, slug: event.slug, network: event.network, source: event.sourceWallet },
+              `[${this.label}] Wallet monitor detected collection offer. Evaluating with standard filters...`
+            );
+            await this.bidderStrategy.evaluateSingleCollection(event.slug, event.contractAddress, event.network);
+          }
         } catch (err: any) {
           logger.error({ worker: this.label, slug: event.slug, err: err.message }, 'Error in wallet monitor evaluation handler');
         }
