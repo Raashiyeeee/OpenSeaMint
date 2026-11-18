@@ -574,14 +574,9 @@ export class CollectionBidderStrategy {
    */
   public static isOutbidBy(competing: { priceEth: number; priceUsd?: number }, offer: ActiveOffer): boolean {
     if (competing.priceUsd !== undefined && offer.priceUsd !== undefined && offer.priceUsd > 0 && competing.priceUsd > 0) {
-      if (competing.priceUsd > offer.priceUsd + 0.001) {
-        return true;
-      }
+      return competing.priceUsd > offer.priceUsd + 0.001;
     }
-    if (competing.priceEth > offer.priceEth + 1e-12) {
-      return true;
-    }
-    return false;
+    return competing.priceEth > offer.priceEth + 1e-12;
   }
 
   /**
