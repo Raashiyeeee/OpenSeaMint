@@ -341,6 +341,10 @@ export class WalletTradingWorker {
           await this.bidderStrategy.processAutomaticOfferCancellations(this.bidderStrategy.getOfferMaxAgeMinutes());
           await this.bidderStrategy.processOutbidOfferCancellations();
           await this.relisterStrategy.monitorListedInventory();
+
+          // Real-time purchase poller: detects accepted bids in seconds via account sales activity
+          await this.relisterStrategy.pollRealTimePurchases(this.tradingWallet.address);
+
           await this.bidderStrategy.checkOffersForFills(async (offer) => {
             await this.relisterStrategy.detectNewHoldings(this.tradingWallet.address, offer.collectionSlug, offer.network || 'robinhood', 'order:FULFILLED');
           });

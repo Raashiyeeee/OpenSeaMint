@@ -1303,6 +1303,69 @@ export class OpenSeaApiService {
 
 
   /**
+   * Queries OpenSea for recent sales involving our wallet (buyer or seller).
+   * Real-time events feed bypasses the 3-5 minute account portfolio indexing lag!
+   */
+  public async getRecentAccountSales(
+    walletAddress: string,
+    limit: number = 20
+  ): Promise<Array<{
+    eventType: string;
+    collectionSlug: string;
+    contractAddress: string;
+    tokenId: string;
+    network: string;
+    buyer: string;
+    seller: string;
+    salePriceEth: number;
+    paymentSymbol: string;
+    txHash?: string;
+    timestamp: number;
+  }>> {
+    try {
+      const res = await this.client.get(`/events/accounts/${walletAddress}?event_type=sale&limit=${limit}`);
+      const rawEvents: any[] = res.data?.asset_events || [];
+      const parsed: any[] = [];
+
+      for (const ev of rawEvents) {
+        const buyer = String(ev.buyer?.address || ev.buyer || '').toLowerCase();
+        const seller = String(ev.seller?.address || ev.seller || '').toLowerCase();
+        const contract = String(ev.nft?.contract || ev.asset?.asset_contract?.address || ev.contract || '').toLowerCase();
+        const tokenId = String(ev.nft?.identifier || ev.asset?.token_id || ev.token_id || '');
+        const collectionSlug = String(ev.nft?.collection || ev.asset?.collection?.slug || ev.collection || '');
+        const rawChain = (ev.chain || 'robinhood').toLowerCase();
+        const network = rawChain === 'ethereum' ? 'mainnet' : rawChain;
+
+        if (!contract || !tokenId) continue;
+
+        let salePriceEth = 0;
+        const decimals = ev.payment?.decimals ?? 18;
+        if (ev.payment?.quantity) {
+          salePriceEth = parseFloat(ev.payment.quantity) / Math.pow(10, decimals);
+        }
+
+        parsed.push({
+          eventType: 'sale',
+          collectionSlug,
+          contractAddress: contract,
+          tokenId,
+          network,
+          buyer,
+          seller,
+          salePriceEth,
+          paymentSymbol: String(ev.payment?.symbol || 'WETH').toUpperCase(),
+          txHash: ev.transaction?.hash || ev.transaction,
+          timestamp: Number(ev.event_timestamp) || Math.floor(Date.now() / 1000)
+        });
+      }
+      return parsed;
+    } catch (err: any) {
+      logger.debug({ walletAddress, err: err.message }, 'Failed to query recent account sales events');
+      return [];
+    }
+  }
+
+  /**
    * Fetches latest minted tokens in a collection (Larry's COLLECTION_ASSETS_URL idea)
    */
   public async getLatestMintedTokens(collectionSlug: string, limit: number = 10): Promise<Array<{ tokenId: string; name: string }>> {

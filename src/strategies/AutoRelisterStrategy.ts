@@ -165,6 +165,49 @@ export class AutoRelisterStrategy {
   }
 
   /**
+   * Fast Real-Time Purchase Detection via Account Sales Event Feed:
+   * Bypasses OpenSea's 3-5 minute account portfolio indexing lag on L2s (Robinhood/Ink).
+   * Runs in the fast loop to detect incoming fills immediately within seconds of the transaction!
+   */
+  public async pollRealTimePurchases(walletAddress: string): Promise<number> {
+    const target = walletAddress.toLowerCase();
+    const sales = await this.apiService.getRecentAccountSales(walletAddress, 15);
+    let detected = 0;
+
+    for (const sale of sales) {
+      // Inbound purchase: our wallet was the BUYER
+      if (sale.buyer === target) {
+        const identifier = `${sale.contractAddress.toLowerCase()}:${sale.tokenId}`;
+        const existing = this.inventoryManager.getInventoryItem(identifier);
+        // Already tracked and not yet sold -> skip
+        if (existing && existing.status !== 'SOLD' && existing.status !== 'TRANSFERRED') continue;
+
+        const ignored = this.config.general.ignoredCollections || ['robin-owls', 'robin-owls-269031093'];
+        if (ignored.some((i) => sale.collectionSlug.toLowerCase().includes(i.toLowerCase()) || sale.contractAddress.toLowerCase().includes(i.toLowerCase()))) {
+          continue;
+        }
+
+        logger.info(
+          { identifier, slug: sale.collectionSlug, priceEth: sale.salePriceEth, seller: sale.seller },
+          '⚡ [Real-Time Poller] Inbound purchase detected via OpenSea sales events! Listing instantly...'
+        );
+
+        detected++;
+        await this.onPurchaseDetected({
+          collectionSlug: sale.collectionSlug,
+          contractAddress: sale.contractAddress,
+          tokenId: sale.tokenId,
+          network: sale.network,
+          eventPriceEth: sale.salePriceEth,
+          source: 'realtime-sales-event'
+        });
+      }
+    }
+
+    return detected;
+  }
+
+  /**
    * Called immediately when a new NFT is received in the trading wallet
    */
   public async handleItemAcquired(
