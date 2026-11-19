@@ -133,7 +133,7 @@ const OS_FEE = { recipient: '0x0000a26b00c1f0df003000390027140000faa719', fee: 1
   assert(item924, '#924 tracked from order-status + wallet lookup');
   assert(Math.abs(item924.acquiredPriceEth - usd(2.0)) < 1e-12, 'Cost basis = the $2.00 offer');
   assert.strictEqual(item924.status, 'LISTED', '#924 listed within profit range even though floor dropped to $2.10');
-  assert(item924.currentListingPriceEth! >= usd(2.60), 'Listed at >= 30% margin price within profit range');
+  assert(item924.currentListingPriceEth! >= usd(2.50), 'Listed at >= 25% margin price within profit range');
   console.log('Case V3 PASSED: #924 detected via order FULFILLED, immediately listed within profit range (never held on floor drop) ✅');
 
   // Unknown cost basis: never guessed (old code used 0.0004 ETH / floor*0.85) -> HOLD with reason

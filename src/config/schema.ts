@@ -99,10 +99,10 @@ const BotConfigSchema = z.object({
   }),
   profitTargets: z.object({
     defaultMinNetProfitUsd: z.number().positive(),
-    defaultMinMarginPercent: z.number().positive().default(12.0),
+    defaultMinMarginPercent: z.number().positive().default(10.0),
     tier1MaxPriceUsd: z.number().positive().default(4.0),
-    tier1MinMarginPercent: z.number().positive().default(30.0),
-    tier2MinMarginPercent: z.number().positive().default(12.0),
+    tier1MinMarginPercent: z.number().positive().default(25.0),
+    tier2MinMarginPercent: z.number().positive().default(10.0),
     undercutFloorByPercent: z.number().nonnegative(),
     bidUnderFloorPercent: z.number().positive(),
     bidIncrementUsd: z.number().positive().default(0.05)

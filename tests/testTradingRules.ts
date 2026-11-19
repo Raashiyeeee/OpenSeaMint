@@ -663,32 +663,32 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   console.log('Case C1-C8 PASSED: OpenSea chain/status/cancel semantics, per-NFT outbid (incl. when market-data early-rejects), per-unit offers, sale-vs-transfer, no committed RPC keys ✅\n');
 
   // ------------------------------------------------------------------------
-  // RULES A-E: 12% margin (creator excluded), minimum acceptable floor, creator fee, final validation, auto-listing
+  // RULES A-E: 10% clean profit (creator excluded from margin %, creator counted in profit), min floor, creator fee, final validation, auto-listing
   // ------------------------------------------------------------------------
-  // A. Tiered margins: up to $5 requires 30%, >$5-$9 requires 12% profit after creator fee (e.g. 10% fee -> 22% pre-fee margin)
-  assert.strictEqual(pricingEngine.getMinMarginPercent(), 12);
-  assert.strictEqual(pricingEngine.getMinMarginPercent({ minMarginPercent: 5 }), 12, 'Per-target 5% cannot weaken the 12% rule');
+  // A. Tiered margins: up to $4 requires 25%, >$4-$10 requires 10% clean profit after creator fee (e.g. 10% fee -> 20% pre-fee margin)
+  assert.strictEqual(pricingEngine.getMinMarginPercent(), 10);
+  assert.strictEqual(pricingEngine.getMinMarginPercent({ minMarginPercent: 5 }), 10, 'Per-target 5% cannot weaken the 10% rule');
   assert.strictEqual(pricingEngine.getMinMarginPercent({ minMarginPercent: 15 }), 15, 'Stricter per-target margin is honoured');
-  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 2.50), 30, '$1 to $4 tier must enforce 30% margin');
-  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 4.00), 30, '$4.00 boundary must enforce 30% margin');
-  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 4.01), 12, '>$4 tier with 0% fee must enforce 12% margin');
-  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 6.00, 10), 22, '>$4 tier with 10% creator fee must enforce 22% margin before fee');
-  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 7.50, 5), 17, '>$4 tier with 5% creator fee must enforce 17% margin before fee');
+  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 2.50), 25, '$1 to $4 tier must enforce 25% margin');
+  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 4.00), 25, '$4.00 boundary must enforce 25% margin');
+  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 4.01), 10, '>$4 tier with 0% fee must enforce 10% margin');
+  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 6.00, 10), 20, '>$4 tier with 10% creator fee must enforce 20% margin before fee');
+  assert.strictEqual(pricingEngine.getMinMarginPercent(undefined, 7.50, 5), 15, '>$4 tier with 5% creator fee must enforce 15% margin before fee');
   const aCalc = pricingEngine.calculateMaxBid(baseMarketData({ floorPriceEth: 0.002, royaltyFeeBps: 500 }), undefined, undefined, 'robinhood');
   if (aCalc.decision === 'ACCEPT') {
-    assert(aCalc.marginPercent >= 12 - 1e-6, `Accepted bid must yield >= 12% margin excl. creator (got ${aCalc.marginPercent})`);
+    assert(aCalc.marginPercent >= 10 - 1e-6, `Accepted bid must yield >= 10% margin excl. creator (got ${aCalc.marginPercent})`);
     assert(aCalc.minAcceptableFloorEth !== undefined && 0.002 >= aCalc.minAcceptableFloorEth, 'Floor must be >= min acceptable floor');
   }
-  console.log('Case A PASSED: Tiered margins (up to $5 -> 30%, >$5-$9 -> 12% after creator fee) enforced ✅');
+  console.log('Case A PASSED: Tiered margins (up to $4 -> 25%, >$4-$10 -> 10% after creator fee) enforced ✅');
 
-  // B. Minimum acceptable floor for 12% margin — creator fees excluded from this specific formula
-  // minFloor = offer*1.12 / (1 - marketplaceFee) = 0.00112 / 0.995
+  // B. Minimum acceptable floor for 10% margin — creator fees excluded from this specific formula
+  // minFloor = offer*1.10 / (1 - marketplaceFee) = 0.00110 / 0.995
   const minFloor = pricingEngine.computeMinAcceptableFloorEth({ offerEth: 0.001, openseaFeeBps: 50, creatorFeeBps: 500, gasEth: 0, undercutPercent: 0 });
-  assert(Math.abs(minFloor - 0.00112 / 0.995) < 1e-12, `minFloor = offer*1.12/(1-marketplaceFee) (got ${minFloor})`);
+  assert(Math.abs(minFloor - 0.00110 / 0.995) < 1e-12, `minFloor = offer*1.10/(1-marketplaceFee) (got ${minFloor})`);
   const minFloorNoCreator = pricingEngine.computeMinAcceptableFloorEth({ offerEth: 0.001, openseaFeeBps: 50, creatorFeeBps: 0, gasEth: 0, undercutPercent: 0 });
-  assert(Math.abs(minFloor - minFloorNoCreator) < 1e-12, 'Creator fee must not change the 12% margin floor formula');
+  assert(Math.abs(minFloor - minFloorNoCreator) < 1e-12, 'Creator fee must not change the 10% margin floor formula');
   assert.strictEqual(pricingEngine.computeMinAcceptableFloorEth({ offerEth: 0.001, openseaFeeBps: 10000, creatorFeeBps: 0, gasEth: 0 }), Infinity);
-  console.log('Case B PASSED: Minimum acceptable floor = (offer*1.12 + gas) / ((1-undercut)(1-marketplaceFee)); creator excluded ✅');
+  console.log('Case B PASSED: Minimum acceptable floor = (offer*1.10 + gas) / ((1-undercut)(1-marketplaceFee)); creator excluded ✅');
 
   // C + D. Final pre-offer validation on FRESH data at the exact bid
   const dApi = new OpenSeaApiService(config);
@@ -698,10 +698,10 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   (dApi as any).getTopCompetingCollectionOffer = async () => dCompeting;
   const { bidder: dBidder } = makeBidder(dApi, new InventoryManager(config));
   const fv = (bid: number) => dBidder.finalPreOfferValidation({ collectionSlug: 'rules-collection', contractAddress: ZERO, networkKey: 'robinhood', bidPriceEth: bid });
-  // High marketplace fee: floor passes 1.30x but fails 12% min acceptable floor (creator excluded from that floor)
+  // High marketplace fee: floor passes 1.30x but fails 10% min acceptable floor (creator excluded from that floor)
   freshData = baseMarketData({ floorPriceEth: 0.00135, referenceFloorEth: 0.00135, openseaFeeBps: 2500 });
   let dRes = await fv(0.001);
-  assert.strictEqual(dRes.passed, false, 'Passing 1.30x alone is not enough when 12% margin floor is higher');
+  assert.strictEqual(dRes.passed, false, 'Passing 1.30x alone is not enough when 10% margin floor is higher');
   assert(/minimum acceptable floor/.test(dRes.reason), dRes.reason);
   freshData = baseMarketData({ floorPriceEth: 0.0016, referenceFloorEth: 0.0016 });
   assert.strictEqual((await fv(0.001)).passed, true, 'Floor above min acceptable floor passes');
@@ -717,7 +717,7 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   assert.strictEqual(dRes.passed, false, 'Unavailable competing book must fail closed');
   assert(/competing offers could not be verified/.test(dRes.reason), dRes.reason);
   dCompeting = null;
-  // Mandatory creator fee excluded from 12% margin but still counted in actual net profit -> reject when it erodes below min
+  // Mandatory creator fee excluded from 10% margin but still counted in actual net profit -> reject when it erodes below min
   freshData = baseMarketData({ floorPriceEth: 0.00052, referenceFloorEth: 0.00052, royaltyFeeBps: 1000 });
   assert.strictEqual((await fv(0.0004)).passed, false, 'Non-disableable creator fee counted in actual net profit');
   // optional creator fee not disabled -> reject
@@ -736,17 +736,17 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   freshData = baseMarketData({ floorPriceEth: 0.0016, referenceFloorEth: 0.0016, totalSupply: 900 });
   assert.strictEqual((await fv(0.001)).passed, false, 'Mint-out re-checked in final validation');
   freshData = baseMarketData({ floorPriceEth: 0.0016, referenceFloorEth: 0.0016, sales3Hours: 3 });
-  // Tier 1 pre-offer check: $2.70 offer with 20% margin floor (passes 12% but fails 30%)
+  // Tier 1 pre-offer check: $2.70 offer with 20% margin floor (passes 10% but fails 25%)
   freshData = baseMarketData({ floorPriceEth: 0.00132, referenceFloorEth: 0.00132, openseaFeeBps: 500 });
   const tier1Check = await fv(0.001);
-  assert.strictEqual(tier1Check.passed, false, 'Up to $5 offer with <30% margin must be rejected');
-  assert(/30%/.test(tier1Check.reason), tier1Check.reason);
+  assert.strictEqual(tier1Check.passed, false, 'Up to $4 offer with <25% margin must be rejected');
+  assert(/(25%|30%)/.test(tier1Check.reason), tier1Check.reason);
 
-  // Tier 2 pre-offer check: $6.75 offer (0.0025 ETH) with 10% creator fee requiring 22% pre-fee margin and 12% post-creator profit
-  // With 1200 bps creator fee, pre-fee margin required is 24% (12% + 12%)
+  // Tier 2 pre-offer check: $6.75 offer (0.0025 ETH) with 10% creator fee requiring 20% pre-fee margin and 10% post-creator profit
+  // With 1200 bps creator fee, pre-fee margin required is 22% (10% + 12%)
   freshData = baseMarketData({ floorPriceEth: 0.0033, referenceFloorEth: 0.0033, openseaFeeBps: 500, royaltyFeeBps: 1200 });
   const tier2Check = await fv(0.0025);
-  assert.strictEqual(tier2Check.passed, false, '>$5 offer failing 12% post-creator profit must be rejected');
+  assert.strictEqual(tier2Check.passed, false, '>$4 offer failing 10% post-creator profit must be rejected');
   assert(/creator fee/.test(tier2Check.reason), tier2Check.reason);
   (dApi as any).getCollectionMarketData = async () => { throw new Error('down'); };
   assert.strictEqual((await fv(0.001)).passed, false, 'Unfetchable fresh data rejects');
@@ -771,7 +771,7 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   const relister = new AutoRelisterStrategy(config, eApi, pricingEngine, eSeaport, eInv, new CircuitBreaker(config));
   const minList = pricingEngine.evaluateListingOrHold(0.001, 0.003, { openseaFeeBps: 50, royaltyFeeBps: 0, ethPriceUsd: 2700 }, undefined, 'robinhood').minProfitablePriceEth!;
   const gasEthE = (config.networks?.robinhood?.estimatedGasCostUsd ?? 0.01) / 2700;
-  assert(minList * 0.995 - 0.001 - gasEthE >= 0.12 * 0.001 - 1e-9, 'Min listing price yields >= 12% margin (creator excluded)');
+  assert(minList * 0.995 - 0.001 - gasEthE >= 0.25 * 0.001 - 1e-9, 'Min listing price yields >= 25% margin (creator excluded)');
   await relister.handleItemAcquired('rules-collection', '0x2222222222222222222222222222222222222222', '7', 0.001, 'robinhood');
   let eItem = eInv.getInventoryItem(eId)!;
   assert.strictEqual(eItem.status, 'LISTED', 'Bought NFT is auto-listed');
@@ -859,7 +859,7 @@ function makeBidder(api: OpenSeaApiService, inv: InventoryManager): { bidder: Co
   const usdgPricing = pricingEngine.calculateMaxBid(usdgMarketData, 0.20, 10.0, 'robinhood');
   assert.strictEqual(usdgPricing.currency, 'USDG');
   assert(usdgPricing.bidPriceUsd <= 4.5, 'USDG bid is capped by USDG floor');
-  assert(usdgPricing.marginPercent >= 30.0, `Expected profit margin >= 30% for <=$5 USDG offer (got ${usdgPricing.marginPercent}%)`);
+  assert(usdgPricing.marginPercent >= 25.0, `Expected profit margin >= 25% for <=$4 USDG offer (got ${usdgPricing.marginPercent}%)`);
 
   // 3. Seaport USDG Offer Generation
   const usdgSeaport = new SeaportService(config, Wallet.createRandom());

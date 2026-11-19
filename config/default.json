@@ -80,10 +80,10 @@
   },
   "profitTargets": {
     "defaultMinNetProfitUsd": 0.15,
-    "defaultMinMarginPercent": 12.0,
+    "defaultMinMarginPercent": 10.0,
     "tier1MaxPriceUsd": 4.0,
-    "tier1MinMarginPercent": 30.0,
-    "tier2MinMarginPercent": 12.0,
+    "tier1MinMarginPercent": 25.0,
+    "tier2MinMarginPercent": 10.0,
     "undercutFloorByPercent": 1.0,
     "bidUnderFloorPercent": 15.0,
     "bidIncrementUsd": 0.05

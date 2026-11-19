@@ -10,16 +10,16 @@ export class PricingEngine {
   }
 
   /** Hard minimum profit margin (excludes creator fees) required for every offer and listing. */
-  public static readonly MIN_NET_MARGIN_PERCENT = 12.0;
+  public static readonly MIN_NET_MARGIN_PERCENT = 10.0;
   public static readonly TIER1_MAX_PRICE_USD = 4.0;
-  public static readonly TIER1_MIN_MARGIN_PERCENT = 30.0;
-  public static readonly TIER2_MIN_MARGIN_PERCENT = 12.0;
+  public static readonly TIER1_MIN_MARGIN_PERCENT = 25.0;
+  public static readonly TIER2_MIN_MARGIN_PERCENT = 10.0;
 
   /**
    * Effective minimum margin:
-   * - NFTs priced up to $4: Minimum 30% expected profit margin before placing an offer.
-   * - NFTs priced above $4 and up to $9: The expected profit after creator fee must be at least 12%.
-   *   If creator fee is 10%, the expected margin before deducting that fee must be at least 22% (12% + creatorFeePercent).
+   * - NFTs priced up to $4: Minimum 25% expected profit margin before placing an offer.
+   * - NFTs priced above $4 and up to $10: The expected profit after creator fee must be at least 10%.
+   *   If creator fee is 10%, the expected margin before deducting that fee must be at least 20% (10% + creatorFeePercent).
    * Per-target minMarginPercent can raise the requirement but never weaken the applicable minimum.
    */
   public getMinMarginPercent(
@@ -41,14 +41,14 @@ export class PricingEngine {
     const tier1Min = this.config.profitTargets?.tier1MinMarginPercent ?? PricingEngine.TIER1_MIN_MARGIN_PERCENT;
     const baseTier2Min = this.config.profitTargets?.tier2MinMarginPercent ?? this.config.profitTargets?.defaultMinMarginPercent ?? PricingEngine.MIN_NET_MARGIN_PERCENT;
 
-    // Tier 1: $1.00 to $4.00 requires at least 30% margin
+    // Tier 1: $1.00 to $4.00 requires at least 25% margin
     if (priceUsd !== undefined && priceUsd >= 1.0 && priceUsd <= tier1Max) {
       const configured = targetConfig?.minMarginPercent ?? tier1Min;
       return Math.max(configured, tier1Min);
     }
 
-    // Tier 2: > $4.00 to $9.00 requires at least 12% profit after creator fee
-    // (e.g. 10% creator fee requires at least 12% + 10% = 22% margin before that fee)
+    // Tier 2: > $4.00 to $10.00 requires at least 10% clean profit after creator fee
+    // (e.g. 10% creator fee requires at least 10% + 10% = 20% margin before that fee)
     const effectiveTier2Min = baseTier2Min + (creatorFeePercent || 0);
     const configured = targetConfig?.minMarginPercent ?? effectiveTier2Min;
     return Math.max(configured, effectiveTier2Min);
@@ -525,17 +525,18 @@ export class PricingEngine {
 
     // 1. Calculate Maximum Profitable Bid Price
     // Tiered Margin Rule:
-    //  - Up to $5.00: expected profit margin >= 30% (creator fees excluded)
-    //  - > $5.00 to $9.00: expected profit after creator fee >= 12% (e.g. 10% fee => 22% pre-fee margin)
+    //  - Up to $4.00: expected profit margin >= 25% (creator fees excluded)
+    //  - > $4.00 to $10.00: expected clean profit after creator fee >= 10% (e.g. 10% fee => 20% pre-fee margin)
     const tier1MaxUsd = this.config.profitTargets?.tier1MaxPriceUsd ?? PricingEngine.TIER1_MAX_PRICE_USD;
     const creatorFeePercent = (marketData.royaltyFeeBps || 0) / 100;
     const tier1Margin = this.getMinMarginPercent(targetConfig, tier1MaxUsd, creatorFeePercent);
     const tier2Margin = this.getMinMarginPercent(targetConfig, tier1MaxUsd + 1, creatorFeePercent);
+    const baseTier2MinMargin = this.config.profitTargets?.tier2MinMarginPercent ?? this.config.profitTargets?.defaultMinMarginPercent ?? PricingEngine.MIN_NET_MARGIN_PERCENT;
 
     const maxMarginBidTier1Eth = netProceedsExclCreatorAfterGasEth / (1 + (tier1Margin / 100));
-    // Tier 2: net profit AFTER creator fee must be >= 12% of the bid, AND pre-fee margin >= tier2Margin
+    // Tier 2: net profit AFTER creator fee must be >= baseTier2MinMargin% of the bid, AND pre-fee margin >= tier2Margin
     const maxMarginBidTier2Eth = Math.min(
-      netProceedsAfterGasEth / 1.12,
+      netProceedsAfterGasEth / (1 + (baseTier2MinMargin / 100)),
       netProceedsExclCreatorAfterGasEth / (1 + (tier2Margin / 100))
     );
 
@@ -686,10 +687,11 @@ export class PricingEngine {
 
     // Check B: Net profit (after purchase price, creator fees, marketplace fees and gas) must meet:
     // 1) Configured minimum net profit USD
-    // 2) Applicable profit margin before creator fee (>= 30% for <=$5, >= 12% + creatorFee% for >$5)
-    // 3) For >$5 NFTs: expected profit after creator fee must be >= 12%
+    // 2) Applicable profit margin before creator fee (>= 25% for <=$4, >= 10% + creatorFee% for >$4)
+    // 3) For >$4 NFTs: expected profit after creator fee must be >= 10%
+    const baseTier2MinPercent = this.config.profitTargets?.tier2MinMarginPercent ?? this.config.profitTargets?.defaultMinMarginPercent ?? PricingEngine.TIER2_MIN_MARGIN_PERCENT;
     const netProfitPercentAfterCreator = finalBidEth > 0 ? (netProfitEth / finalBidEth) * 100 : 0;
-    const checkTier2NetPassed = bidPriceUsd <= tier1MaxUsd || netProfitPercentAfterCreator >= 12.0 - 1e-6;
+    const checkTier2NetPassed = bidPriceUsd <= tier1MaxUsd || netProfitPercentAfterCreator >= baseTier2MinPercent - 1e-6;
 
     const checkBProfitPassed =
       netProfitUsd > 0 &&
@@ -741,7 +743,7 @@ export class PricingEngine {
     } else if (netProfitEth < targetProfitEth - 1e-12) {
       reason = `Check B Failed: Net profit ($${netProfitUsd.toFixed(2)}) is below minimum required net profit ($${minNetProfit.toFixed(2)}) after creator fees, marketplace fees, and gas.`;
     } else if (bidPriceUsd > tier1MaxUsd && !checkTier2NetPassed) {
-      reason = `Check B Failed: Profit after creator fee (${netProfitPercentAfterCreator.toFixed(1)}%) is below required minimum (12.0%).`;
+      reason = `Check B Failed: Profit after creator fee (${netProfitPercentAfterCreator.toFixed(1)}%) is below required minimum (${baseTier2MinPercent.toFixed(1)}%).`;
     } else if (marginPercent < applicableMinMargin) {
       reason = `Check B Failed: Margin (${marginPercent.toFixed(1)}%, creator fees excluded) is below minimum threshold (${applicableMinMargin}%).`;
     }
@@ -900,16 +902,17 @@ export class PricingEngine {
     // Hard rule: List price must NEVER be below acquiredPriceEth (Rule 6)
     // No-loss selling: proceeds after ALL fees (incl. creator) & gas must cover cost + min net profit
     // Tiered Margin Rule:
-    //  - $1.00 to $4.00: minimum list price preserves 30% margin
-    //  - > $4.00 to $9.00: minimum list price preserves 12% profit AFTER creator fee
+    //  - $1.00 to $4.00: minimum list price preserves 25% margin
+    //  - > $4.00 to $10.00: minimum list price preserves 10% clean profit AFTER creator fee
     const acquiredUsd = acquiredPriceEth * ethPriceUsd;
     const tier1MaxUsd = this.config.profitTargets?.tier1MaxPriceUsd ?? PricingEngine.TIER1_MAX_PRICE_USD;
     const creatorFeePercent = (marketData.royaltyFeeBps || 0) / 100;
     const margin = this.getMinMarginPercent(acquiredUsd, undefined, creatorFeePercent) / 100;
     const ceil6 = (v: number) => Math.ceil(v * 1e6 - 1e-9) / 1e6;
 
-    // For >$4 NFTs, 12% profit after creator fee means profitGoal is at least 12% of acquired cost
-    const minProfitAfterCreatorEth = acquiredUsd > tier1MaxUsd ? acquiredPriceEth * 0.12 : profitGoalEth;
+    // For >$4 NFTs, 10% clean profit after creator fee means profitGoal is at least tier2MinMarginPercent of acquired cost
+    const baseTier2Rate = (this.config.profitTargets?.tier2MinMarginPercent ?? this.config.profitTargets?.defaultMinMarginPercent ?? PricingEngine.TIER2_MIN_MARGIN_PERCENT) / 100;
+    const minProfitAfterCreatorEth = acquiredUsd > tier1MaxUsd ? acquiredPriceEth * baseTier2Rate : profitGoalEth;
     const effectiveProfitEth = Math.max(profitGoalEth, minProfitAfterCreatorEth);
 
     const minProfitablePriceEth = Math.max(

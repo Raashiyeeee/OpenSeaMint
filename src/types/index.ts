@@ -66,10 +66,10 @@ export interface BotConfig {
   };
   profitTargets: {
     defaultMinNetProfitUsd: number;
-    defaultMinMarginPercent: number; // 12% default and hard minimum for tier 2
-    tier1MaxPriceUsd?: number; // $4.00 ceiling for 30% margin tier
-    tier1MinMarginPercent?: number; // 30% minimum margin for $1 to $4 NFTs
-    tier2MinMarginPercent?: number; // 12% minimum margin after creator fee for >$4-$9 NFTs
+    defaultMinMarginPercent: number; // 10% default and hard minimum for tier 2
+    tier1MaxPriceUsd?: number; // $4.00 ceiling for 25% margin tier
+    tier1MinMarginPercent?: number; // 25% minimum margin for $1 to $4 NFTs
+    tier2MinMarginPercent?: number; // 10% minimum clean profit after creator fee for >$4-$10 NFTs
     undercutFloorByPercent: number;
     bidUnderFloorPercent: number;
     bidIncrementUsd?: number;
