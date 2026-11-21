@@ -20,6 +20,9 @@ export class AutoRelisterStrategy {
   private collectionFillHandler?: (collectionSlug: string, contractAddress: string) => Promise<void>;
   /** NFTs with a listing attempt in progress (dedupes stream + order-status + wallet-scan detections). */
   private listingInFlight = new Set<string>();
+  /** Tracked sales event keys to prevent processing old historical sales on startup */
+  private seenSalesTxHashes = new Set<string>();
+  private salesPollerInitialized = false;
   /** Retry delays for the instant-listing path (not the 15s cycle / 10-min reprice cooldown). */
   public static readonly HOLD_RETRY_MS = 20_000;
   public static readonly UNAVAILABLE_RETRY_MS = 5_000;
@@ -172,15 +175,35 @@ export class AutoRelisterStrategy {
   public async pollRealTimePurchases(walletAddress: string): Promise<number> {
     const target = walletAddress.toLowerCase();
     const sales = await this.apiService.getRecentAccountSales(walletAddress, 15);
+    
+    // On the initial run, baseline all existing historical sales so past items aren't mistaken for new fills
+    if (!this.salesPollerInitialized) {
+      for (const s of sales) {
+        const key = s.txHash ? s.txHash.toLowerCase() : `${s.contractAddress.toLowerCase()}:${s.tokenId}:${s.timestamp}`;
+        this.seenSalesTxHashes.add(key);
+      }
+      this.salesPollerInitialized = true;
+      return 0;
+    }
+
     let detected = 0;
+    const nowSec = Math.floor(Date.now() / 1000);
 
     for (const sale of sales) {
-      // Inbound purchase: our wallet was the BUYER
+      const key = sale.txHash ? sale.txHash.toLowerCase() : `${sale.contractAddress.toLowerCase()}:${sale.tokenId}:${sale.timestamp}`;
+      if (this.seenSalesTxHashes.has(key)) continue;
+      this.seenSalesTxHashes.add(key);
+
+      // Inbound purchase: our wallet was the BUYER and sale occurred recently (<= 10 mins ago)
       if (sale.buyer === target) {
+        if (sale.timestamp && nowSec - sale.timestamp > 600) {
+          continue;
+        }
+
         const identifier = `${sale.contractAddress.toLowerCase()}:${sale.tokenId}`;
         const existing = this.inventoryManager.getInventoryItem(identifier);
-        // Already tracked and not yet sold -> skip
-        if (existing && existing.status !== 'SOLD' && existing.status !== 'TRANSFERRED') continue;
+        // Already tracked in inventory -> skip
+        if (existing) continue;
 
         const ignored = this.config.general.ignoredCollections || ['robin-owls', 'robin-owls-269031093'];
         if (ignored.some((i) => sale.collectionSlug.toLowerCase().includes(i.toLowerCase()) || sale.contractAddress.toLowerCase().includes(i.toLowerCase()))) {
@@ -537,12 +560,26 @@ export class AutoRelisterStrategy {
       this.circuitBreaker.registerSuccess();
       return { outcome: 'LISTED', reason: `listed at ${listPriceEth} ETH` };
     } catch (err: any) {
-      if (err.message?.includes('enforcement restrictions')) {
+      const errMsg = String(err.message || '');
+      if (errMsg.includes('enforcement restrictions')) {
         item.status = 'ERROR';
         item.holdReason = 'Listing restricted by OpenSea (enforcement restrictions)';
         logger.warn(
           { identifier: item.identifier, slug: item.collectionSlug, error: err.message },
           'OpenSea has active enforcement restrictions on this collection. Item marked as ERROR and excluded from relist queue.'
+        );
+        return { outcome: 'SKIPPED', reason: item.holdReason };
+      }
+      if (
+        errMsg.includes('not owner of token') ||
+        errMsg.includes('does not have enough balance of order asset') ||
+        errMsg.includes('ERC721 not owner')
+      ) {
+        item.status = 'SOLD';
+        item.holdReason = 'NFT no longer in wallet (not owner / zero balance): marked resolved';
+        logger.warn(
+          { identifier: item.identifier, slug: item.collectionSlug, tokenId: item.tokenId },
+          'OpenSea reports wallet is not the owner of this NFT (already sold or transferred). Resolved and removed from relist queue.'
         );
         return { outcome: 'SKIPPED', reason: item.holdReason };
       }
